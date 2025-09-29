@@ -44,7 +44,7 @@ Power:              12V battery + solar panel charging
 ```
 
 ## Wiring Diagram
-![Hardware Connections](WiringDiagram.png)
+![Hardware Connections](Wiring Diagram v7.png)
 
 *Complete wiring schematic showing ESP32-CAM connections to GPS, motor drivers, 
 SD card, and user interface components. Verify all pin assignments match the 
