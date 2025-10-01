@@ -1,8 +1,11 @@
 # Sunflower – ESP32 GPS Solar Tracker (Capstone Project)
+![Sunflower Logo](SunflowerLogo.png)
 
 Autonomous dual‑axis solar panel tracker using an ESP32. Computes real‑time sun position from GPS + astronomical algorithms and drives motors to maximize irradiance while monitoring battery health and conserving power.
 
 ## System Overview
+
+![System Structure](Structure.png)
 
 **Hardware Platform**: ESP32-CAM + MAX-M10S GPS + MD20A motor drivers + 200mm linear actuators  
 **Control Algorithm**: Time-of-motion positioning with nightly mechanical homing  
