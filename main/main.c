@@ -48,6 +48,7 @@
 #include "status_led.h"
 #include "button.h"
 #include "esp_sleep.h"
+#include "driver/i2c.h"
 
 #define TAG "APP"
 
@@ -85,14 +86,14 @@
 
 // Hardware config (adjust pins to match your wiring)
 #define I2C_NUM        I2C_NUM_0
-#define I2C_SDA        18     // GPS I2C SDA (ESP32-CAM free pin)
-#define I2C_SCL        19     // GPS I2C SCL (ESP32-CAM free pin)
+#define I2C_SDA        26     // GPS I2C SDA (ESP32-CAM free pin)
+#define I2C_SCL        27     // GPS I2C SCL (ESP32-CAM free pin)
 #define GPS_ADDR       0x42   // MAX-M10S default I2C address
 
 #define MOTOR_AZ_PWM   32     // Azimuth actuator PWM (high current capable)
 #define MOTOR_AZ_DIR   33     // Azimuth actuator direction
-#define MOTOR_EL_PWM   26     // Elevation actuator PWM
-#define MOTOR_EL_DIR   27     // Elevation actuator direction
+#define MOTOR_EL_PWM   18     // Elevation actuator PWM
+#define MOTOR_EL_DIR   19     // Elevation actuator direction
 
 // SD card (ESP32-CAM SPI mode defaults - don't change without hardware mod)
 #define SD_MOSI        15     // CMD/MOSI (boot strap pin)
@@ -102,7 +103,7 @@
 
 // User interface pins
 #define STATUS_LED_GPIO 4     // ESP32-CAM built-in flash LED (active high)
-#define START_BTN_GPIO 25     // Start/calibrate button (change if needed)
+#define START_BTN_GPIO 5     // Start/calibrate button (change if needed)
 
 /*
     Calibration task: monitors button for long-press events.
@@ -135,20 +136,40 @@ static void calib_task(void *arg){
     
     for(;;){
         // Wait for long press event (3 second threshold, infinite timeout)
-        if (button_wait_for_long_press(3000, -1)){
-            ESP_LOGI(TAG, "=== CALIBRATION TRIGGER ===");
-            ESP_LOGI(TAG, "Long-press detected: starting mount offset calibration");
+        // Check for button press, then measure hold time manually
+        if (button_wait_for_press(100)) {  // 100ms timeout for polling
+            // Button was pressed, now measure hold duration
+            uint32_t press_start = xTaskGetTickCount();
+            uint32_t hold_time = 0;
             
-            // Visual feedback during calibration
-            status_led_set_mode(LED_STARTUP);  // Fast blink indicates calibration active
-            
-            sdlog_printf("Long-press detected: calibrate mount offsets");
-            tracking_calibrate_mount_offset_now();
-            
-            // Return to normal tracking indication
-            status_led_set_mode(LED_TRACKING);
-            
-            ESP_LOGI(TAG, "Calibration complete, resuming normal operation");
+            // Wait while button remains pressed
+            while (button_is_pressed()) {
+                vTaskDelay(pdMS_TO_TICKS(50));  // Check every 50ms
+                hold_time = (xTaskGetTickCount() - press_start) * portTICK_PERIOD_MS;
+                
+                // If held for 3+ seconds, trigger calibration
+                if (hold_time >= 3000) {
+                    ESP_LOGI(TAG, "=== CALIBRATION TRIGGER ===");
+                    ESP_LOGI(TAG, "Long-press detected: starting mount offset calibration");
+                    
+                    // Visual feedback during calibration
+                    status_led_set_mode(LED_STARTUP);  // Fast blink indicates calibration active
+                    
+                    sdlog_printf("Long-press detected: calibrate mount offsets");
+                    tracking_calibrate_mount_offset_now();
+                    
+                    // Return to normal tracking indication
+                    status_led_set_mode(LED_TRACKING);
+                    
+                    ESP_LOGI(TAG, "Calibration complete, resuming normal operation");
+                    
+                    // Wait for button release to avoid repeat triggers
+                    while (button_is_pressed()) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    break;  // Exit the hold-time measurement loop
+                }
+            }
         }
         
         // Brief yield to prevent task starvation

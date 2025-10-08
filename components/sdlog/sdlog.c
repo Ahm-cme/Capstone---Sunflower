@@ -8,6 +8,7 @@
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
+#include <inttypes.h>
 
 /*
     ┌───────────────────────────────────────────────────────────────────────┐
@@ -53,7 +54,7 @@ static sdmmc_card_t *s_card = NULL;  // Keep reference for diagnostics
     Returns pointer to static buffer (not thread-safe, but we're single-threaded).
 */
 static const char* get_timestamp_str(void) {
-    static char buf[32];
+    static char buf[64];  // Increased from 32 to 64 to fix truncation warning
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -153,9 +154,8 @@ bool sdlog_init(const sdlog_cfg_t *cfg){
     // Log detailed card information for diagnostics
     ESP_LOGI(TAG, "SD card mounted successfully:");
     ESP_LOGI(TAG, "  Name: %s", s_card->cid.name);
-    ESP_LOGI(TAG, "  Type: %s", (s_card->ocr & SD_OCR_SDHC_CAP) ? "SDHC/SDXC" : "SDSC");
+    ESP_LOGI(TAG, "  Capacity: %lluMB", ((uint64_t) s_card->csd.capacity) * s_card->csd.sector_size / (1024 * 1024));
     ESP_LOGI(TAG, "  Speed: %s", (s_card->csd.tr_speed > 25000000) ? "High Speed" : "Standard");
-    ESP_LOGI(TAG, "  Size: %llu MB", ((uint64_t)s_card->csd.capacity) / (1024 * 1024));
     ESP_LOGI(TAG, "  Manufacturer: %s (%02X)", 
              s_card->cid.mfg_id == 0x03 ? "SanDisk" : "Unknown", s_card->cid.mfg_id);
 

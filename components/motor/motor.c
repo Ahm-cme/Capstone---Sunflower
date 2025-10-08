@@ -1,3 +1,7 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>  
+#include "esp_log.h"
 #include "motor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -117,7 +121,7 @@ static uint32_t move_time_ms(double cur_mm, double tgt_mm){
     // Add safety buffer for real-world variations
     uint32_t total_ms = (uint32_t)base_time_ms + 300;
     
-    ESP_LOGD(TAG, "Move %.2f mm @ %.2f mm/s: base=%.0f ms + 300 ms buffer = %u ms total",
+    ESP_LOGD(TAG, "Move %.2f mm @ %.2f mm/s: base=%.0f ms + 300 ms buffer = %" PRIu32 " ms total",
              distance_mm, s_cfg.speed_mm_per_s, base_time_ms, total_ms);
     return total_ms;
 }
@@ -261,8 +265,9 @@ void motor_move_az(double current_deg, double target_deg){
     uint32_t move_ms = move_time_ms(current_mm, target_mm);
     
     // Log the complete move plan
-    ESP_LOGI(TAG, "AZ executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %u ms", 
-             current_deg, clamped_target, current_mm, target_mm, dir_name, move_ms);
+    ESP_LOGI(TAG, "AZ executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms",
+             current_deg, target_deg, current_mm, target_mm,
+             (target_mm > current_mm) ? "EXTEND" : "RETRACT", move_ms);
 
     // Execute the move: start PWM, wait, stop PWM
     start_pwm(AZ_CH, 4096);                     // 50% duty cycle
@@ -302,8 +307,9 @@ void motor_move_el(double current_deg, double target_deg){
     // Calculate timing
     uint32_t move_ms = move_time_ms(current_mm, target_mm);
     
-    ESP_LOGI(TAG, "EL executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %u ms", 
-             current_deg, clamped_target, current_mm, target_mm, dir_name, move_ms);
+    ESP_LOGI(TAG, "EL executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms",
+             current_deg, target_deg, current_mm, target_mm,
+             (target_mm > current_mm) ? "EXTEND" : "RETRACT", move_ms);
 
     // Execute the move
     start_pwm(EL_CH, 4096);                     // 50% duty
@@ -314,7 +320,7 @@ void motor_move_el(double current_deg, double target_deg){
 }
 
 void motor_run_az_ms(int dir_level, uint32_t ms){
-    ESP_LOGI(TAG, "AZ timed run: DIR=%d for %u ms (raw mode)", dir_level, ms);
+    ESP_LOGI(TAG, "AZ timed run: DIR=%d for %" PRIu32 " ms (raw mode)", dir_level, ms);
     ESP_LOGW(TAG, "Running AZ in RAW mode - may exceed normal limits!");
     
     // Set direction immediately
@@ -329,7 +335,7 @@ void motor_run_az_ms(int dir_level, uint32_t ms){
 }
 
 void motor_run_el_ms(int dir_level, uint32_t ms){
-    ESP_LOGI(TAG, "EL timed run: DIR=%d for %u ms (raw mode)", dir_level, ms);
+    ESP_LOGI(TAG, "EL timed run: DIR=%d for %" PRIu32 " ms (raw mode)", dir_level, ms);
     ESP_LOGW(TAG, "Running EL in RAW mode - may exceed normal limits!");
     
     // Set direction

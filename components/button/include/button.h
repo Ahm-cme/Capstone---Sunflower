@@ -82,4 +82,4 @@ bool button_wait_for_press(int timeout_ms);
 
 /*
     Block until the button is pressed and held continuously for hold_ms, or a timeout.
-    - Used for “long-press to calibrate mount offset”.
+    - Used for “long-press to calibrate mount offset”.*/
