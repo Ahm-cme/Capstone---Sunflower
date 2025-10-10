@@ -39,8 +39,8 @@ Autonomous dual‑axis solar panel tracker using an ESP32. Computes real‑time 
 
 ### Pin Assignments (ESP32-CAM Compatible)
 ```
-GPS (I2C):          SDA=18, SCL=19, Addr=0x42
-Motors (PWM+DIR):   AZ_PWM=32, AZ_DIR=33, EL_PWM=26, EL_DIR=27  
+GPS (I2C):          SDA=26, SCL=27, Addr=0x42
+Motors (PWM+DIR):   AZ_PWM=32, AZ_DIR=33, EL_PWM=18, EL_DIR=19  
 SD Card (SPI):      MOSI=15, MISO=2, SCK=14, CS=13
 User Interface:     LED=4, Button=25
 Power:              12V battery + solar panel charging
