@@ -249,6 +249,31 @@ void app_main(void){
     }
     ESP_LOGI(TAG, "NVS flash ready");
 
+    // === SYSTEM TIME INITIALIZATION (HARDCODED) ===
+    ESP_LOGI(TAG, "Setting system time to October 15, 2025, 2:30 PM CST...");
+    struct tm timeinfo = {0};
+    timeinfo.tm_year = 2025 - 1900;  // Years since 1900
+    timeinfo.tm_mon = 10 - 1;        // Months since January (0-11)
+    timeinfo.tm_mday = 15;           // Day of month (1-31)
+    timeinfo.tm_hour = 14;           // Hour (0-23) - 2:30 PM
+    timeinfo.tm_min = 30;            // Minutes (0-59)
+    timeinfo.tm_sec = 0;             // Seconds (0-59)
+    timeinfo.tm_isdst = 0;           // Daylight saving time flag
+    
+    time_t t = mktime(&timeinfo);
+    struct timeval now = { .tv_sec = t };
+    settimeofday(&now, NULL);
+    
+    // Set timezone to Central Time (Auburn, AL)
+    setenv("TZ", "CST6CDT,M3.2.0,M11.1.0", 1);
+    tzset();
+    
+    char strftime_buf[64];
+    localtime_r(&t, &timeinfo);
+    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+    ESP_LOGI(TAG, "System time set to: %s", strftime_buf);
+    sdlog_printf("System time: %s (Auburn, AL - CST)", strftime_buf);
+
     // === SD CARD LOGGING INITIALIZATION ===
     // High priority: capture boot events and system state
     ESP_LOGI(TAG, "Initializing SD card logging...");

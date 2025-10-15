@@ -21,6 +21,15 @@
 #define GPS_LOG_HEXDUMP 0
 #endif
 
+#define USE_HARDCODED_LOCATION 1  // Set to 0 to use real GPS
+
+#if USE_HARDCODED_LOCATION
+// Auburn, Alabama coordinates
+#define HARDCODED_LAT  32.5990
+#define HARDCODED_LON  -85.4808
+#define HARDCODED_ALT  200.0  // meters above sea level
+#endif
+
 static gps_cfg_t  s_cfg;
 static gps_data_t s_last = {0};
 
@@ -134,6 +143,11 @@ static bool parse_nav_pvt(const uint8_t *buf, size_t n, gps_data_t *g) {
 esp_err_t gps_init(const gps_cfg_t *cfg) {
     s_cfg = *cfg;
 
+#if USE_HARDCODED_LOCATION
+    ESP_LOGI(TAG, "GPS module initialized in HARDCODED mode (Auburn, AL)");
+    ESP_LOGI(TAG, "Location: %.4f°N, %.4f°W", HARDCODED_LAT, -HARDCODED_LON);
+    return ESP_OK;
+#else
     // Optional: bump this module to DEBUG without changing global verbosity.
     esp_log_level_set(TAG, ESP_LOG_DEBUG);
 
@@ -159,6 +173,7 @@ esp_err_t gps_init(const gps_cfg_t *cfg) {
     ESP_LOGI(TAG, "GPS init: I2C%d SDA=%d SCL=%d @%lu Hz, addr=0x%02X",
              s_cfg.i2c_port, s_cfg.sda_io, s_cfg.scl_io, (unsigned long)s_cfg.clk_hz, s_cfg.addr);
     return ESP_OK;
+#endif
 }
 
 bool gps_poll_nav_pvt(gps_data_t *out) {
@@ -208,4 +223,29 @@ bool gps_get_last(gps_data_t *out) {
     if (!s_last.valid) return false;
     if (out) *out = s_last;
     return true;
+}
+
+bool gps_get_fix(gps_fix_t *fix, uint32_t timeout_ms) {
+    if (!fix) return false;
+
+#if USE_HARDCODED_LOCATION
+    // Use hardcoded Auburn, AL location
+    fix->latitude = HARDCODED_LAT;
+    fix->longitude = HARDCODED_LON;
+    fix->altitude = HARDCODED_ALT;
+    fix->num_satellites = 12;  // Simulate good GPS fix
+    fix->hdop = 0.8;           // Good horizontal dilution of precision
+    
+    // Get current system time (should be set via SNTP or manual)
+    time_t now;
+    time(&now);
+    fix->time = now;
+    
+    ESP_LOGI(TAG, "Using hardcoded location: Auburn, AL (%.4f, %.4f)", 
+             HARDCODED_LAT, HARDCODED_LON);
+    
+    return true;
+#else
+    // ...existing GPS acquisition code...
+#endif
 }

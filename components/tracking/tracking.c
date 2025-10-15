@@ -46,6 +46,7 @@
 */
 
 #define TAG "TRACK"
+#define HARDCODED_MOUNT_AZIMUTH 0.0  // Panel faces North (0 degrees)
 
 // Global tracker state with sensible defaults for initial deployment.
 // These values are overridden by NVS-stored state after first calibration.
@@ -441,6 +442,27 @@ static void home_to_stops(void){
     - Misalignment: can be corrected by repeating calibration
 */
 void tracking_calibrate_mount_offset_now(void){
+#if USE_HARDCODED_LOCATION
+    // Use hardcoded north-facing orientation
+    float mount_az_offset = HARDCODED_MOUNT_AZIMUTH;
+    float mount_el_offset = 0.0;  // Assume level mounting
+    
+    ESP_LOGI(TAG, "Using hardcoded mount orientation: North-facing (Az offset: %.1f°)", 
+             HARDCODED_MOUNT_AZIMUTH);
+    
+    // Store offsets to NVS
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open("tracking", NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_blob(nvs_handle, "mount_az_off", &mount_az_offset, sizeof(float));
+        nvs_set_blob(nvs_handle, "mount_el_off", &mount_el_offset, sizeof(float));
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Mount offsets stored to NVS");
+    }
+    
+    return;
+#else
     ESP_LOGI(TAG, "=== MOUNT OFFSET CALIBRATION START ===");
     
     // Require valid GPS data for accurate sun position calculation
@@ -491,6 +513,7 @@ void tracking_calibrate_mount_offset_now(void){
                  s.az_mount_offset_deg, s.el_mount_offset_deg);
     
     ESP_LOGI(TAG, "Future tracking will use these offsets automatically");
+#endif
 }
 
 /*
