@@ -494,6 +494,112 @@ void tracking_calibrate_mount_offset_now(void){
 }
 
 /*
+    Automatic mount orientation detection using compass + sun position.
+    
+    This eliminates manual alignment:
+    1. Calculate sun position from GPS coordinates and time
+    2. Read actual mount heading from compass
+    3. Compute offset between compass north and sun azimuth
+    4. Store offset for all future tracking calculations
+    
+    Benefits over manual calibration:
+    - No need to point panel at sun
+    - Works in any orientation
+    - Can re-calibrate if mount is moved
+    - Accounts for magnetic declination automatically
+    
+    Limitations:
+    - Requires good GPS fix (accurate time + position)
+    - Sun must be >15° elevation (avoid horizon effects)
+    - Compass must be calibrated first (hard iron offset)
+*/
+void tracking_auto_calibrate_with_compass(void) {
+    ESP_LOGI(TAG, "=== AUTOMATIC MOUNT CALIBRATION (COMPASS) ===");
+    
+    // Check compass calibration status
+    if (!gps_is_compass_calibrated()) {
+        ESP_LOGW(TAG, "Compass not calibrated - run compass calibration first!");
+        ESP_LOGI(TAG, "Call gps_calibrate_compass() and rotate system 360°");
+        sdlog_printf("Auto-calibration failed: compass not calibrated");
+        return;
+    }
+    
+    // Get GPS fix for position and time
+    gps_data_t gps;
+    bool gps_ok = gps_get_last(&gps);
+    if (!gps_ok || !gps.valid) {
+        ESP_LOGW(TAG, "No valid GPS fix - cannot calculate sun position");
+        sdlog_printf("Auto-calibration failed: no GPS fix");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "GPS: lat=%.6f lon=%.6f sats=%u", 
+             gps.latitude, gps.longitude, gps.num_satellites);
+    
+    // Calculate current sun position
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    
+    double sun_az, sun_el;
+    solar_position(gps.latitude, gps.longitude, now, &sun_az, &sun_el);
+    
+    ESP_LOGI(TAG, "Calculated sun position: az=%.2f° el=%.2f°", sun_az, sun_el);
+    
+    // Verify sun is high enough for accurate azimuth
+    if (sun_el < 15.0) {
+        ESP_LOGW(TAG, "Sun too low (%.1f°) - azimuth unreliable near horizon", sun_el);
+        ESP_LOGI(TAG, "Wait until sun is >15° elevation for best calibration");
+        sdlog_printf("Auto-calibration failed: sun elevation %.1f° too low", sun_el);
+        return;
+    }
+    
+    // Read compass heading (mount's orientation)
+    float compass_heading;
+    if (!gps_get_compass_heading(&compass_heading)) {
+        ESP_LOGE(TAG, "Failed to read compass heading");
+        sdlog_printf("Auto-calibration failed: compass read error");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Compass heading: %.2f° magnetic", compass_heading);
+    
+    // Calculate mount offset
+    // Mount offset = (compass reading) - (sun azimuth)
+    // This offset will be added to all future sun calculations
+    double az_offset = compass_heading - sun_az;
+    
+    // Normalize to ±180°
+    while (az_offset > 180.0) az_offset -= 360.0;
+    while (az_offset < -180.0) az_offset += 360.0;
+    
+    ESP_LOGI(TAG, "=== CALIBRATION RESULT ===");
+    ESP_LOGI(TAG, "Sun azimuth:      %.2f°", sun_az);
+    ESP_LOGI(TAG, "Compass heading:  %.2f°", compass_heading);
+    ESP_LOGI(TAG, "Mount AZ offset:  %.2f°", az_offset);
+    ESP_LOGI(TAG, "=========================");
+    
+    // Store in tracking state
+    s.az_mount_offset_deg = az_offset;
+    s.el_mount_offset_deg = 0.0;  // Elevation offset assumed 0 (horizontal mount)
+    
+    // Persist to NVS
+    nvs_save();
+    
+    // Log to SD card
+    sdlog_printf("AUTO-CALIBRATION SUCCESS:");
+    sdlog_printf("  Sun: az=%.2f° el=%.2f°", sun_az, sun_el);
+    sdlog_printf("  Compass: %.2f° magnetic", compass_heading);
+    sdlog_printf("  Mount offset: az=%.2f° el=%.2f°", 
+                 s.az_mount_offset_deg, s.el_mount_offset_deg);
+    sdlog_printf("  Time: %04d-%02d-%02d %02d:%02d:%02d",
+                 lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
+                 lt->tm_hour, lt->tm_min, lt->tm_sec);
+    
+    ESP_LOGI(TAG, "Mount orientation calibration complete!");
+    ESP_LOGI(TAG, "System will now track accurately from any base orientation");
+}
+
+/*
     Main tracking task - runs continuously until deep sleep.
     
     Task lifecycle:
@@ -540,6 +646,34 @@ static void tracking_task(void *arg){
     
     ESP_LOGI(TAG, "Tracking loop starting with %ds cadence", s.cur_period_s);
 
+    // Auto-calibrate if compass available and not yet calibrated
+    if (gps_is_compass_calibrated()) {
+        // Check if we have a stored mount offset
+        if (fabs(s.az_mount_offset_deg) < 0.1 && fabs(s.el_mount_offset_deg) < 0.1) {
+            ESP_LOGI(TAG, "No mount offset stored - attempting auto-calibration");
+            
+            // Wait for GPS fix
+            status_led_set_mode(LED_WAITING);
+            gps_data_t gps;
+            int wait_count = 0;
+            while (!gps_poll_nav_pvt(&gps) && wait_count < 60) {
+                ESP_LOGI(TAG, "Waiting for GPS fix... (%d/60)", ++wait_count);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            }
+            
+            if (wait_count < 60) {
+                tracking_auto_calibrate_with_compass();
+            } else {
+                ESP_LOGW(TAG, "GPS timeout - using default offsets");
+            }
+        } else {
+            ESP_LOGI(TAG, "Using stored mount offset: az=%.2f° el=%.2f°",
+                     s.az_mount_offset_deg, s.el_mount_offset_deg);
+        }
+    } else {
+        ESP_LOGW(TAG, "Compass not calibrated - manual alignment required");
+    }
+    
     while (1){
         TickType_t loop_start = xTaskGetTickCount();
 

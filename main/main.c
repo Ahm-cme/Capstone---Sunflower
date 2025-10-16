@@ -49,6 +49,8 @@
 #include "button.h"
 #include "esp_sleep.h"
 #include "driver/i2c.h"
+#include "driver/uart.h"
+
 
 #define TAG "APP"
 
@@ -60,12 +62,12 @@
     │  - Avoids GPIO 0,1,3 (UART/boot)                                     │
     │  - Avoids GPIO 6-11 (flash)                                          │
     │  - Works around GPIO 2,12,13,14,15 (SD card)                         │
-    │  - Uses available GPIO 18,19,25,26,27,32,33                          │
+    │  - Uses available GPIO 16,17,18,19,25,26,27,32,33                    │
     │                                                                       │
-    │ I2C Bus (GPS):                                                        │
-    │  - SDA=18, SCL=19: Safe pins with good drive strength                │
-    │  - 400kHz: Fast enough for GPS without EMI issues                    │
-    │  - GPS addr 0x42: MAX-M10S default I2C address                       │
+    │ UART (GPS BN-880):                                                    │
+    │  - UART2: TX=GPIO17, RX=GPIO16 (safe pins)                           │
+    │  - 9600 baud: BN-880 default                                         │
+    │  - NMEA-0183: standard GPS protocol                                  │
     │                                                                       │
     │ Motor Control (PWM + DIR):                                           │
     │  - Uses LEDC hardware PWM (5kHz, 13-bit resolution)                  │
@@ -85,10 +87,15 @@
 */
 
 // Hardware config (adjust pins to match your wiring)
-#define I2C_NUM        I2C_NUM_0
-#define I2C_SDA        26     // GPS I2C SDA (ESP32-CAM free pin)
-#define I2C_SCL        27     // GPS I2C SCL (ESP32-CAM free pin)
-#define GPS_ADDR       0x42   // MAX-M10S default I2C address
+#define GPS_UART_PORT  UART_NUM_2
+#define GPS_TX_PIN     17     // ESP32 TX → GPS RX (BN-880)
+#define GPS_RX_PIN     16     // ESP32 RX ← GPS TX (BN-880)
+#define GPS_BAUD       9600   // BN-880 default baud rate
+
+// I2C for HMC5883 compass (on BN-880)
+#define I2C_PORT       I2C_NUM_0
+#define I2C_SDA_PIN    21     // Standard ESP32 I2C SDA
+#define I2C_SCL_PIN    22     // Standard ESP32 I2C SCL
 
 #define MOTOR_AZ_PWM   32     // Azimuth actuator PWM (high current capable)
 #define MOTOR_AZ_DIR   33     // Azimuth actuator direction
@@ -173,6 +180,67 @@ static void calib_task(void *arg){
         }
         
         // Brief yield to prevent task starvation
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/*
+    Compass calibration task: triggered by double-press of start button.
+    
+    Calibration procedure:
+    1. Press START button twice quickly (< 1 second between presses)
+    2. LED blinks rapidly to indicate calibration mode
+    3. Slowly rotate entire system 360° horizontally (2-3 full circles over 20 seconds)
+    4. LED returns to normal pattern when complete
+    5. Calibration data automatically saved to NVS
+    
+    This should be done once after hardware assembly, away from large metal objects.
+*/
+static void compass_calib_task(void *arg){
+    ESP_LOGI(TAG, "Compass calibration monitor started");
+    ESP_LOGI(TAG, "Double-press START button to calibrate compass");
+    
+    uint32_t last_press = 0;
+    
+    for(;;){
+        if (button_wait_for_press(100)) {
+            uint32_t now = xTaskGetTickCount();
+            uint32_t time_since_last = (now - last_press) * portTICK_PERIOD_MS;
+            
+            if (time_since_last < 1000) {
+                // Double-press detected!
+                ESP_LOGI(TAG, "=== COMPASS CALIBRATION ===");
+                sdlog_printf("Compass calibration started");
+                
+                status_led_set_mode(LED_STARTUP);  // Fast blink
+                
+                bool success = gps_calibrate_compass();
+                
+                if (success) {
+                    ESP_LOGI(TAG, "Compass calibration successful!");
+                    sdlog_printf("Compass calibration: SUCCESS");
+                    
+                    // Blink LED 3 times to indicate success
+                    for (int i = 0; i < 3; i++) {
+                        status_led_set_mode(LED_ERROR);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        status_led_set_mode(LED_TRACKING);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Compass calibration failed - try again");
+                    sdlog_printf("Compass calibration: FAILED");
+                    status_led_set_mode(LED_ERROR);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
+                
+                status_led_set_mode(LED_TRACKING);
+                last_press = 0;  // Reset double-press detection
+            } else {
+                last_press = now;
+            }
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
@@ -270,13 +338,17 @@ void app_main(void){
 
     // === GPS SUBSYSTEM INITIALIZATION ===
     // Critical: required for position and time reference
-    ESP_LOGI(TAG, "Initializing GPS subsystem...");
+    ESP_LOGI(TAG, "Initializing GPS subsystem with compass...");
     gps_cfg_t gps_config = {
-        .i2c_port = I2C_NUM,
-        .sda_io = I2C_SDA,
-        .scl_io = I2C_SCL,
-        .clk_hz = 400000,      // 400kHz I2C: fast but reliable
-        .addr = GPS_ADDR       // MAX-M10S default address
+        .uart_port = GPS_UART_PORT,
+        .tx_io = GPS_TX_PIN,
+        .rx_io = GPS_RX_PIN,
+        .baud_rate = GPS_BAUD,
+        
+        // I2C for HMC5883 compass
+        .i2c_port = I2C_PORT,
+        .sda_io = I2C_SDA_PIN,
+        .scl_io = I2C_SCL_PIN
     };
     ret = gps_init(&gps_config);
     if (ret != ESP_OK) {
@@ -388,6 +460,23 @@ void app_main(void){
         ESP_LOGI(TAG, "Calibration monitor active");
     }
 
+    // === COMPASS CALIBRATION MONITOR ===
+    ESP_LOGI(TAG, "Starting compass calibration monitor...");
+    BaseType_t compass_ret = xTaskCreate(
+        compass_calib_task,
+        "compass_calib",
+        2048,
+        NULL,
+        3,  // Lower priority than tracking
+        NULL
+    );
+    
+    if (compass_ret != pdPASS) {
+        ESP_LOGW(TAG, "Failed to create compass calibration task");
+    } else {
+        ESP_LOGI(TAG, "Compass calibration monitor active (double-press START)");
+    }
+    
     // === INITIALIZATION COMPLETE ===
     ESP_LOGI(TAG, "=== SYSTEM INITIALIZATION COMPLETE ===");
     ESP_LOGI(TAG, "Solar tracker is now operational");

@@ -174,6 +174,29 @@ void tracking_start(void);
 void tracking_calibrate_mount_offset_now(void);
 
 /*
+    Automatic mount orientation calibration using compass.
+    
+    This replaces manual alignment - system automatically learns mount
+    orientation by comparing sun azimuth (calculated) vs compass heading.
+    
+    Algorithm:
+    1. Get GPS position and current time
+    2. Calculate sun's true azimuth angle
+    3. Read compass heading (mount's magnetic north reference)
+    4. Compute offset: az_mount_offset = compass_heading - sun_azimuth
+    5. Store offset in NVS for future boots
+    
+    Requirements:
+    - Valid GPS fix (lat/lon/time)
+    - Sun elevation > 15° (avoid horizon refraction errors)
+    - Compass calibrated (run gps_calibrate_compass() first)
+    
+    Called automatically on first boot or when user requests re-calibration.
+*/
+
+void tracking_auto_calibrate_with_compass(void);
+
+/*
     Development and debugging functions (add these for testing):
     
     void tracking_get_state(tracker_state_t *state);     // Read current state
