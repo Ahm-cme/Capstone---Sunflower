@@ -1,7 +1,39 @@
 /*
  * Enhanced GPS-Based Solar Tracking System
- * ESP32 + MAX-M10S GPS + Dual Linear Actuators
- * Optimized for power efficiency and tracking accuracy
+ * ESP32 + Dual Linear Actuators
+ * 
+ * ════════════════════════════════════════════════════════════════════════
+ * ║  HARDCODED_LOCATION BRANCH - TESTING CONFIGURATION                   ║
+ * ════════════════════════════════════════════════════════════════════════
+ * ║  Location:        Auburn, AL (32.5990°N, 85.4808°W, 200m elev)      ║
+ * ║  Date/Time:       October 15, 2025, 2:30 PM CST                     ║
+ * ║  System Base:     North-facing (0° azimuth reference)               ║
+ * ║  Panel Position:  Facing STRAIGHT UP (zenith, 90° elevation)        ║
+ * ║  Panel Plane:     Vertical from ground (normal to horizontal)       ║
+ * ║  GPS Hardware:    NOT REQUIRED - using fixed coordinates            ║
+ * ════════════════════════════════════════════════════════════════════════
+ * 
+ * Physical Configuration:
+ *   - System base/frame oriented with "front" pointing North (0°)
+ *   - Panel starts in vertical position (plane facing skyward)
+ *   - Panel normal vector initially points to zenith (90° elevation)
+ *   - Actuators tilt panel from this vertical reference position
+ *   - Azimuth rotation: clockwise from north (0°=N, 90°=E, 180°=S, 270°=W)
+ *   - Elevation range: 10° (near-horizontal) to 90° (vertical/zenith)
+ * 
+ * At the configured time (2:30 PM, October 15, 2025), Auburn AL sun position:
+ *   - Sun Azimuth: ~205° (Southwest)
+ *   - Sun Elevation: ~40° (mid-afternoon, moderate angle)
+ *   - Required panel tilt: FROM vertical (90°) TO 40° elevation
+ *   - Required panel rotation: FROM north (0°) TO southwest (205°)
+ *   - Panel will tilt DOWN 50° from vertical and rotate 205° clockwise
+ * 
+ * The tracker will:
+ *   1. Calculate sun position relative to Auburn, AL at 2:30 PM
+ *   2. Compute required actuator movements from vertical starting position
+ *   3. Move elevation actuator to tilt panel down to 40° from horizontal
+ *   4. Move azimuth actuator to rotate panel to 205° (southwest-facing)
+ *   5. Panel will be perpendicular to sun rays for maximum power output
  * 
  * ┌───────────────────────────────────────────────────────────────────────┐
  * │ System Architecture Overview                                          │
@@ -35,11 +67,13 @@
  */
 
 #include <stdio.h>
-#include <math.h>
+#include <string.h>
 #include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_system.h"  // Add this for system functions
 #include "nvs_flash.h"
 #include "gps.h"
 #include "motor.h"
@@ -85,10 +119,12 @@
 */
 
 // Hardware config (adjust pins to match your wiring)
+// I2C NOT USED - GPS hardware not required in hardcoded location mode
+// These pins (GPIO 26, 27) can be repurposed if needed
 #define I2C_NUM        I2C_NUM_0
-#define I2C_SDA        26     // GPS I2C SDA (ESP32-CAM free pin)
-#define I2C_SCL        27     // GPS I2C SCL (ESP32-CAM free pin)
-#define GPS_ADDR       0x42   // MAX-M10S default I2C address
+#define I2C_SDA        26     // Available (not used for GPS)
+#define I2C_SCL        27     // Available (not used for GPS)
+#define GPS_ADDR       0x42   // Not used
 
 #define MOTOR_AZ_PWM   32     // Azimuth actuator PWM (high current capable)
 #define MOTOR_AZ_DIR   33     // Azimuth actuator direction
@@ -206,9 +242,19 @@ static void calib_task(void *arg){
     - FreeRTOS tasks for concurrent operation
 */
 void app_main(void){
-    ESP_LOGI(TAG, "=== SOLTRAC SOLAR TRACKER STARTING ===");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "║  SOLTRAC SOLAR TRACKER - HARDCODED LOCATION MODE        ║");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     ESP_LOGI(TAG, "Firmware build: %s %s", __DATE__, __TIME__);
     ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Configuration Summary:");
+    ESP_LOGI(TAG, "  • Location: Auburn, AL (32.5990°N, 85.4808°W)");
+    ESP_LOGI(TAG, "  • Time: October 15, 2025, 2:30 PM CST");
+    ESP_LOGI(TAG, "  • System base: North-facing (0° azimuth reference)");
+    ESP_LOGI(TAG, "  • Panel initial: Facing UP (90° from horizontal)");
+    ESP_LOGI(TAG, "  • GPS hardware: Not required (hardcoded mode)");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     
     // Get wake cause early for startup decision logic
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
@@ -250,12 +296,13 @@ void app_main(void){
     ESP_LOGI(TAG, "NVS flash ready");
 
     // === SYSTEM TIME INITIALIZATION (HARDCODED) ===
-    ESP_LOGI(TAG, "Setting system time to October 15, 2025, 2:30 PM CST...");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "Setting system time to October 15, 2025, 3:30 PM CST...");
     struct tm timeinfo = {0};
     timeinfo.tm_year = 2025 - 1900;  // Years since 1900
     timeinfo.tm_mon = 10 - 1;        // Months since January (0-11)
     timeinfo.tm_mday = 15;           // Day of month (1-31)
-    timeinfo.tm_hour = 14;           // Hour (0-23) - 2:30 PM
+    timeinfo.tm_hour = 15;           // Hour (0-23) - 3:30 PM
     timeinfo.tm_min = 30;            // Minutes (0-59)
     timeinfo.tm_sec = 0;             // Seconds (0-59)
     timeinfo.tm_isdst = 0;           // Daylight saving time flag
@@ -272,8 +319,8 @@ void app_main(void){
     localtime_r(&t, &timeinfo);
     strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
     ESP_LOGI(TAG, "System time set to: %s", strftime_buf);
-    sdlog_printf("System time: %s (Auburn, AL - CST)", strftime_buf);
-
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    
     // === SD CARD LOGGING INITIALIZATION ===
     // High priority: capture boot events and system state
     ESP_LOGI(TAG, "Initializing SD card logging...");
@@ -283,7 +330,11 @@ void app_main(void){
     };
     if (sdlog_init(&sd_config)) {
         ESP_LOGI(TAG, "SD card logging active");
-        sdlog_printf("=== SYSTEM BOOT ===");
+        sdlog_printf("=== SYSTEM BOOT - HARDCODED LOCATION MODE ===");
+        sdlog_printf("Location: Auburn, AL (32.5990°N, 85.4808°W)");
+        sdlog_printf("System time: %s (CST)", strftime_buf);
+        sdlog_printf("System base: North-facing (0° azimuth)");
+        sdlog_printf("Panel position: Facing UP (90° from horizontal)");
         sdlog_printf("Wake cause: %s", wake_reason);
         sdlog_printf("Build: %s %s", __DATE__, __TIME__);
     } else {
@@ -293,17 +344,16 @@ void app_main(void){
         status_led_set_mode(LED_STARTUP); // Continue startup
     }
 
-    // === GPS SUBSYSTEM INITIALIZATION ===
-    // Critical: required for position and time reference
-    ESP_LOGI(TAG, "Initializing GPS subsystem...");
+    // === GPS SUBSYSTEM INITIALIZATION (STUB ONLY) ===
+    ESP_LOGI(TAG, "Initializing GPS subsystem (hardcoded mode)...");
     gps_cfg_t gps_config = {
         .i2c_port = I2C_NUM,
         .sda_io = I2C_SDA,
         .scl_io = I2C_SCL,
-        .clk_hz = 400000,      // 400kHz I2C: fast but reliable
-        .addr = GPS_ADDR       // MAX-M10S default address
+        .clk_hz = 400000,
+        .addr = GPS_ADDR
     };
-    ret = gps_init(&gps_config);
+    ret = gps_init(&gps_config);  // Will skip I2C init, return ESP_OK immediately
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "GPS initialization failed: %s", esp_err_to_name(ret));
         status_led_set_mode(LED_ERROR);
@@ -311,7 +361,8 @@ void app_main(void){
         ESP_LOGE(TAG, "System halted due to GPS failure");
         while(1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    ESP_LOGI(TAG, "GPS subsystem ready");
+    ESP_LOGI(TAG, "GPS subsystem ready (using hardcoded Auburn, AL location)");
+    ESP_LOGI(TAG, "GPS hardware NOT required for this build");
 
     // === MOTOR CONTROL INITIALIZATION ===
     // Critical: required for panel positioning
@@ -414,33 +465,30 @@ void app_main(void){
     }
 
     // === INITIALIZATION COMPLETE ===
-    ESP_LOGI(TAG, "=== SYSTEM INITIALIZATION COMPLETE ===");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "║  SYSTEM INITIALIZATION COMPLETE                         ║");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     ESP_LOGI(TAG, "Solar tracker is now operational");
-    ESP_LOGI(TAG, "LED patterns: STARTUP→WAITING→TRACKING→ERROR→SLEEP");
-    ESP_LOGI(TAG, "Button: short press = start, long press (3s) = calibrate");
-    ESP_LOGI(TAG, "Check SD card logs for detailed operation history");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Configuration:");
+    ESP_LOGI(TAG, "  • Location: Auburn, AL (32.5990°N, 85.4808°W)");
+    ESP_LOGI(TAG, "  • Time: October 15, 2025, 2:30 PM CST");
+    ESP_LOGI(TAG, "  • System base: North-facing (0° azimuth)");
+    ESP_LOGI(TAG, "  • Panel initial: Vertical/UP (90° elevation)");
+    ESP_LOGI(TAG, "  • GPS Hardware: Not required (hardcoded)");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Expected Sun Position at 2:30 PM:");
+    ESP_LOGI(TAG, "  • Azimuth: ~205° (Southwest)");
+    ESP_LOGI(TAG, "  • Elevation: ~40° (mid-afternoon)");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Expected Panel Movement:");
+    ESP_LOGI(TAG, "  • From: Vertical (90° el) pointing North (0° az)");
+    ESP_LOGI(TAG, "  • To: 40° elevation, 205° azimuth (Southwest)");
+    ESP_LOGI(TAG, "  • Tilt: DOWN 50° from vertical");
+    ESP_LOGI(TAG, "  • Rotate: 205° clockwise from north");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     
     sdlog_printf("System initialization complete - entering autonomous operation");
-    
-    /*
-        Main application task exits here - system continues running via:
-        - Tracking task (main control loop)
-        - Calibration task (user input monitoring)  
-        - LED task (status indication)
-        - GPS task (periodic data acquisition)
-        
-        The system will:
-        1. Track sun during daylight hours
-        2. Enter deep sleep at night  
-        3. Wake automatically before sunrise
-        4. Perform nightly homing for position reset
-        5. Log all operations to SD card
-        6. Respond to user calibration requests
-        
-        To monitor operation:
-        - LED patterns indicate system state
-        - SD card contains CSV data + human-readable logs
-        - Serial console shows detailed debug information
-        - NVS preserves state across power cycles
-    */
+    sdlog_printf("Hardcoded mode: No GPS hardware needed");
+    sdlog_printf("Panel starts vertical, will tilt to track sun at Az=205° El=40°");
 }

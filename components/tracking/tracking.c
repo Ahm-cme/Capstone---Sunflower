@@ -45,8 +45,16 @@
     └───────────────────────────────────────────────────────────────────────┘
 */
 
+#if USE_HARDCODED_LOCATION
+// System orientation: base faces north (0° azimuth reference)
+// Initial panel position: facing straight up (zenith)
+#define HARDCODED_MOUNT_AZIMUTH 0.0      // System base oriented north
+#define HARDCODED_MOUNT_ELEVATION 90.0   // Panel plane faces up (vertical from ground)
+#define HARDCODED_PANEL_NORMAL_AZ 0.0    // Panel normal initially points to zenith
+#define HARDCODED_PANEL_NORMAL_EL 90.0   // Panel normal at 90° elevation (straight up)
+#endif
+
 #define TAG "TRACK"
-#define HARDCODED_MOUNT_AZIMUTH 0.0  // Panel faces North (0 degrees)
 
 // Global tracker state with sensible defaults for initial deployment.
 // These values are overridden by NVS-stored state after first calibration.
@@ -441,14 +449,25 @@ static void home_to_stops(void){
     - GPS time error: may introduce small systematic error
     - Misalignment: can be corrected by repeating calibration
 */
-void tracking_calibrate_mount_offset_now(void){
+void tracking_calibrate_mount_offset_now(void) {
 #if USE_HARDCODED_LOCATION
-    // Use hardcoded north-facing orientation
+    // Use hardcoded vertical panel orientation
     float mount_az_offset = HARDCODED_MOUNT_AZIMUTH;
-    float mount_el_offset = 0.0;  // Assume level mounting
+    float mount_el_offset = HARDCODED_MOUNT_ELEVATION;
     
-    ESP_LOGI(TAG, "Using hardcoded mount orientation: North-facing (Az offset: %.1f°)", 
-             HARDCODED_MOUNT_AZIMUTH);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "║  HARDCODED MOUNT CALIBRATION                            ║");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "System Configuration:");
+    ESP_LOGI(TAG, "  • System base orientation: North-facing (0° azimuth)");
+    ESP_LOGI(TAG, "  • Panel initial position: Facing UP (zenith)");
+    ESP_LOGI(TAG, "  • Panel plane angle: 90° from horizontal (vertical)");
+    ESP_LOGI(TAG, "  • Panel normal vector: Points to zenith initially");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Mount offsets:");
+    ESP_LOGI(TAG, "  • Azimuth offset: %.1f° (north reference)", mount_az_offset);
+    ESP_LOGI(TAG, "  • Elevation offset: %.1f° (from horizontal)", mount_el_offset);
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     
     // Store offsets to NVS
     nvs_handle_t nvs_handle;
@@ -459,26 +478,28 @@ void tracking_calibrate_mount_offset_now(void){
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
         ESP_LOGI(TAG, "Mount offsets stored to NVS");
+    } else {
+        ESP_LOGE(TAG, "Failed to store mount offsets: %s", esp_err_to_name(err));
     }
+    
+    sdlog_printf("Hardcoded mount calibration:");
+    sdlog_printf("  System base: North-facing (0° azimuth)");
+    sdlog_printf("  Panel position: Facing UP (90° elevation)");
+    sdlog_printf("  Mount offsets: Az=%.1f° El=%.1f°", mount_az_offset, mount_el_offset);
     
     return;
 #else
     ESP_LOGI(TAG, "=== MOUNT OFFSET CALIBRATION START ===");
     
     // Require valid GPS data for accurate sun position calculation
-    gps_data_t g = {0};
-    bool gps_fresh = gps_poll_nav_pvt(&g);
-    bool gps_valid = gps_fresh || gps_get_last(&g);
+    gps_fix_t g = {0};
+    bool gps_available = gps_get_fix(&g, 5000);  // 5 second timeout
     
-    if (!gps_valid) {
+    if (!gps_available) {
         ESP_LOGW(TAG, "Calibration aborted: no GPS fix available");
         ESP_LOGW(TAG, "Ensure GPS antenna has clear sky view and try again");
         sdlog_printf("Calibration failed: no GPS");
         return;
-    }
-    
-    if (!gps_fresh) {
-        ESP_LOGW(TAG, "Using cached GPS data for calibration (age unknown)");
     }
     
     time_t now = time(NULL);
@@ -567,15 +588,16 @@ static void tracking_task(void *arg){
         TickType_t loop_start = xTaskGetTickCount();
 
         // === GPS DATA ACQUISITION ===
-        gps_data_t g = {0};
-        bool gps_fresh = gps_poll_nav_pvt(&g);
-        bool gps_available = gps_fresh || gps_get_last(&g);
+        // In hardcoded mode, this returns immediately with fixed Auburn, AL coordinates
+        // In real GPS mode, this would poll the MAX-M10S module via I2C
+        gps_fix_t g = {0};
+        bool gps_available = gps_get_fix(&g, 5000);  // 5 second timeout
         
         if (!gps_available) {
             // No GPS data at all - enter error state and retry
             status_led_set_mode(LED_ERROR);
-            ESP_LOGW(TAG, "No GPS data available (fresh or cached)");
-            ESP_LOGW(TAG, "Check antenna connection and sky visibility");
+            ESP_LOGW(TAG, "No GPS data available");
+            ESP_LOGW(TAG, "In hardcoded mode, this should never happen");
             ESP_LOGW(TAG, "Retrying in 30 seconds...");
             vTaskDelay(pdMS_TO_TICKS(30000));
             continue;
@@ -586,11 +608,6 @@ static void tracking_task(void *arg){
                 status_led_set_mode(LED_TRACKING);
             }
         }
-        
-        if (!gps_fresh) {
-            ESP_LOGD(TAG, "Using cached GPS data (no fresh fix this cycle)");
-        }
-
         // === SUN POSITION CALCULATION ===
         time_t now = time(NULL);
         sun_pos_t sun = solar_compute(g.latitude, g.longitude, now);
@@ -606,8 +623,8 @@ static void tracking_task(void *arg){
         double dang = fmax(daz, del);
 
         ESP_LOGI(TAG, "=== TRACKING STATUS ===");
-        ESP_LOGI(TAG, "GPS: %.6f°N %.6f°W (%u sats, fix=%u)", 
-                 g.latitude, g.longitude, g.num_satellites, g.fix_type);
+        ESP_LOGI(TAG, "GPS: %.6f°N %.6f°W (%u sats, hdop=%.1f)", 
+                 g.latitude, g.longitude, g.num_satellites, g.hdop);
         ESP_LOGI(TAG, "Sun (earth): az=%.1f° el=%.1f° daylight=%s", 
                  sun.azimuth_deg, sun.elevation_deg, sun.is_daylight ? "YES" : "NO");
         ESP_LOGI(TAG, "Target (mount): az=%.1f° el=%.1f°", s.az_tgt, s.el_tgt);
@@ -628,9 +645,9 @@ static void tracking_task(void *arg){
             // Perform nightly homing to reset position error
             home_to_stops();
 
-            // Log pre-sleep state
-            sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
-                now, g.latitude, g.longitude, g.fix_type, g.num_satellites,
+            // Log pre-sleep state (removed fix_type field)
+            sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
+                now, g.latitude, g.longitude, g.num_satellites, g.hdop,
                 s.az_tgt, s.el_tgt, s.az_cur, s.el_cur, s.moves_today, s.total_moves, NAN, "HOME_BEFORE_SLEEP");
 
             // Calculate sunrise and schedule wake time
@@ -684,8 +701,9 @@ static void tracking_task(void *arg){
         }
 
         // === TELEMETRY LOGGING ===
-        sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
-            now, g.latitude, g.longitude, g.fix_type, g.num_satellites,
+        // Updated CSV format: removed fix_type field
+        sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
+            now, g.latitude, g.longitude, g.num_satellites, g.hdop,
             s.az_tgt, s.el_tgt, s.az_cur, s.el_cur, s.moves_today, s.total_moves, NAN, csv_note);
 
         // === HOUSEKEEPING ===
