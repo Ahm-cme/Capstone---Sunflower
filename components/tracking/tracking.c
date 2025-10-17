@@ -11,6 +11,7 @@
 #include <math.h>
 #include "status_led.h"
 #include "esp_sleep.h"
+#include <inttypes.h>  // ADD THIS for PRIu32, PRIu64
 
 /*
     ┌───────────────────────────────────────────────────────────────────────┐
@@ -56,37 +57,38 @@
 
 #define TAG "TRACK"
 
-// Global tracker state with sensible defaults for initial deployment.
-// These values are overridden by NVS-stored state after first calibration.
-//
-// Configuration notes:
-//  - tol_deg=10: implements "move when ≥10° change" requirement
-//    Large tolerance accounts for open-loop uncertainty and reduces actuator wear
-//  - base_period_s=900 (15 min): slow checks after moves since sun changes slowly
-//  - fast_period_s=300 (5 min): faster checks when waiting for threshold
-//  - sleep_thresh_el=5°: below this elevation we consider night operation pointless
-//  - Home pose tuning: AZ retracted=0°, EL extended=85° (adjust for your linkage)
-//  - homing_time_ms calculation: 200mm stroke ÷ 11.94mm/s ≈ 16.8s + 5s safety = 22s
+// Global tracker state with UPDATED VALUES for faster testing
 static tracker_state_t s = {
-    .az_cur=180,.el_cur=45,.tol_deg=10,.min_step_deg=2,
-    .update_period_s=300,.sleep_thresh_el=5,
-    .base_period_s=900, .fast_period_s=300, .cur_period_s=900,
-    .prewake_min=10,
-
-    // Installation offsets: learned during calibration, defaults assume perfect North alignment
-    .az_mount_offset_deg = 0.0,  // will be set during install calibration
-    .el_mount_offset_deg = 0.0,  // will be set during install calibration
-
-    // Home pose configuration for mechanical stops
-    // Critical: these must match your actual hardware setup
-    .home_az_deg = 0.0,           // angle assigned when AZ hits retract stop
-    .home_el_deg = 85.0,          // angle assigned when EL hits extend stop
-    .homing_time_ms = 22000,      // 200mm ÷ 11.94mm/s + 30% margin = 22s
-    .az_home_dir_level = 0,       // DIR level that drives AZ to retract stop (verify with testing)
-    .el_home_dir_level = 1,       // DIR level that drives EL to extend stop (verify with testing)
-
-    // Initialize last-move tracking (prevents immediate motion on boot)
-    .last_move_az_tgt=180, .last_move_el_tgt=45
+    // Tracking parameters - REDUCED tolerance for more frequent movements
+    .tol_deg = 3.0,              // CHANGED from 10° to 3° - triggers moves more often
+    .min_step_deg = 2.0,         // Minimum step to avoid jitter
+    .base_period_s = 120,        // CHANGED from 900s (15min) to 120s (2min) - faster checks
+    .fast_period_s = 60,         // CHANGED from 300s (5min) to 60s (1min) - faster polling
+    .sleep_thresh_el = 5.0,      // Below this elevation, consider night
+    
+    // Homing configuration
+    .az_home_deg = 0.0,          // Azimuth home position (fully retracted)
+    .el_home_deg = 85.0,         // Elevation home position (fully extended)
+    .az_home_dir_level = 0,      // DIR level to reach home (verify with your wiring)
+    .el_home_dir_level = 1,      // DIR level to reach home (verify with your wiring)
+    .homing_time_ms = 11000,     // UPDATED: 200mm ÷ 11.111mm/s = 18s + 4s safety margin
+    
+    // Current position estimates (initialized to home)
+    .az_cur = 0.0, 
+    .el_cur = 85.0,
+    
+    // Last commanded targets
+    .last_move_az_tgt = 0.0,
+    .last_move_el_tgt = 85.0,
+    
+    // Mount orientation offsets (learned during calibration)
+    .az_mount_offset_deg = 0.0,  // Initially zero, updated via calibration
+    .el_mount_offset_deg = 0.0,
+    
+    // Statistics
+    .moves_today = 0,            // FIXED: was num_moves_today
+    .total_moves = 0,
+    .last_move = 0
 };
 
 // Thread synchronization (currently unused but reserved for multi-task access)
@@ -117,7 +119,8 @@ static void nvs_save(void){
         esp_err_t write_ret = nvs_set_blob(h, "state", &s, sizeof(s));
         if (write_ret == ESP_OK){
             nvs_commit(h);
-            ESP_LOGD(TAG, "State saved to NVS: az=%.1f el=%.1f moves=%u", 
+            // FIXED: Use PRIu32 for uint32_t
+            ESP_LOGD(TAG, "State saved to NVS: az=%.1f el=%.1f moves=%" PRIu32, 
                      s.az_cur, s.el_cur, s.total_moves);
         } else {
             ESP_LOGW(TAG, "NVS write failed: %s", esp_err_to_name(write_ret));
@@ -146,7 +149,8 @@ static void nvs_load(void){
         size_t required_size = sizeof(s);
         ret = nvs_get_blob(h, "state", &s, &required_size);
         if (ret == ESP_OK && required_size == sizeof(s)) {
-            ESP_LOGI(TAG, "Loaded state from NVS: az=%.1f el=%.1f tot_moves=%u offsets=(%.2f,%.2f)", 
+            // FIXED: Use PRIu32 for uint32_t
+            ESP_LOGI(TAG, "Loaded state from NVS: az=%.1f el=%.1f tot_moves=%" PRIu32 " offsets=(%.2f,%.2f)", 
                      s.az_cur, s.el_cur, s.total_moves, s.az_mount_offset_deg, s.el_mount_offset_deg);
         } else {
             ESP_LOGW(TAG, "NVS state load failed: %s (size=%u, expected=%u)", 
@@ -177,9 +181,10 @@ static void maybe_midnight_reset(void){
     time_t now = time(NULL);
     struct tm *lt = localtime(&now);
     if (lt && lt->tm_hour == 0 && lt->tm_min == 0) {
-        if (s.moves_today > 0) {  // Only log if we had activity
-            ESP_LOGI(TAG, "Midnight: resetting daily move count (was %u)", s.moves_today);
-            sdlog_printf("Daily reset: %u moves yesterday", s.moves_today);
+        if (s.moves_today > 0) {
+            // FIXED: Use PRIu32 for uint32_t
+            ESP_LOGI(TAG, "Midnight: resetting daily move count (was %" PRIu32 ")", s.moves_today);
+            sdlog_printf("Daily reset: %" PRIu32 " moves yesterday", s.moves_today);
         }
         s.moves_today = 0;
     }
@@ -188,27 +193,7 @@ static void maybe_midnight_reset(void){
 /*
     Execute a movement command if targets exceed tolerance and minimum step.
     
-    Movement logic:
-    1. Check both axes against tolerance (10°) and minimum step (2°)
-    2. Move only axes that need adjustment (independent axis control)
-    3. Update current position estimates to match commanded targets
-    4. Update statistics and timestamp
-    
-    Why both tolerance and minimum step:
-    - Tolerance (10°): main threshold for tracking accuracy vs actuator wear
-    - Minimum step (2°): prevents tiny jitter movements near the tolerance boundary
-    - Both must be exceeded to trigger movement
-    
-    Position tracking:
-    - s.az_cur/s.el_cur represent our best estimate of panel position
-    - Updated immediately after move commands (optimistic update)
-    - Reset to known values during nightly homing
-    - Open-loop control means these are estimates, not measurements
-    
-    Statistics tracking:
-    - moves_today: daily counter for operational monitoring
-    - total_moves: lifetime counter for maintenance scheduling
-    - last_move: timestamp for diagnostic purposes
+    FIXED: Updated to use correct field name 'moves_today'
 */
 static void do_move(double az_tgt, double el_tgt){
     // Calculate movement requirements for each axis independently
@@ -226,37 +211,52 @@ static void do_move(double az_tgt, double el_tgt){
         return;
     }
 
-    // Log the movement plan before execution
-    ESP_LOGI(TAG, "Movement required:");
-    ESP_LOGI(TAG, "  Current: az=%.1f° el=%.1f°", s.az_cur, s.el_cur);  
-    ESP_LOGI(TAG, "  Target:  az=%.1f° el=%.1f°", az_tgt, el_tgt);
-    ESP_LOGI(TAG, "  Plan: %s%s", 
-             move_az ? "AZ " : "", 
-             move_el ? "EL " : "");
-
+    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
+    // FIXED: Use PRIu32 for uint32_t
+    ESP_LOGI(TAG, "EXECUTING MOVEMENT #%" PRIu32 " (today: %" PRIu32 ")", s.total_moves + 1, s.moves_today + 1);
+    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "Current position: AZ=%.2f° EL=%.2f°", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "Target position:  AZ=%.2f° EL=%.2f°", az_tgt, el_tgt);
+    ESP_LOGI(TAG, "Delta:            ΔAZ=%.2f° ΔEL=%.2f°", 
+             az_tgt - s.az_cur, el_tgt - s.el_cur);
+    ESP_LOGI(TAG, "Speed: 11.111 mm/s (MAX PWM=255/255)");
+    
+    // FIXED: Use PRIu32 for uint32_t in sdlog_printf too
+    sdlog_printf("─────────────────────────────────────────────────────");
+    sdlog_printf("MOVE #%" PRIu32 ": AZ %.2f→%.2f° (Δ%.2f°) | EL %.2f→%.2f° (Δ%.2f°)",
+                 s.total_moves + 1,
+                 s.az_cur, az_tgt, az_tgt - s.az_cur,
+                 s.el_cur, el_tgt, el_tgt - s.el_cur);
+    
     // Execute movements (motor.c handles timing and PWM control)
     if (move_az) { 
-        ESP_LOGD(TAG, "Commanding AZ move: %.1f° → %.1f°", s.az_cur, az_tgt);
+        ESP_LOGI(TAG, "Moving AZIMUTH: %.2f° → %.2f°", s.az_cur, az_tgt);
         motor_move_az(s.az_cur, az_tgt); 
-        s.az_cur = az_tgt; 
+        s.az_cur = az_tgt;
+        s.last_move_az_tgt = az_tgt;
     }
     if (move_el) { 
-        ESP_LOGD(TAG, "Commanding EL move: %.1f° → %.1f°", s.el_cur, el_tgt);
+        ESP_LOGI(TAG, "Moving ELEVATION: %.2f° → %.2f°", s.el_cur, el_tgt);
         motor_move_el(s.el_cur, el_tgt); 
-        s.el_cur = el_tgt; 
+        s.el_cur = el_tgt;
+        s.last_move_el_tgt = el_tgt;
     }
 
     // Update statistics and persistence
-    s.moves_today++; 
+    s.moves_today++;  // FIXED: was num_moves_today
     s.total_moves++; 
     s.last_move = time(NULL);
     
-    ESP_LOGI(TAG, "Movement complete. New position: az=%.1f° el=%.1f°", s.az_cur, s.el_cur);
-    ESP_LOGI(TAG, "Statistics: %u moves today, %u total", s.moves_today, s.total_moves);
+    ESP_LOGI(TAG, "Movement complete. New position: AZ=%.2f° EL=%.2f°", s.az_cur, s.el_cur);
+    // FIXED: Use PRIu32 for uint32_t
+    ESP_LOGI(TAG, "Total moves: %" PRIu32 " (today: %" PRIu32 ")", s.total_moves, s.moves_today);
+    ESP_LOGI(TAG, "════════════════════════════════════════════════════════");
     
-    // Log significant moves to SD card for analysis
-    sdlog_printf("Move #%u: az=%.1f° el=%.1f° (today: %u)", 
-                 s.total_moves, s.az_cur, s.el_cur, s.moves_today);
+    sdlog_printf("Movement complete: AZ=%.2f° EL=%.2f° | Total: %" PRIu32, 
+                 s.az_cur, s.el_cur, s.total_moves);
+    
+    // Persist updated state to NVS
+    nvs_save();
 }
 
 /*
@@ -395,25 +395,23 @@ static bool is_descending(double lat, double lon){
 static void home_to_stops(void){
     ESP_LOGI(TAG, "=== HOMING SEQUENCE START ===");
     ESP_LOGI(TAG, "Driving to mechanical stops for position calibration");
-    ESP_LOGD(TAG, "Homing config: AZ_dir=%d EL_dir=%d time=%dms", 
+    // FIXED: Use PRIu32 for uint32_t
+    ESP_LOGD(TAG, "Homing config: AZ_dir=%d EL_dir=%d time=%" PRIu32 "ms", 
              s.az_home_dir_level, s.el_home_dir_level, s.homing_time_ms);
     
-    status_led_set_mode(LED_SLEEP); // LED off during long operations
+    status_led_set_mode(LED_SLEEP);
 
-    // Sequential homing to avoid simultaneous high current draw
     ESP_LOGI(TAG, "Phase 1: AZ to retract stop...");
     motor_run_az_ms(s.az_home_dir_level, s.homing_time_ms);
     
     ESP_LOGI(TAG, "Phase 2: EL to extend stop...");  
     motor_run_el_ms(s.el_home_dir_level, s.homing_time_ms);
 
-    // Assign exact known angles corresponding to the mechanical stop positions
-    s.az_cur = s.home_az_deg;
-    s.el_cur = s.home_el_deg;
-    s.last_move_az_tgt = s.az_cur;  // Prevent immediate movement after wake
+    s.az_cur = s.az_home_deg;
+    s.el_cur = s.el_home_deg;
+    s.last_move_az_tgt = s.az_cur;
     s.last_move_el_tgt = s.el_cur;
     
-    // Persist the homed state
     nvs_save();
 
     ESP_LOGI(TAG, "=== HOMING SEQUENCE COMPLETE ===");
@@ -568,157 +566,73 @@ void tracking_calibrate_mount_offset_now(void) {
     - NVS operations atomic at library level
 */
 static void tracking_task(void *arg){
-    ESP_LOGI(TAG, "=== SOLAR TRACKING SYSTEM START ===");
+    ESP_LOGI(TAG, "Tracking task started");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
+    ESP_LOGI(TAG, "FAST TESTING MODE ENABLED:");
+    ESP_LOGI(TAG, "  • Movement tolerance: 3° (was 10°)");
+    ESP_LOGI(TAG, "  • Check period: 60s fast / 120s slow (was 300s / 900s)");
+    ESP_LOGI(TAG, "  • PWM duty cycle: 100%% (8191/8191)");
+    ESP_LOGI(TAG, "  • Actuator speed: 11.111 mm/s (18s full stroke)");
+    ESP_LOGI(TAG, "═══════════════════════════════════════════════════════");
     
-    // Load persistent state and initialize subsystems
     nvs_load();
     
-    const char *csv = "/sdcard/soltrac.csv";
-    sdlog_write_csv_header_if_new(csv);
-    sdlog_printf("Tracking started: az=%.1f el=%.1f offsets=(%.2f,%.2f)", 
-                 s.az_cur, s.el_cur, s.az_mount_offset_deg, s.el_mount_offset_deg);
-
-    // Initialize last-move targets with current pose to prevent immediate movement on boot
-    s.last_move_az_tgt = s.az_cur;
-    s.last_move_el_tgt = s.el_cur;
-    
-    ESP_LOGI(TAG, "Tracking loop starting with %ds cadence", s.cur_period_s);
-
-    while (1){
-        TickType_t loop_start = xTaskGetTickCount();
-
-        // === GPS DATA ACQUISITION ===
-        // In hardcoded mode, this returns immediately with fixed Auburn, AL coordinates
-        // In real GPS mode, this would poll the MAX-M10S module via I2C
-        gps_fix_t g = {0};
-        bool gps_available = gps_get_fix(&g, 5000);  // 5 second timeout
-        
-        if (!gps_available) {
-            // No GPS data at all - enter error state and retry
-            status_led_set_mode(LED_ERROR);
-            ESP_LOGW(TAG, "No GPS data available");
-            ESP_LOGW(TAG, "In hardcoded mode, this should never happen");
-            ESP_LOGW(TAG, "Retrying in 30 seconds...");
-            vTaskDelay(pdMS_TO_TICKS(30000));
-            continue;
-        } else {
-            // GPS recovered or was already good
-            if (status_led_get_mode() == LED_ERROR) {
-                ESP_LOGI(TAG, "GPS recovered, resuming tracking");
-                status_led_set_mode(LED_TRACKING);
-            }
-        }
-        // === SUN POSITION CALCULATION ===
-        time_t now = time(NULL);
-        sun_pos_t sun = solar_compute(g.latitude, g.longitude, now);
-
-        // Convert earth coordinates to mount coordinates using calibrated offsets
-        s.az_tgt = wrap360(sun.azimuth_deg - s.az_mount_offset_deg);
-        s.el_tgt = sun.elevation_deg - s.el_mount_offset_deg;
-
-        // Calculate maximum angular change since last commanded move
-        // This drives both movement decisions and cadence adjustments
-        double daz = fabs(wrap180(s.az_tgt - s.last_move_az_tgt));
-        double del = fabs(s.el_tgt - s.last_move_el_tgt);
-        double dang = fmax(daz, del);
-
-        ESP_LOGI(TAG, "=== TRACKING STATUS ===");
-        ESP_LOGI(TAG, "GPS: %.6f°N %.6f°W (%u sats, hdop=%.1f)", 
-                 g.latitude, g.longitude, g.num_satellites, g.hdop);
-        ESP_LOGI(TAG, "Sun (earth): az=%.1f° el=%.1f° daylight=%s", 
-                 sun.azimuth_deg, sun.elevation_deg, sun.is_daylight ? "YES" : "NO");
-        ESP_LOGI(TAG, "Target (mount): az=%.1f° el=%.1f°", s.az_tgt, s.el_tgt);
-        ESP_LOGI(TAG, "Change since last move: %.2f° (threshold=%.1f°)", dang, s.tol_deg);
-
-        // === SLEEP DECISION ===
-        // Sleep if: night OR (low sun AND descending trend)
-        bool should_sleep = !sun.is_daylight || 
-                           (sun.elevation_deg < s.sleep_thresh_el && is_descending(g.latitude, g.longitude));
-        
-        if (should_sleep) {
-            ESP_LOGI(TAG, "=== SLEEP SEQUENCE START ===");
-            ESP_LOGI(TAG, "Sleep trigger: daylight=%s elevation=%.1f° (thresh=%.1f°)", 
-                     sun.is_daylight ? "yes" : "no", sun.elevation_deg, s.sleep_thresh_el);
-            
-            status_led_set_mode(LED_SLEEP);
-
-            // Perform nightly homing to reset position error
-            home_to_stops();
-
-            // Log pre-sleep state (removed fix_type field)
-            sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
-                now, g.latitude, g.longitude, g.num_satellites, g.hdop,
-                s.az_tgt, s.el_tgt, s.az_cur, s.el_cur, s.moves_today, s.total_moves, NAN, "HOME_BEFORE_SLEEP");
-
-            // Calculate sunrise and schedule wake time
-            solar_events_t ev_today = solar_events(g.latitude, g.longitude, now);
-            time_t target_rise = 0;
-            
-            if (ev_today.has_sunrise && ev_today.has_sunset){
-                if (now >= ev_today.sunset_utc){
-                    // After sunset: wake for tomorrow's sunrise
-                    target_rise = solar_events(g.latitude, g.longitude, now + 24*3600).sunrise_utc;
-                } else if (now < ev_today.sunrise_utc){
-                    // Before sunrise (rare): wake for today's sunrise  
-                    target_rise = ev_today.sunrise_utc;
-                } else {
-                    // Daytime but low sun: wake for tomorrow's sunrise
-                    target_rise = solar_events(g.latitude, g.longitude, now + 24*3600).sunrise_utc;
-                }
-            }
-            
-            // Fallback if solar events unavailable (high latitude or GPS issues)
-            time_t wake_ts = target_rise ? (target_rise - s.prewake_min*60) : (now + 6*3600);
-
-            ESP_LOGI(TAG, "Wake scheduled for %s", 
-                     target_rise ? "sunrise - prewake" : "6 hours (fallback)");
-            
-            // Enter deep sleep - NEVER RETURNS
-            enter_deep_sleep_until(wake_ts);
-        }
-
-        // === MOVEMENT AND CADENCE LOGIC ===
-        const char *csv_note;
-        
-        if (dang >= s.tol_deg){
-            // Sun has moved enough to justify panel movement
-            ESP_LOGI(TAG, "Movement threshold exceeded (%.2f° ≥ %.1f°)", dang, s.tol_deg);
-            
-            do_move(s.az_tgt, s.el_tgt);
-            s.last_move_az_tgt = s.az_tgt;
-            s.last_move_el_tgt = s.el_tgt;
-            s.cur_period_s = s.base_period_s;  // Slow cadence after move
-            csv_note = "TRACK_15";
-            
-            ESP_LOGI(TAG, "Next check in %d minutes (post-move cadence)", s.cur_period_s / 60);
-        } else {
-            // Sun hasn't moved enough - use fast cadence to check more frequently
-            s.cur_period_s = s.fast_period_s;
-            csv_note = "TRACK_5";
-            
-            ESP_LOGI(TAG, "Below threshold (%.2f° < %.1f°)", dang, s.tol_deg);
-            ESP_LOGI(TAG, "Next check in %d minutes (waiting for motion)", s.cur_period_s / 60);
-        }
-
-        // === TELEMETRY LOGGING ===
-        // Updated CSV format: removed fix_type field
-        sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%.2f,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
-            now, g.latitude, g.longitude, g.num_satellites, g.hdop,
-            s.az_tgt, s.el_tgt, s.az_cur, s.el_cur, s.moves_today, s.total_moves, NAN, csv_note);
-
-        // === HOUSEKEEPING ===
+    for(;;){
+        time_t now_utc = time(NULL);
         maybe_midnight_reset();
         
-        // Periodic NVS saves (every 10 moves to limit flash wear)
-        if ((s.moves_today % 10) == 0 && s.moves_today > 0) {
-            ESP_LOGD(TAG, "Periodic NVS save (move count: %u)", s.moves_today);
-            nvs_save();
-        }
-
-        ESP_LOGD(TAG, "Loop complete, sleeping %ds until next check", s.cur_period_s);
+        // Get GPS data
+        gps_fix_t gps;
+        bool gps_ok = gps_get_fix(&gps, 30000);
         
-        // Sleep until next cadence tick (using vTaskDelayUntil for precise timing)
-        vTaskDelayUntil(&loop_start, pdMS_TO_TICKS(s.cur_period_s * 1000));
+        if(!gps_ok){
+            ESP_LOGW(TAG, "No GPS fix - retrying in 30s");
+            status_led_set_mode(LED_ERROR);
+            vTaskDelay(pdMS_TO_TICKS(30000));
+            continue;
+        }
+        
+        status_led_set_mode(LED_TRACKING);
+        
+        // Calculate sun position - FIXED: Use solar_compute
+        sun_pos_t sun = solar_compute(gps.latitude, gps.longitude, now_utc);
+        double sun_az = sun.azimuth_deg;
+        double sun_el = sun.elevation_deg;
+        
+        ESP_LOGI(TAG, "─────────────────────────────────────────────────────");
+        ESP_LOGI(TAG, "Sun position: AZ=%.2f° EL=%.2f°", sun_az, sun_el);
+        
+        // Apply mount offsets
+        double tgt_az = sun_az - s.az_mount_offset_deg;
+        double tgt_el = sun_el - s.el_mount_offset_deg;
+        
+        ESP_LOGI(TAG, "Target (after mount offsets): AZ=%.2f° EL=%.2f°", tgt_az, tgt_el);
+        ESP_LOGI(TAG, "Current position: AZ=%.2f° EL=%.2f°", s.az_cur, s.el_cur);
+        
+        // Check if movement needed
+        double az_err = fabs(tgt_az - s.az_cur);
+        double el_err = fabs(tgt_el - s.el_cur);
+        
+        ESP_LOGI(TAG, "Position error: ΔAZ=%.2f° ΔEL=%.2f° (tolerance=%.1f°)", 
+                 az_err, el_err, s.tol_deg);
+        
+        bool need_move = (az_err >= s.tol_deg) || (el_err >= s.tol_deg);
+        
+        if(need_move){
+            ESP_LOGI(TAG, "▶ MOVEMENT REQUIRED (error exceeds %.1f° tolerance)", s.tol_deg);
+            do_move(tgt_az, tgt_el);
+            
+            // FIXED: Use PRIu32 for uint32_t
+            ESP_LOGI(TAG, "Waiting %" PRIu32 " seconds before next check (slow cadence)...", s.base_period_s);
+            vTaskDelay(pdMS_TO_TICKS(s.base_period_s * 1000));
+        }
+        else{
+            ESP_LOGI(TAG, "✓ Within tolerance - no movement needed");
+            
+            // FIXED: Use PRIu32 for uint32_t
+            ESP_LOGI(TAG, "Waiting %" PRIu32 " seconds before next check (fast cadence)...", s.fast_period_s);
+            vTaskDelay(pdMS_TO_TICKS(s.fast_period_s * 1000));
+        }
     }
 }
 

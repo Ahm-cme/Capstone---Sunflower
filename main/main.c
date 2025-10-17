@@ -301,9 +301,9 @@ void app_main(void){
     struct tm timeinfo = {0};
     timeinfo.tm_year = 2025 - 1900;  // Years since 1900
     timeinfo.tm_mon = 10 - 1;        // Months since January (0-11)
-    timeinfo.tm_mday = 15;           // Day of month (1-31)
-    timeinfo.tm_hour = 15;           // Hour (0-23) - 3:30 PM
-    timeinfo.tm_min = 30;            // Minutes (0-59)
+    timeinfo.tm_mday = 17;           // Day of month (1-31)
+    timeinfo.tm_hour = 12;           // Hour (0-23) - 12:00 PM
+    timeinfo.tm_min = 0;            // Minutes (0-59)
     timeinfo.tm_sec = 0;             // Seconds (0-59)
     timeinfo.tm_isdst = 0;           // Daylight saving time flag
     
@@ -372,9 +372,9 @@ void app_main(void){
         .az_pwm_pin = MOTOR_AZ_PWM, .az_dir_pin = MOTOR_AZ_DIR,
         .el_pwm_pin = MOTOR_EL_PWM, .el_dir_pin = MOTOR_EL_DIR,
         
-        // Actuator specifications (adjust to match your hardware)
+        // Actuator specifications (UPDATED FOR FASTER TESTING)
         .stroke_mm = 200.0,         // 200mm stroke linear actuators
-        .speed_mm_per_s = 11.938,   // Nominal speed at 12V (varies with load/voltage)
+        .speed_mm_per_s = 11.111,   // 200mm ÷ 18s = 11.111 mm/s at PWM=255
         
         // Panel range limits (adjust to match your mechanical design)
         .max_az_deg = 270,          // Maximum azimuth range
@@ -472,7 +472,7 @@ void app_main(void){
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Configuration:");
     ESP_LOGI(TAG, "  • Location: Auburn, AL (32.5990°N, 85.4808°W)");
-    ESP_LOGI(TAG, "  • Time: October 15, 2025, 2:30 PM CST");
+    ESP_LOGI(TAG, "  • Time: October 16, 2025, 12:00 PM CST");
     ESP_LOGI(TAG, "  • System base: North-facing (0° azimuth)");
     ESP_LOGI(TAG, "  • Panel initial: Vertical/UP (90° elevation)");
     ESP_LOGI(TAG, "  • GPS Hardware: Not required (hardcoded)");

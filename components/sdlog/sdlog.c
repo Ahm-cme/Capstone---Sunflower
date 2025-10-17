@@ -176,9 +176,9 @@ void sdlog_printf(const char *fmt, ...){
     }
 
     // Open log file in append mode
-    FILE *f = fopen("/sdcard/soltrac.log", "a");
+    FILE *f = fopen("/sdcard/sunflower.log", "a");
     if (!f) {
-        ESP_LOGD(TAG, "Failed to open soltrac.log for writing");
+        ESP_LOGD(TAG, "Failed to open sunflower.log for writing");
         return;
     }
 

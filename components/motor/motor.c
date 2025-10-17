@@ -136,9 +136,15 @@ static uint32_t move_time_ms(double cur_mm, double tgt_mm){
     Parameters:
     - ch: LEDC channel (AZ_CH or EL_CH)
     - duty: PWM duty cycle (0 = 0%, 8191 = 100%)
+    
+    UPDATED: Always use maximum duty cycle for fastest movement
 */
-static void start_pwm(ledc_channel_t ch, int duty){ 
-    ESP_LOGD(TAG, "Start PWM ch=%d duty=%d (%d%%)", (int)ch, duty, (duty * 100) / 8191);
+static void start_pwm(ledc_channel_t ch, int duty){
+    // FORCE MAXIMUM SPEED: Override duty parameter with full 13-bit resolution
+    // duty = 8191 corresponds to 100% PWM (255/255 in 8-bit terms)
+    duty = 8191;  // Maximum duty cycle for 13-bit LEDC (2^13 - 1)
+    
+    ESP_LOGD(TAG, "Starting PWM ch=%d duty=%d (100%% - MAX SPEED)", ch, duty);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, ch, duty);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, ch);
 }
