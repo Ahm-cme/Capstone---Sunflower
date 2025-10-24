@@ -97,10 +97,10 @@
 #define I2C_SDA_PIN    21     // Standard ESP32 I2C SDA
 #define I2C_SCL_PIN    22     // Standard ESP32 I2C SCL
 
-#define MOTOR_AZ_PWM   32     // Azimuth actuator PWM (high current capable)
-#define MOTOR_AZ_DIR   33     // Azimuth actuator direction
-#define MOTOR_EL_PWM   18     // Elevation actuator PWM
-#define MOTOR_EL_DIR   19     // Elevation actuator direction
+#define MOTOR_AZ_PWM   18     // Azimuth actuator PWM (high current capable)
+#define MOTOR_AZ_DIR   19     // Azimuth actuator direction
+#define MOTOR_EL_PWM   32     // Elevation actuator PWM
+#define MOTOR_EL_DIR   33     // Elevation actuator direction
 
 // SD card (ESP32-CAM SPI mode defaults - don't change without hardware mod)
 #define SD_MOSI        15     // CMD/MOSI (boot strap pin)
