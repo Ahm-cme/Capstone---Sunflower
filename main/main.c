@@ -243,7 +243,7 @@ static void calib_task(void *arg){
 */
 void app_main(void){
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
-    ESP_LOGI(TAG, "║  SOLTRAC SOLAR TRACKER - HARDCODED LOCATION MODE        ║");
+    ESP_LOGI(TAG, "║  SUNFLOWER SOLAR TRACKER - HARDCODED LOCATION MODE        ║");
     ESP_LOGI(TAG, "═══════════════════════════════════════════════════════════");
     ESP_LOGI(TAG, "Firmware build: %s %s", __DATE__, __TIME__);
     ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
@@ -301,7 +301,7 @@ void app_main(void){
     struct tm timeinfo = {0};
     timeinfo.tm_year = 2025 - 1900;  // Years since 1900
     timeinfo.tm_mon = 10 - 1;        // Months since January (0-11)
-    timeinfo.tm_mday = 17;           // Day of month (1-31)
+    timeinfo.tm_mday = 22;           // Day of month (1-31)
     timeinfo.tm_hour = 12;           // Hour (0-23) - 12:00 PM
     timeinfo.tm_min = 0;            // Minutes (0-59)
     timeinfo.tm_sec = 0;             // Seconds (0-59)

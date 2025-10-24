@@ -42,7 +42,7 @@
     │ - Enable DEBUG logs to see sun calculations and movement decisions   │
     │ - CSV logs provide historical tracking performance data             │
     │ - LED patterns indicate system health at a glance                   │
-    │ - NVS state survives reboots for troubleshooting                    │
+    │ - NVS state survives reboots for troubleshooting                    │`
     └───────────────────────────────────────────────────────────────────────┘
 */
 
