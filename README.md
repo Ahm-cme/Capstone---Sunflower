@@ -42,7 +42,7 @@ Autonomous dual‑axis solar panel tracker using an ESP32. Computes real‑time 
 ```
 GPS (UART):         TX=17, RX=16, 9600 baud (NMEA-0183)
 Compass (I2C):      SDA=21, SCL=22, Addr=0x1E (HMC5883)
-Motors (PWM+DIR):   AZ_PWM=32, AZ_DIR=33, EL_PWM=18, EL_DIR=19  
+Motors (PWM+DIR):   AZ_PWM=18, AZ_DIR=19, EL_PWM=32, EL_DIR=33  
 SD Card (SPI):      MOSI=15, MISO=2, SCK=14, CS=13
 User Interface:     LED=4, Button=5
 Power:              12V battery + solar panel charging
