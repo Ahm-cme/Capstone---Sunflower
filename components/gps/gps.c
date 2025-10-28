@@ -15,6 +15,7 @@
     - Reads NMEA sentences from UART, verifies checksum, parses GGA and RMC.
     - Maintains a cached last valid fix (s_last).
     - Talks to HMC5883 via I2C, supports calibration saved in NVS.
+    - Provides magnetic declination correction for true north conversion.
 */
 
 #define TAG "GPS"
@@ -36,11 +37,63 @@ typedef struct {
     int16_t y_min, y_max;
     int16_t z_min, z_max;
     bool calibrated;
+    float declination_deg;  // User-configured or estimated magnetic declination
 } compass_cal_t;
 
 static gps_cfg_t  s_cfg;
 static gps_data_t s_last = {0};
 static compass_cal_t s_compass_cal = {0};
+
+/* ────────────────────── Magnetic Declination Helpers ─────────────────── */
+
+/*
+ * Estimate magnetic declination for a given location.
+ * 
+ * This is a simplified approximation based on regional patterns.
+ * For production use, integrate full WMM (World Magnetic Model) library
+ * or query NOAA API: https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+ * 
+ * Returns declination in degrees:
+ *   Positive = magnetic north is EAST of true north
+ *   Negative = magnetic north is WEST of true north
+ */
+static float estimate_magnetic_declination(double lat, double lon) {
+    // North America approximation (rough linear gradient)
+    if (lat > 25.0 && lat < 50.0 && lon > -125.0 && lon < -65.0) {
+        // Eastern US: ~-10° to -15°
+        // Central US: ~0° to -5°  
+        // Western US: ~10° to +15°
+        // Simple east-west linear interpolation
+        float decl = 15.0f * (float)(lon + 95.0) / 30.0f;
+        
+        ESP_LOGD(TAG, "Estimated declination for %.2f,%.2f: %.1f°", lat, lon, decl);
+        return decl;
+    }
+    
+    // Europe approximation
+    if (lat > 35.0 && lat < 70.0 && lon > -10.0 && lon < 40.0) {
+        // Western Europe: ~-5° to +5°
+        // Eastern Europe: ~5° to +15°
+        float decl = 10.0f * (float)(lon + 5.0) / 35.0f;
+        
+        ESP_LOGD(TAG, "Estimated declination for %.2f,%.2f: %.1f°", lat, lon, decl);
+        return decl;
+    }
+    
+    // Australia approximation
+    if (lat > -45.0 && lat < -10.0 && lon > 110.0 && lon < 155.0) {
+        // Eastern Australia: ~10° to +15°
+        float decl = 12.5f;
+        
+        ESP_LOGD(TAG, "Estimated declination for %.2f,%.2f: %.1f°", lat, lon, decl);
+        return decl;
+    }
+    
+    // Default: unknown location
+    ESP_LOGW(TAG, "Location %.2f,%.2f outside known regions - using 0° declination", lat, lon);
+    ESP_LOGW(TAG, "For accurate tracking, manually set declination using gps_set_magnetic_declination()");
+    return 0.0f;
+}
 
 /* ────────────────────────── NMEA Helpers ─────────────────────────────── */
 
@@ -150,6 +203,7 @@ static void compass_load_calibration(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "No compass calibration in NVS");
         s_compass_cal.calibrated = false;
+        s_compass_cal.declination_deg = 0.0f;
         return;
     }
     
@@ -158,13 +212,15 @@ static void compass_load_calibration(void) {
     nvs_close(h);
     
     if (ret == ESP_OK && s_compass_cal.calibrated) {
-        ESP_LOGI(TAG, "Compass calibration loaded: X[%d,%d] Y[%d,%d] Z[%d,%d]",
+        ESP_LOGI(TAG, "Compass calibration loaded: X[%d,%d] Y[%d,%d] Z[%d,%d] decl=%.1f°",
                  s_compass_cal.x_min, s_compass_cal.x_max,
                  s_compass_cal.y_min, s_compass_cal.y_max,
-                 s_compass_cal.z_min, s_compass_cal.z_max);
+                 s_compass_cal.z_min, s_compass_cal.z_max,
+                 s_compass_cal.declination_deg);
     } else {
         ESP_LOGW(TAG, "Compass not calibrated - heading will be inaccurate");
         s_compass_cal.calibrated = false;
+        s_compass_cal.declination_deg = 0.0f;
     }
 }
 
@@ -180,7 +236,7 @@ static void compass_save_calibration(void) {
     ret = nvs_set_blob(h, "compass_cal", &s_compass_cal, sizeof(compass_cal_t));
     if (ret == ESP_OK) {
         nvs_commit(h);
-        ESP_LOGI(TAG, "Compass calibration saved to NVS");
+        ESP_LOGI(TAG, "Compass calibration saved to NVS (decl=%.1f°)", s_compass_cal.declination_deg);
     }
     nvs_close(h);
 }
@@ -385,16 +441,62 @@ bool gps_get_compass_heading(float *heading_deg) {
     
     *heading_deg = heading;
     
-    ESP_LOGD(TAG, "Compass: raw[%d,%d,%d] heading=%.1f°", x, y, z, heading);
+    ESP_LOGD(TAG, "Compass: raw[%d,%d,%d] magnetic_heading=%.1f°", x, y, z, heading);
     
     return true;
+}
+
+bool gps_get_compass_heading_true(float *heading_true_deg) {
+    float mag_heading;
+    if (!gps_get_compass_heading(&mag_heading)) {
+        return false;
+    }
+    
+    // Get declination (user-configured or estimated)
+    float declination = s_compass_cal.declination_deg;
+    
+    // If no declination set, try to estimate from GPS location
+    if (fabs(declination) < 0.1f) {
+        gps_data_t gps;
+        if (gps_get_last(&gps) && gps.valid) {
+            declination = estimate_magnetic_declination(gps.latitude, gps.longitude);
+            ESP_LOGI(TAG, "Using estimated declination %.1f° for %.2f,%.2f",
+                     declination, gps.latitude, gps.longitude);
+        } else {
+            ESP_LOGW(TAG, "No GPS fix - can't estimate declination, using 0°");
+        }
+    }
+    
+    // Convert magnetic to true: true_north = magnetic_north + declination
+    *heading_true_deg = mag_heading + declination;
+    
+    // Normalize to 0-360
+    while (*heading_true_deg < 0) *heading_true_deg += 360.0f;
+    while (*heading_true_deg >= 360) *heading_true_deg -= 360.0f;
+    
+    ESP_LOGD(TAG, "Heading: magnetic=%.1f° + decl=%.1f° = true=%.1f°",
+             mag_heading, declination, *heading_true_deg);
+    
+    return true;
+}
+
+void gps_set_magnetic_declination(float declination_deg) {
+    s_compass_cal.declination_deg = declination_deg;
+    compass_save_calibration();
+    
+    ESP_LOGI(TAG, "Magnetic declination set to %.1f°", declination_deg);
+}
+
+float gps_get_magnetic_declination(void) {
+    return s_compass_cal.declination_deg;
 }
 
 bool gps_calibrate_compass(void) {
     ESP_LOGI(TAG, "=== COMPASS CALIBRATION ===");
     ESP_LOGI(TAG, "Slowly rotate system 360° horizontally (2-3 circles)...");
     
-    // Reset calibration data
+    // Reset calibration data (but preserve declination)
+    float saved_decl = s_compass_cal.declination_deg;
     s_compass_cal.x_min = 32767;
     s_compass_cal.x_max = -32768;
     s_compass_cal.y_min = 32767;
@@ -402,6 +504,7 @@ bool gps_calibrate_compass(void) {
     s_compass_cal.z_min = 32767;
     s_compass_cal.z_max = -32768;
     s_compass_cal.calibrated = false;
+    s_compass_cal.declination_deg = saved_decl;
     
     // Collect samples for 20 seconds
     uint32_t start = xTaskGetTickCount();

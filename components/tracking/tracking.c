@@ -319,7 +319,7 @@ void tracking_calibrate_mount_offset_now(void){
 /*
  * Auto-calibration using compass:
  * - Requires compass calibration and valid GPS.
- * - Uses sun azimuth vs magnetic heading to derive az offset.
+ * - Uses sun azimuth vs TRUE compass heading (declination-corrected) to derive az offset.
  * - EL offset left as 0.
  */
 void tracking_auto_calibrate_with_compass(void) {
@@ -341,21 +341,25 @@ void tracking_auto_calibrate_with_compass(void) {
 
     ESP_LOGI(TAG, "Sun: az=%.2f° el=%.2f°", sun.azimuth_deg, sun.elevation_deg);
 
-    if (sun.elevation_deg < 15.0) {               // Avoid low-elevation error
+    if (sun.elevation_deg < 15.0) {
         ESP_LOGW(TAG, "Sun too low (%.1f°), wait until >15°", sun.elevation_deg);
         return;
     }
 
-    float compass_heading;
-    if (!gps_get_compass_heading(&compass_heading)) {
+    // Get TRUE compass heading (declination-corrected)
+    float compass_heading_true;
+    if (!gps_get_compass_heading_true(&compass_heading_true)) {
         ESP_LOGE(TAG, "Failed to read compass");
         return;
     }
 
-    ESP_LOGI(TAG, "Compass: %.2f° magnetic", compass_heading);
+    float declination = gps_get_magnetic_declination();
+    ESP_LOGI(TAG, "Compass: %.2f° true north (declination: %.1f°)",
+             compass_heading_true, declination);
 
-    double az_offset = compass_heading - sun.azimuth_deg;  // Magnetic vs sun
-    while (az_offset > 180.0) az_offset -= 360.0;          // Normalize to [-180,180]
+    // Calculate mount offset using TRUE headings (both compass and sun are now in true north frame)
+    double az_offset = compass_heading_true - sun.azimuth_deg;
+    while (az_offset > 180.0) az_offset -= 360.0;
     while (az_offset < -180.0) az_offset += 360.0;
 
     s.az_mount_offset_deg = az_offset;
@@ -363,10 +367,11 @@ void tracking_auto_calibrate_with_compass(void) {
     nvs_save();
 
     ESP_LOGI(TAG, "=== CALIBRATION COMPLETE ===");
-    ESP_LOGI(TAG, "Mount offset: az=%.2f° el=%.2f°",
+    ESP_LOGI(TAG, "Mount offset: az=%.2f° el=%.2f° (declination-corrected)",
              s.az_mount_offset_deg, s.el_mount_offset_deg);
 
-    sdlog_printf("Auto-calibration: az_off=%.2f", s.az_mount_offset_deg);
+    sdlog_printf("Auto-calibration: az_off=%.2f (decl=%.1f)", 
+                 s.az_mount_offset_deg, declination);
 }
 
 /*

@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include "driver/uart.h"
+#include "driver/i2c.h"
 #include "esp_err.h"
 
 /*
@@ -82,14 +84,45 @@ bool gps_get_last(gps_data_t *out);
 bool gps_get_compass_heading(float *heading_deg);
 
 /*
-    Run compass calibration routine.
-    - Rotate system 2–3 full turns horizontally.
-    - Captures min/max, stores calibration in NVS.
-    - Returns true when enough samples are collected.
-*/
-bool gps_calibrate_compass(void);
+ * Get compass heading corrected to TRUE north (not magnetic).
+ * 
+ * Applies magnetic declination correction:
+ *   true_heading = magnetic_heading + declination
+ * 
+ * Declination sources (in priority order):
+ *   1. User-configured value (via gps_set_magnetic_declination)
+ *   2. Estimated from GPS location (regional approximation)
+ *   3. Zero if no GPS fix available
+ * 
+ * Returns:
+ *   true  - heading retrieved successfully
+ *   false - compass read failed
+ */
+bool gps_get_compass_heading_true(float *heading_true_deg);
 
 /*
-    Query whether compass calibration data exists in NVS.
-*/
+ * Set magnetic declination for current location (degrees).
+ * 
+ * Call once after installation with value from:
+ *   https://www.ngdc.noaa.gov/geomag/calculators/magcalc.shtml
+ * 
+ * Positive = magnetic north is EAST of true north
+ * Negative = magnetic north is WEST of true north
+ * 
+ * Example values:
+ *   New York, NY: -13°
+ *   Los Angeles, CA: +12°
+ *   London, UK: +1°
+ *   Sydney, Australia: +12°
+ * 
+ * Stored in NVS, persists across reboots.
+ */
+void gps_set_magnetic_declination(float declination_deg);
+
+/*
+ * Get current declination setting (returns 0 if not configured).
+ */
+float gps_get_magnetic_declination(void);
+
+bool gps_calibrate_compass(void);
 bool gps_is_compass_calibrated(void);
