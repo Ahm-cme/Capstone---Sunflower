@@ -38,8 +38,8 @@
 
 #define TAG "MOTOR"
 
-// Safety factor: use 85% of calculated time to prevent overshoot
-#define TIMING_SAFETY_FACTOR 0.85
+// Safety factor: use 90% of calculated time to prevent overshoot
+#define TIMING_SAFETY_FACTOR 0.90
 
 // Minimum safety buffer added to all moves (ms)
 #define MIN_SAFETY_BUFFER_MS 100

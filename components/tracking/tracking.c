@@ -35,9 +35,21 @@
  * - az/el in mount frame (after offsets)
  * - dynamic cadence (fast while waiting, slower after move)
  * - nightly homing configuration
+ * 
+ * Home position philosophy:
+ * - Actuators at midpoint (50% stroke, both half-extended)
+ * - Panel faces straight up (zenith) at home position
+ * - This is the safest position: balanced, no mechanical stress
+ * - AZ midpoint = 135° (half of 270° range)
+ * - EL midpoint = 47.5° (midpoint between 10° and 85°)
+ * 
+ * Timing calculation:
+ * - Full stroke: 200mm ÷ 11.94 mm/s = 16.7 seconds (measured)
+ * - Half stroke (to midpoint): 100mm ÷ 11.94 mm/s = 8.3 seconds
+ * - With 90% safety factor: 8.3s × 0.9 + 0.1s buffer ≈ 7.6 seconds actual move time
  */
 static tracker_state_t s = {
-    .az_cur=180, .el_cur=45,           // Initial assumed pose
+    .az_cur=135, .el_cur=47.5,         // Initial assumed pose (actuators at midpoint)
     .tol_deg=10, .min_step_deg=2,      // Move thresholds
     .update_period_s=300,              // Legacy (kept for compatibility)
     .sleep_thresh_el=5,                // Sleep below this elevation (deg)
@@ -47,12 +59,12 @@ static tracker_state_t s = {
     .prewake_min=10,                   // Wake before sunrise (minutes)
     .az_mount_offset_deg = 0.0,        // Install-time offset (earth→mount)
     .el_mount_offset_deg = 0.0,
-    .home_az_deg = 0.0,                // Pose assigned after homing
-    .home_el_deg = 85.0,
-    .homing_time_ms = 22000,           // Time to reach mechanical stops
-    .az_home_dir_level = 0,            // DIR level toward AZ stop
-    .el_home_dir_level = 1,            // DIR level toward EL stop
-    .last_move_az_tgt=180, .last_move_el_tgt=45
+    .home_az_deg = 135.0,              // Home = 50% of 270° AZ range
+    .home_el_deg = 47.5,               // Home = midpoint of 10-85° EL range
+    .homing_time_ms = 8300,            // Time to reach midpoint from either extreme (half of 16.7s full stroke)
+    .az_home_dir_level = 0,            // DIR level toward AZ midpoint (calculated dynamically by motor_move_az)
+    .el_home_dir_level = 0,            // DIR level toward EL midpoint (calculated dynamically by motor_move_el)
+    .last_move_az_tgt=135, .last_move_el_tgt=47.5
 };
 
 static SemaphoreHandle_t s_mutex;      // Reserved for future multi-thread access to 's'
@@ -218,21 +230,33 @@ static bool is_descending(double lat, double lon){
 }
 
 /*
- * Nightly homing: drive to mechanical stops and assign known angles.
- * Resets open-loop drift; persists updated pose.
+ * Nightly homing: move to safe midpoint position (actuators half-extended, panel facing up).
+ * This is the balanced, low-stress position for overnight parking.
+ * 
+ * New approach:
+ * - Instead of driving to mechanical stops, move to calculated midpoint
+ * - Uses normal motor_move_* functions with conservative timing
+ * - Safer and puts less stress on actuators than hard-stop homing
+ * - Position accuracy maintained by conservative motor timing + periodic recalibration
  */
-static void home_to_stops(void){
-    ESP_LOGI(TAG, "=== HOMING SEQUENCE START ===");
+static void home_to_midpoint(void){
+    ESP_LOGI(TAG, "=== HOMING TO MIDPOINT ===");
+    ESP_LOGI(TAG, "Moving to safe park position: az=%.1f° el=%.1f° (actuators at 50%%)",
+             s.home_az_deg, s.home_el_deg);
 
-    status_led_set_mode(LED_SLEEP);               // Solid off during homing
+    status_led_set_mode(LED_SLEEP);               // Visual feedback
 
-    ESP_LOGI(TAG, "AZ to retract stop...");
-    motor_run_az_ms(s.az_home_dir_level, s.homing_time_ms);
+    // Move to home position using normal tracking moves (with conservative timing)
+    ESP_LOGI(TAG, "AZ to midpoint (%.1f°)...", s.home_az_deg);
+    motor_move_az(s.az_cur, s.home_az_deg);
+    
+    vTaskDelay(pdMS_TO_TICKS(500));               // Brief pause between axes
+    
+    ESP_LOGI(TAG, "EL to midpoint (%.1f°)...", s.home_el_deg);
+    motor_move_el(s.el_cur, s.home_el_deg);
 
-    ESP_LOGI(TAG, "EL to extend stop...");
-    motor_run_el_ms(s.el_home_dir_level, s.homing_time_ms);
-
-    s.az_cur = s.home_az_deg;                     // Assign reference pose
+    // Update state to home position
+    s.az_cur = s.home_az_deg;
     s.el_cur = s.home_el_deg;
     s.last_move_az_tgt = s.az_cur;
     s.last_move_el_tgt = s.el_cur;
@@ -240,9 +264,10 @@ static void home_to_stops(void){
     nvs_save();                                   // Persist new pose
 
     ESP_LOGI(TAG, "=== HOMING COMPLETE ===");
-    ESP_LOGI(TAG, "Position reset: az=%.1f° el=%.1f°", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "Position reset: az=%.1f° el=%.1f° (facing zenith, balanced)", 
+             s.az_cur, s.el_cur);
 
-    sdlog_printf("HOMED: az=%.1f el=%.1f", s.az_cur, s.el_cur);
+    sdlog_printf("HOMED: az=%.1f el=%.1f (midpoint)", s.az_cur, s.el_cur);
     status_led_set_mode(LED_TRACKING);
 }
 
@@ -360,6 +385,8 @@ static void tracking_task(void *arg){
     s.last_move_az_tgt = s.az_cur;                  // Initialize deltas
     s.last_move_el_tgt = s.el_cur;
 
+    ESP_LOGI(TAG, "Home position: az=%.1f° el=%.1f° (actuators at midpoint, facing zenith)",
+             s.home_az_deg, s.home_el_deg);
     ESP_LOGI(TAG, "Tracking loop starting (%ds cadence)", s.cur_period_s);
 
     // Optional auto-calibration on first boot (if compass ready and no offsets)
@@ -432,7 +459,7 @@ static void tracking_task(void *arg){
             ESP_LOGI(TAG, "=== ENTERING SLEEP MODE ===");
 
             status_led_set_mode(LED_SLEEP);
-            home_to_stops();                         // Reset reference before sleep
+            home_to_midpoint();                      // Park at safe midpoint position
 
             sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
                 now, g.latitude, g.longitude, g.fix_type, g.num_satellites,

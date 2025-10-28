@@ -376,7 +376,7 @@ void app_main(void){
         .az_pwm_pin = MOTOR_AZ_PWM, .az_dir_pin = MOTOR_AZ_DIR,
         .el_pwm_pin = MOTOR_EL_PWM, .el_dir_pin = MOTOR_EL_DIR,
         .stroke_mm = 200.0,
-        .speed_mm_per_s = 11.938,
+        .speed_mm_per_s = 11.94,       // Measured: 200mm ÷ 16.7s = 11.94 mm/s
         .max_az_deg = 270,
         .max_el_deg = 85,
         .min_el_deg = 10
