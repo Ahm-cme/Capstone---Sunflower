@@ -1,23 +1,20 @@
 #pragma once
 /*
-    ┌───────────────────────────────────────────────────────────────────────┐
-    │ GPS (BN-880 over UART) + HMC5883 Compass (I2C)                       │
-    │ - NMEA-0183 sentence parser (GGA, RMC)                               │
-    │ - 9600 bps, 1Hz update rate                                          │
-    │ - HMC5883 compass for automatic mount orientation detection           │
-    └───────────────────────────────────────────────────────────────────────┘
+    GPS + Compass Module (BN-880 over UART, HMC5883 over I2C)
 
-    Wiring (project default):
-    - UART: UART_NUM_2, TX=GPIO17, RX=GPIO16
-    - GPS TX → ESP32 RX (GPIO16)
-    - GPS RX → ESP32 TX (GPIO17) [optional, for config]
-    - I2C: SDA=GPIO21, SCL=GPIO22 (for HMC5883 compass)
-    - GPS VCC → 5V, GND → GND
+    Purpose:
+    - Parse GPS position/time from NMEA (GGA, RMC) at 9600 bps, 1 Hz.
+    - Read magnetic heading from HMC5883 for automatic mount orientation.
+    - Provide a cached last-fix for use when live data is momentarily unavailable.
+
+    Project wiring (default):
+    - UART2: TX=GPIO17 (ESP32→GPS RX, optional), RX=GPIO16 (GPS TX→ESP32)
+    - I2C0:  SDA=GPIO21, SCL=GPIO22 (HMC5883)
+    - GPS power: VCC 5V, GND
 
     Notes:
-    - BN-880 outputs NMEA sentences at 9600 baud, 1Hz by default
-    - We parse GGA (position) and RMC (time, speed, heading)
-    - HMC5883 compass on I2C for automatic calibration
+    - Magnetic heading is relative to magnetic north (apply declination externally if needed).
+    - Call gps_init() once before using other functions.
 */
 
 #include <stdbool.h>
@@ -25,98 +22,74 @@
 #include <time.h>
 #include "esp_err.h"
 
+/*
+    Parsed GPS fix (latest valid values).
+*/
 typedef struct {
-    double   latitude;          // degrees
-    double   longitude;         // degrees
-    double   altitude_m;        // meters (MSL)
-    uint8_t  fix_type;          // 0=no fix, 1=GPS fix, 2=DGPS fix
-    uint8_t  num_satellites;    // SVs used
+    double   latitude;          // degrees (+N, -S)
+    double   longitude;         // degrees (+E, -W)
+    double   altitude_m;        // meters MSL
+    uint8_t  fix_type;          // 0=no fix, 1=GPS, 2=DGPS
+    uint8_t  num_satellites;    // satellites used
     bool     valid;             // true if fields are valid
-    time_t   timestamp;         // local epoch when fix parsed
+    time_t   timestamp;         // local epoch when parsed
     float    ground_speed_mps;  // m/s (from RMC)
-    float    heading_deg;       // degrees (course over ground from RMC)
+    float    heading_deg;       // course over ground (deg, from RMC)
 } gps_data_t;
 
+/*
+    Static configuration for UART (GPS) and I2C (compass).
+*/
 typedef struct {
-    int      uart_port;  // UART_NUM_2 recommended
-    int      tx_io;      // GPIO17 (ESP32 TX → GPS RX)
-    int      rx_io;      // GPIO16 (ESP32 RX ← GPS TX)
-    int      baud_rate;  // 9600 (BN-880 default)
-    
-    // I2C for HMC5883 compass
-    int      i2c_port;   // I2C_NUM_0 recommended
-    int      sda_io;     // GPIO21 (I2C data)
-    int      scl_io;     // GPIO22 (I2C clock)
+    // UART (GPS)
+    int uart_port;   // e.g., UART_NUM_2
+    int tx_io;       // ESP32 TX → GPS RX (optional)
+    int rx_io;       // ESP32 RX ← GPS TX
+    int baud_rate;   // 9600
+
+    // I2C (HMC5883)
+    int i2c_port;    // e.g., I2C_NUM_0
+    int sda_io;      // GPIO for SDA
+    int scl_io;      // GPIO for SCL
 } gps_cfg_t;
 
 /*
-    Initialize UART and GPS module + HMC5883 compass.
-    - Configures UART with 9600-8-N-1
-    - Sets up RX buffer for NMEA sentences
-    - Initializes I2C for compass
-    - Configures HMC5883 for continuous mode
-    - Returns ESP_OK on success
+    Initialize UART (NMEA 9600-8-N-1) and I2C compass.
+    - Sets UART RX buffer for NMEA lines.
+    - Puts HMC5883 into continuous-conversion mode.
+    - Returns ESP_OK on success.
 */
 esp_err_t gps_init(const gps_cfg_t *cfg);
 
 /*
-    Read and parse NMEA sentences from GPS.
-    - Returns true if a valid fix is parsed and 'out' is filled
-    - Also updates the internal last-fix cache on success
-    - Blocks briefly to read UART data
+    Poll UART, parse NMEA (GGA/RMC).
+    - On success: fills 'out', updates internal last-fix cache, returns true.
+    - May block briefly while reading.
 */
 bool gps_poll_nav_pvt(gps_data_t *out);
 
 /*
-    Copy the last known good fix into 'out'.
-    - Returns false if no valid fix has ever been parsed this boot
+    Copy last valid fix (from internal cache) into 'out'.
+    - Returns false if no valid fix has been seen since boot.
 */
 bool gps_get_last(gps_data_t *out);
 
 /*
-    Read magnetic heading from HMC5883 compass.
-    
-    Returns: true if valid heading obtained
-    
-    Parameters:
-    - heading_deg: output magnetic heading (0-360°, 0=North, 90=East)
-    
-    Notes:
-    - Heading is magnetic north (not true north)
-    - Add local magnetic declination for true north
-    - For solar tracking, magnetic north is fine (consistent reference)
-    - Compass should be calibrated away from motors/metal
-    
-    Usage example:
-        float mount_heading;
-        if (gps_get_compass_heading(&mount_heading)) {
-            ESP_LOGI("APP", "Mount facing: %.1f° magnetic", mount_heading);
-        }
+    Read magnetic heading from HMC5883.
+    - Returns true on success.
+    - heading_deg: 0–360 (0=North, 90=East), magnetic north.
 */
 bool gps_get_compass_heading(float *heading_deg);
 
 /*
-    Perform compass calibration routine.
-    
-    Instructions:
-    1. Call this function to start calibration
-    2. Slowly rotate the entire system 360° horizontally (2-3 full circles)
-    3. Calibration captures min/max values for each axis
-    4. Returns true when sufficient data collected
-    
-    This should be done once after hardware assembly, away from:
-    - Power lines
-    - Large metal objects
-    - Motors (while off)
-    - Magnetic materials
-    
-    Calibration data is stored in NVS and persists across reboots.
-    Re-calibrate if you move the system or add nearby metal.
+    Run compass calibration routine.
+    - Rotate system 2–3 full turns horizontally.
+    - Captures min/max, stores calibration in NVS.
+    - Returns true when enough samples are collected.
 */
 bool gps_calibrate_compass(void);
 
 /*
-    Get compass calibration status.
-    Returns: true if compass has been calibrated
+    Query whether compass calibration data exists in NVS.
 */
 bool gps_is_compass_calibrated(void);

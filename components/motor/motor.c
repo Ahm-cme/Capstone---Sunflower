@@ -9,47 +9,40 @@
 #include <math.h>
 
 /*
-    ┌───────────────────────────────────────────────────────────────────────┐
-    │ Implementation Notes & Debugging Hints                               │
-    │                                                                       │
-    │ Common issues and how to debug them:                                  │
-    │                                                                       │
-    │ 1) Actuator moves wrong direction:                                    │
-    │    - Check DIR pin polarity in your wiring                           │
-    │    - Swap DIR logic in homing config, not here                       │
-    │    - Use multimeter to verify DIR pin voltage during moves           │
-    │                                                                       │
-    │ 2) Actuator moves too slow/fast:                                     │
-    │    - Check battery voltage (12V nominal, but varies 10-15V)          │
-    │    - Measure actual speed with ruler + stopwatch                     │
-    │    - Adjust speed_mm_per_s in config                                 │
-    │                                                                       │
-    │ 3) Actuator doesn't move at all:                                     │
-    │    - Check PWM signal with oscilloscope                              │
-    │    - Verify motor driver power supply                                │
-    │    - Test with external PWM source                                   │
-    │                                                                       │
-    │ 4) Tracking accuracy degrades over time:                             │
-    │    - Normal! Open-loop control accumulates error                     │
-    │    - Daily homing should reset this                                  │
-    │    - If homing fails, check mechanical stops                        │
-    │                                                                       │
-    │ 5) PWM frequency too high/low:                                       │
-    │    - 5 kHz is good for most motor drivers                           │
-    │    - Some drivers prefer 1-10 kHz range                             │
-    │    - Higher frequency = smoother but more switching loss             │
-    └───────────────────────────────────────────────────────────────────────┘
+    Motor Control Module (Linear Actuators for AZ/EL)
 
-    The logging levels help during development:
+    What this module does:
+    - Configures LEDC PWM for two actuators (AZ, EL)
+    - Drives direction GPIOs
+    - Provides time-based open-loop moves to target angles
+    - Provides raw timed runs for homing
 
-ESP_LOGV: Verbose details (usually disabled)
-ESP_LOGD: Debug info (enable during development)
-ESP_LOGI: Important operations (always enabled)
-ESP_LOGW: Warnings about limit clamping
-ESP_LOGE: Serious errors that prevent operation
+    Assumptions:
+    - Linear mapping angle↔stroke (sufficient for solar tracking accuracy)
+    - Conservative timing (85% of calculated time) to prevent overshoot
+    - Mechanical limits enforced by angle clamping
+
+    Quick troubleshooting:
+    - Wrong direction: check wiring and DIR level used by homing config
+    - Too slow/fast: verify battery voltage, adjust speed_mm_per_s
+    - No motion: verify PWM present, driver powered, DIR level changes
+    - Drift over days: expected; nightly homing resets reference
+    - PWM issues: 5 kHz, 13-bit resolution is a good default
+
+    Log levels:
+    - V: detailed math/derived values
+    - D: configuration, timing, flow
+    - I: move requests and completions
+    - W/E: clamping and failures
 */
 
 #define TAG "MOTOR"
+
+// Safety factor: use 85% of calculated time to prevent overshoot
+#define TIMING_SAFETY_FACTOR 0.85
+
+// Minimum safety buffer added to all moves (ms)
+#define MIN_SAFETY_BUFFER_MS 100
 
 // Internal state: keep a copy of config and define LEDC channel assignments
 static motor_cfg_t s_cfg;
@@ -59,24 +52,8 @@ static ledc_channel_t EL_CH = LEDC_CHANNEL_1;  // Elevation actuator PWM
 /* ────────────────────── Internal Helper Functions ────────────────────── */
 
 /*
-    Convert panel angle (degrees) to actuator position (millimeters).
-    
-    This uses a simple linear mapping:
-      actuator_mm = (angle_deg / max_angle_deg) * total_stroke_mm
-    
-    Real-world linkages are usually nonlinear (sine/cosine functions), but
-    linear approximation works well enough for solar tracking where we only
-    need ±2-3° accuracy.
-    
-    Parameters:
-    - angle_deg: desired angle in panel coordinate system
-    - max_angle_deg: maximum angle corresponding to full actuator extension
-    
-    Returns: position along actuator stroke in millimeters
-    
-    Edge cases:
-    - angle_deg < 0: clamps to 0 mm (fully retracted)
-    - angle_deg > max: clamps to stroke_mm (fully extended)
+    Map panel angle (deg) to actuator stroke (mm), clamped to [0, stroke_mm].
+    Linear model: (angle / max_angle) * stroke_mm.
 */
 static double angle_to_mm(double angle_deg, double max_angle_deg){
     // Clamp input to valid range to prevent driving past mechanical limits
@@ -97,20 +74,16 @@ static double angle_to_mm(double angle_deg, double max_angle_deg){
 }
 
 /*
-    Calculate time (ms) needed to move between two actuator positions.
+    Compute move time (ms) from distance and nominal speed.
+    Conservative approach:
+    - Calculate base time from kinematics
+    - Apply safety factor (85% of calculated time)
+    - Add minimum safety buffer
     
-    Formula: time = distance / speed + safety_buffer
-    
-    The safety buffer (300 ms) accounts for:
-    - Acceleration/deceleration ramps (actuators aren't instant)
-    - Speed variations due to battery voltage or mechanical load
-    - vTaskDelay() timing quantization (usually ±10 ms)
-    - Better to overshoot slightly than undershoot
-    
-    Parameters:
-    - cur_mm, tgt_mm: current and target positions along actuator stroke
-    
-    Returns: time in milliseconds to complete the move
+    This prevents overshoot due to:
+    - Actuator momentum/inertia
+    - Voltage variations
+    - Manufacturing tolerances
 */
 static uint32_t move_time_ms(double cur_mm, double tgt_mm){
     double distance_mm = fabs(tgt_mm - cur_mm);
@@ -118,24 +91,22 @@ static uint32_t move_time_ms(double cur_mm, double tgt_mm){
     // Base time calculation from kinematics
     double base_time_ms = (distance_mm / s_cfg.speed_mm_per_s) * 1000.0;
     
-    // Add safety buffer for real-world variations
-    uint32_t total_ms = (uint32_t)base_time_ms + 300;
+    // Apply safety factor to prevent overshoot
+    double safe_time_ms = base_time_ms * TIMING_SAFETY_FACTOR;
     
-    ESP_LOGD(TAG, "Move %.2f mm @ %.2f mm/s: base=%.0f ms + 300 ms buffer = %" PRIu32 " ms total",
-             distance_mm, s_cfg.speed_mm_per_s, base_time_ms, total_ms);
+    // Add minimum safety buffer (prevents ultra-short moves from being too aggressive)
+    uint32_t total_ms = (uint32_t)safe_time_ms + MIN_SAFETY_BUFFER_MS;
+    
+    ESP_LOGD(TAG, "Move %.2f mm @ %.2f mm/s:", distance_mm, s_cfg.speed_mm_per_s);
+    ESP_LOGD(TAG, "  Base: %.0f ms", base_time_ms);
+    ESP_LOGD(TAG, "  Safe (%.0f%%): %.0f ms", TIMING_SAFETY_FACTOR * 100, safe_time_ms);
+    ESP_LOGD(TAG, "  Total: %" PRIu32 " ms (with %d ms buffer)", total_ms, MIN_SAFETY_BUFFER_MS);
+    
     return total_ms;
 }
 
 /*
-    Start PWM output on the specified LEDC channel.
-    
-    We use 13-bit PWM resolution (0-8191 range) and typically run at
-    50% duty cycle (4096) which provides good torque without excessive
-    power consumption.
-    
-    Parameters:
-    - ch: LEDC channel (AZ_CH or EL_CH)
-    - duty: PWM duty cycle (0 = 0%, 8191 = 100%)
+    Start PWM on a channel with given duty (0..8191), then update.
 */
 static void start_pwm(ledc_channel_t ch, int duty){ 
     ESP_LOGD(TAG, "Start PWM ch=%d duty=%d (%d%%)", (int)ch, duty, (duty * 100) / 8191);
@@ -144,10 +115,7 @@ static void start_pwm(ledc_channel_t ch, int duty){
 }
 
 /*
-    Stop PWM output on the specified LEDC channel.
-    
-    Sets duty cycle to 0%, allowing the actuator to coast to a stop.
-    DIR pin level is unchanged, so it still shows the last commanded direction.
+    Stop PWM on a channel (sets duty to 0%).
 */
 static void stop_pwm(ledc_channel_t ch){
     ESP_LOGD(TAG, "Stop PWM ch=%d", (int)ch);
@@ -157,14 +125,22 @@ static void stop_pwm(ledc_channel_t ch){
 
 /* ─────────────────────────── Public API ─────────────────────────────── */
 
+/*
+    Initialize PWM timer/channels and DIR pins.
+    Expects motor_cfg_t with pins, stroke, speed, and limits.
+*/
 esp_err_t motor_init(const motor_cfg_t *cfg){
     // Store configuration in module-global state
     s_cfg = *cfg;
     
     ESP_LOGI(TAG, "Initializing motor system...");
     ESP_LOGI(TAG, "  Stroke: %.1f mm @ %.2f mm/s", s_cfg.stroke_mm, s_cfg.speed_mm_per_s);
-    ESP_LOGI(TAG, "  AZ limits: 0° to %.1f° (PWM=%d DIR=%d)", s_cfg.max_az_deg, s_cfg.az_pwm_pin, s_cfg.az_dir_pin);
-    ESP_LOGI(TAG, "  EL limits: %.1f° to %.1f° (PWM=%d DIR=%d)", s_cfg.min_el_deg, s_cfg.max_el_deg, s_cfg.el_pwm_pin, s_cfg.el_dir_pin);
+    ESP_LOGI(TAG, "  Timing safety: %.0f%% + %d ms buffer", 
+             TIMING_SAFETY_FACTOR * 100, MIN_SAFETY_BUFFER_MS);
+    ESP_LOGI(TAG, "  AZ limits: 0° to %.1f° (PWM=%d DIR=%d)", 
+             s_cfg.max_az_deg, s_cfg.az_pwm_pin, s_cfg.az_dir_pin);
+    ESP_LOGI(TAG, "  EL limits: %.1f° to %.1f° (PWM=%d DIR=%d)", 
+             s_cfg.min_el_deg, s_cfg.max_el_deg, s_cfg.el_pwm_pin, s_cfg.el_dir_pin);
 
     // Configure LEDC timer (shared by both PWM channels)
     ledc_timer_config_t timer_config = {
@@ -231,10 +207,15 @@ esp_err_t motor_init(const motor_cfg_t *cfg){
     gpio_set_level(s_cfg.el_dir_pin, 0);
     ESP_LOGD(TAG, "DIR pins initialized: AZ=%d→0, EL=%d→0", s_cfg.az_dir_pin, s_cfg.el_dir_pin);
 
-    ESP_LOGI(TAG, "Motor initialization complete");
+    ESP_LOGI(TAG, "Motor initialization complete (conservative)");
     return ESP_OK;
 }
 
+/*
+    Move AZ to target angle (deg). Applies 0..max_az_deg clamp, sets DIR,
+    runs full-speed PWM for computed duration, then stops PWM.
+    Uses conservative timing to prevent overshoot.
+*/
 void motor_move_az(double current_deg, double target_deg){
     ESP_LOGI(TAG, "AZ move requested: %.2f° → %.2f°", current_deg, target_deg);
 
@@ -261,22 +242,27 @@ void motor_move_az(double current_deg, double target_deg){
     gpio_set_level(s_cfg.az_dir_pin, dir_level);
     ESP_LOGD(TAG, "AZ direction set: %s (DIR pin=%d)", dir_name, dir_level);
 
-    // Calculate move time based on distance and nominal speed
+    // Calculate conservative move time
     uint32_t move_ms = move_time_ms(current_mm, target_mm);
     
     // Log the complete move plan
-    ESP_LOGI(TAG, "AZ executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms",
+    ESP_LOGI(TAG, "AZ executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms (conservative)",
              current_deg, target_deg, current_mm, target_mm,
              (target_mm > current_mm) ? "EXTEND" : "RETRACT", move_ms);
 
-    // Execute the move: start PWM, wait, stop PWM
-    start_pwm(AZ_CH, 4096);                     // 50% duty cycle
-    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Block for move duration
+    // Execute the move at full speed with conservative timing
+    start_pwm(AZ_CH, 8191);                     // 100% duty
+    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
     stop_pwm(AZ_CH);                            // Stop PWM, actuator coasts
     
-    ESP_LOGI(TAG, "AZ move complete");
+    ESP_LOGI(TAG, "AZ move complete (stopped at ~%.1f°)", clamped_target);
 }
 
+/*
+    Move EL to target angle (deg). Applies min_el_deg..max_el_deg clamp,
+    sets DIR, runs full-speed PWM for computed duration, then stops PWM.
+    Uses conservative timing to prevent overshoot.
+*/
 void motor_move_el(double current_deg, double target_deg){
     ESP_LOGI(TAG, "EL move requested: %.2f° → %.2f°", current_deg, target_deg);
 
@@ -304,62 +290,77 @@ void motor_move_el(double current_deg, double target_deg){
     gpio_set_level(s_cfg.el_dir_pin, dir_level);
     ESP_LOGD(TAG, "EL direction set: %s (DIR pin=%d)", dir_name, dir_level);
 
-    // Calculate timing
+    // Calculate conservative timing
     uint32_t move_ms = move_time_ms(current_mm, target_mm);
     
-    ESP_LOGI(TAG, "EL executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms",
+    ESP_LOGI(TAG, "EL executing: %.2f°→%.2f° (%.1f→%.1f mm) %s for %" PRIu32 " ms (conservative)",
              current_deg, target_deg, current_mm, target_mm,
              (target_mm > current_mm) ? "EXTEND" : "RETRACT", move_ms);
 
     // Execute the move
-    start_pwm(EL_CH, 4096);                     // 50% duty
-    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Wait for completion
+    start_pwm(EL_CH, 8191);                     // 100% duty
+    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
     stop_pwm(EL_CH);                            // Stop
     
-    ESP_LOGI(TAG, "EL move complete");
+    ESP_LOGI(TAG, "EL move complete (stopped at ~%.1f°)", clamped_target);
 }
 
+/*
+    Raw timed AZ run (for homing). Direction is set as given, PWM at full power.
+    Note: Homing uses full calculated time since we want to reach mechanical stops.
+*/
 void motor_run_az_ms(int dir_level, uint32_t ms){
-    ESP_LOGI(TAG, "AZ timed run: DIR=%d for %" PRIu32 " ms (raw mode)", dir_level, ms);
-    ESP_LOGW(TAG, "Running AZ in RAW mode - may exceed normal limits!");
+    ESP_LOGI(TAG, "AZ timed run: DIR=%d for %" PRIu32 " ms (homing mode)", dir_level, ms);
+    ESP_LOGW(TAG, "Running AZ in HOMING mode - will reach mechanical stop!");
     
     // Set direction immediately
     gpio_set_level(s_cfg.az_dir_pin, dir_level);
     
-    // Run at full power for specified duration
-    start_pwm(AZ_CH, 4096);                     // 50% duty (could go higher for homing)
-    vTaskDelay(pdMS_TO_TICKS(ms));              // Block for entire duration
-    stop_pwm(AZ_CH);                            // Stop PWM
+    // Run at full power for specified duration (no safety factor for homing)
+    start_pwm(AZ_CH, 8191);
+    vTaskDelay(pdMS_TO_TICKS(ms));
+    stop_pwm(AZ_CH);
     
     ESP_LOGI(TAG, "AZ timed run complete");
 }
 
+/*
+    Raw timed EL run (for homing). Direction is set as given, PWM at full power.
+    Note: Homing uses full calculated time since we want to reach mechanical stops.
+*/
 void motor_run_el_ms(int dir_level, uint32_t ms){
-    ESP_LOGI(TAG, "EL timed run: DIR=%d for %" PRIu32 " ms (raw mode)", dir_level, ms);
-    ESP_LOGW(TAG, "Running EL in RAW mode - may exceed normal limits!");
+    ESP_LOGI(TAG, "EL timed run: DIR=%d for %" PRIu32 " ms (homing mode)", dir_level, ms);
+    ESP_LOGW(TAG, "Running EL in HOMING mode - will reach mechanical stop!");
     
     // Set direction
     gpio_set_level(s_cfg.el_dir_pin, dir_level);
     
-    // Execute timed run
-    start_pwm(EL_CH, 4096);
+    // Execute timed run (no safety factor for homing)
+    start_pwm(EL_CH, 8191);
     vTaskDelay(pdMS_TO_TICKS(ms));
     stop_pwm(EL_CH);
     
     ESP_LOGI(TAG, "EL timed run complete");
 }
 
+/*
+    Park sequence: move AZ, then EL to specified park angles (sequential to reduce current).
+*/
 void motor_park(double park_az_deg, double park_el_deg, double cur_az, double cur_el){
-    ESP_LOGI(TAG, "Parking: AZ %.2f°→%.2f°, EL %.2f°→%.2f°", 
+    ESP_LOGI(TAG, "Parking: AZ %.2f°→%.2f°, EL %.2f°→%.2f° (conservative timing)", 
              cur_az, park_az_deg, cur_el, park_el_deg);
     
     // Move axes sequentially (not simultaneously to reduce peak current)
     motor_move_az(cur_az, park_az_deg);
+    vTaskDelay(pdMS_TO_TICKS(500));             // Brief pause between moves
     motor_move_el(cur_el, park_el_deg);
     
     ESP_LOGI(TAG, "Park sequence complete");
 }
 
+/*
+    Emergency stop: immediately stop PWM on both channels (DIR levels unchanged).
+*/
 void motor_stop_all(void){
     ESP_LOGI(TAG, "EMERGENCY STOP - halting all motor PWM");
     stop_pwm(AZ_CH);

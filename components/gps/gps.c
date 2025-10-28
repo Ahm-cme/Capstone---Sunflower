@@ -9,20 +9,12 @@
 #include "nvs.h"
 
 /*
-    ┌───────────────────────────────────────────────────────────────────────┐
-    │ BN-880 NMEA Parser + HMC5883 Compass Driver                          │
-    │                                                                       │
-    │ HMC5883 I2C Protocol:                                                 │
-    │  - Address: 0x1E (7-bit)                                              │
-    │  - Registers: 0x00-0x0C                                               │
-    │  - Data format: 16-bit signed integers (big-endian)                   │
-    │  - Update rate: 75 Hz max (we use 15 Hz for power efficiency)        │
-    │                                                                       │
-    │ Compass Calibration:                                                  │
-    │  - Hard iron offset: nearby permanent magnets (motors, batteries)     │
-    │  - Soft iron distortion: ferromagnetic materials (steel frame)        │
-    │  - Solution: capture min/max during full rotation, apply offset       │
-    └───────────────────────────────────────────────────────────────────────┘
+    BN-880 NMEA Parser + HMC5883 Compass Driver
+
+    Overview:
+    - Reads NMEA sentences from UART, verifies checksum, parses GGA and RMC.
+    - Maintains a cached last valid fix (s_last).
+    - Talks to HMC5883 via I2C, supports calibration saved in NVS.
 */
 
 #define TAG "GPS"
