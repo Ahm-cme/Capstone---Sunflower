@@ -385,7 +385,6 @@ void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, ui
 static void tft_draw_image(uint16_t x, uint16_t y, const uint16_t *image, uint16_t w, uint16_t h, uint16_t transparent_color)
 {
     // Very simple blit with chroma key (transparent_color). Per-pixel writes.
-    // TODO: Optimize: set window per line and stream line buffers for speed.
     // NOTE: 'image' is const -> stored in flash; reads are fine on ESP32.
     if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
     
@@ -630,7 +629,6 @@ static void draw_battery_graph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     // Historic battery ADC plot (100 samples). Min/Max autoscale.
     // NOTE: Labels assume 0..4095 -> 0..~15V map; adjust to real divider ratio.
-    // TODO: Store processed voltage instead of raw ADC for clearer graph scaling.
     lcd_fill_rect(x, y, w, h, TFT_BLACK);
     lcd_draw_rect(x, y, w, h, TFT_SLATE);
     
