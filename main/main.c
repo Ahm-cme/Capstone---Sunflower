@@ -12,7 +12,7 @@
  * What it does:
  *  - Connects to "Sunflower" WiFi AP
  *  - Receives tracking data every second
- *  - Shows elevation, azimuth, battery, GPS location
+ *  - Shows elevation, azimuth, battery, GPS location, sun position, stats
  *  - Displays real-time graphs
  */
 
@@ -101,7 +101,15 @@ void app_main(void)
         .tracking_status = 0,
         .latitude = 0.0f,
         .longitude = 0.0f,
-        .gps_valid = false
+        .gps_valid = false,
+        .gps_satellites = 0,
+        .sun_elevation = 0.0f,
+        .sun_azimuth = 0.0f,
+        .moves_today = 0,
+        .total_moves = 0,
+        .uptime_hours = 0,
+        .wifi_rssi = 0,
+        .tracking_quality = 0
     };
     
     // Draw dashboard
@@ -130,15 +138,25 @@ void app_main(void)
             display_data.latitude = rx_data.latitude;
             display_data.longitude = rx_data.longitude;
             display_data.gps_valid = (rx_data.gps_valid == 1);
+            display_data.gps_satellites = rx_data.gps_satellites;
+            display_data.sun_elevation = rx_data.sun_elevation;
+            display_data.sun_azimuth = rx_data.sun_azimuth;
+            display_data.moves_today = rx_data.moves_today;
+            display_data.total_moves = rx_data.total_moves;
+            display_data.uptime_hours = rx_data.uptime_hours;
+            display_data.wifi_rssi = rx_data.wifi_rssi;
+            display_data.tracking_quality = rx_data.tracking_quality;
             
             // Update display
             lcd_update_display(&display_data);
             
             last_update = esp_log_timestamp();
             
-            ESP_LOGI(TAG, "Updated - El: %.1f° Az: %.1f° Batt: %.2fV Status: %d",
+            ESP_LOGI(TAG, "Updated - El:%.1f° Az:%.1f° Sun:%.1f°/%.1f° Qual:%d° Sats:%d RSSI:%ddBm",
                      display_data.elevation, display_data.azimuth,
-                     display_data.battery_voltage, display_data.tracking_status);
+                     display_data.sun_elevation, display_data.sun_azimuth,
+                     display_data.tracking_quality, display_data.gps_satellites,
+                     display_data.wifi_rssi);
         } else if (ret == ESP_ERR_TIMEOUT) {
             // No data timeout
             if (esp_log_timestamp() - last_update > 10000) {

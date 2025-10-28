@@ -141,7 +141,7 @@ const uint8_t font5x7[][5] = {
     {0x38, 0x54, 0x54, 0x54, 0x18}, // e
     {0x08, 0x7E, 0x09, 0x01, 0x02}, // f
     {0x0C, 0x52, 0x52, 0x52, 0x3E}, // g
-    {0x7F, 0x08, 0x04, 0x04, 0x78}, // h
+    {0x7F, 0x08, 0x04, 0x04, 0x78}, // H
     {0x00, 0x44, 0x7D, 0x40, 0x00}, // i
     {0x20, 0x40, 0x44, 0x3D, 0x00}, // j
     {0x7F, 0x10, 0x28, 0x44, 0x00}, // k
@@ -554,7 +554,7 @@ static void draw_angle_panel(uint16_t x, uint16_t y, const char *label, float an
     
     char angle_str[16];
     snprintf(angle_str, sizeof(angle_str), "%.1f", angle);
-    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 3);
+    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 2);  // Changed from 3 to 2
     lcd_draw_string(x + 5, y + 52, "deg", TFT_SILVER, TFT_STEEL, 1);
     
     char delta_str[16];
@@ -573,7 +573,7 @@ static void draw_battery_panel(uint16_t x, uint16_t y)
     
     char volt_str[16];
     snprintf(volt_str, sizeof(volt_str), "%.2fV", current_data.battery_voltage);
-    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 3);
+    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 2);  // Changed from 3 to 2
     
     char adc_str[16];
     snprintf(adc_str, sizeof(adc_str), "ADC:%d", current_data.battery_adc);
@@ -625,17 +625,97 @@ static void draw_status_panel(uint16_t x, uint16_t y)
     lcd_draw_string(x + 10, y + 30, status_text, text_color, status_color, 2);
 }
 
+static void draw_sun_panel(uint16_t x, uint16_t y)
+{
+    // Sun position panel showing calculated sun angles
+    lcd_fill_rect(x, y, 150, 70, TFT_NAVY);
+    lcd_draw_rect(x, y, 150, 70, TFT_GOLDEN);
+    
+    lcd_draw_string(x + 5, y + 5, "SUN POS", TFT_GOLDEN, TFT_NAVY, 1);
+    
+    char el_str[16];
+    snprintf(el_str, sizeof(el_str), "E:%.1f", current_data.sun_elevation);
+    lcd_draw_string(x + 5, y + 20, el_str, TFT_SUNGLOW, TFT_NAVY, 2);
+    
+    char az_str[16];
+    snprintf(az_str, sizeof(az_str), "A:%.1f", current_data.sun_azimuth);
+    lcd_draw_string(x + 5, y + 40, az_str, TFT_SUNGLOW, TFT_NAVY, 2);
+    
+    char qual_str[16];
+    snprintf(qual_str, sizeof(qual_str), "Err:%d", current_data.tracking_quality);
+    uint16_t qual_color = (current_data.tracking_quality < 5) ? TFT_SAGE : 
+                         (current_data.tracking_quality < 15) ? TFT_AMBER : TFT_CORAL;
+    lcd_draw_string(x + 5, y + 57, qual_str, qual_color, TFT_NAVY, 1);
+}
+
+static void draw_stats_panel(uint16_t x, uint16_t y)
+{
+    // System statistics panel
+    lcd_fill_rect(x, y, 150, 70, TFT_CHARCOAL);
+    lcd_draw_rect(x, y, 150, 70, TFT_SILVER);
+    
+    lcd_draw_string(x + 5, y + 5, "STATS", TFT_SILVER, TFT_CHARCOAL, 1);
+    
+    char moves_str[24];
+    snprintf(moves_str, sizeof(moves_str), "Today:%lu", (unsigned long)current_data.moves_today);
+    lcd_draw_string(x + 5, y + 20, moves_str, TFT_TEAL, TFT_CHARCOAL, 1);
+    
+    char total_str[24];
+    snprintf(total_str, sizeof(total_str), "Total:%lu", (unsigned long)current_data.total_moves);
+    lcd_draw_string(x + 5, y + 32, total_str, TFT_TEAL, TFT_CHARCOAL, 1);
+    
+    char uptime_str[16];
+    snprintf(uptime_str, sizeof(uptime_str), "Up:%dh", current_data.uptime_hours);
+    lcd_draw_string(x + 5, y + 44, uptime_str, TFT_MINT, TFT_CHARCOAL, 1);
+    
+    char rssi_str[16];
+    snprintf(rssi_str, sizeof(rssi_str), "RSSI:%ddBm", current_data.wifi_rssi);
+    uint16_t rssi_color = (current_data.wifi_rssi > -60) ? TFT_SAGE :
+                         (current_data.wifi_rssi > -75) ? TFT_AMBER : TFT_CORAL;
+    lcd_draw_string(x + 5, y + 56, rssi_str, rssi_color, TFT_CHARCOAL, 1);
+}
+
+static void draw_gps_panel(uint16_t x, uint16_t y)
+{
+    // GPS details panel with satellite count
+    if (current_data.gps_valid) {
+        char lat_str[20], lon_str[20];
+        snprintf(lat_str, sizeof(lat_str), "%.4f%c", fabs(current_data.latitude), 
+                 current_data.latitude >= 0 ? 'N' : 'S');
+        snprintf(lon_str, sizeof(lon_str), "%.4f%c", fabs(current_data.longitude), 
+                 current_data.longitude >= 0 ? 'E' : 'W');
+        
+        lcd_draw_string(x, y, "GPS:", TFT_SILVER, TFT_BLACK, 1);
+        lcd_draw_string(x + 30, y, lat_str, TFT_TEAL, TFT_BLACK, 1);
+        lcd_draw_string(x, y + 12, lon_str, TFT_TEAL, TFT_BLACK, 1);
+        
+        char sat_str[16];
+        snprintf(sat_str, sizeof(sat_str), "Sats:%d", current_data.gps_satellites);
+        uint16_t sat_color = (current_data.gps_satellites >= 6) ? TFT_SAGE :
+                            (current_data.gps_satellites >= 4) ? TFT_AMBER : TFT_CORAL;
+        lcd_draw_string(x, y + 24, sat_str, sat_color, TFT_BLACK, 1);
+    } else {
+        lcd_draw_string(x, y, "GPS: No Fix", TFT_CORAL, TFT_BLACK, 1);
+        
+        char sat_str[16];
+        snprintf(sat_str, sizeof(sat_str), "Sats:%d", current_data.gps_satellites);
+        lcd_draw_string(x, y + 12, sat_str, TFT_AMBER, TFT_BLACK, 1);
+    }
+}
+
+// Replace the draw_battery_graph function with this smaller version:
+
 static void draw_battery_graph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     // Historic battery ADC plot (100 samples). Min/Max autoscale.
-    // NOTE: Labels assume 0..4095 -> 0..~15V map; adjust to real divider ratio.
     lcd_fill_rect(x, y, w, h, TFT_BLACK);
     lcd_draw_rect(x, y, w, h, TFT_SLATE);
     
-    lcd_draw_string(x + 5, y + 5, "Battery Voltage History (Last 100 Readings)", TFT_SILVER, TFT_BLACK, 1);
+    lcd_draw_string(x + 5, y + 3, "Battery History", TFT_SILVER, TFT_BLACK, 1);
     
-    for (int i = 0; i <= 4; i++) {
-        int grid_y = y + 20 + (h - 30) * i / 4;
+    // Draw grid lines
+    for (int i = 0; i <= 4; i++) {  // Changed from 3 to 4 for more grid lines
+        int grid_y = y + 15 + (h - 20) * i / 4;
         lcd_draw_line(x + 35, grid_y, x + w - 5, grid_y, TFT_DARKGREY);
     }
     
@@ -648,17 +728,17 @@ static void draw_battery_graph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
     if (max_val == min_val) max_val = min_val + 100;
     
     int graph_w = w - 45;
-    int graph_h = h - 35;
+    int graph_h = h - 25;
     
     for (int i = 1; i < 100; i++) {
         int prev_index = (history_index + i - 1) % 100;
         int curr_index = (history_index + i) % 100;
         
         int x1 = x + 35 + (graph_w * (i - 1) / 99);
-        int y1 = y + 25 + graph_h - ((battery_history[prev_index] - min_val) * graph_h / (max_val - min_val));
+        int y1 = y + 18 + graph_h - ((battery_history[prev_index] - min_val) * graph_h / (max_val - min_val));
         
         int x2 = x + 35 + (graph_w * i / 99);
-        int y2 = y + 25 + graph_h - ((battery_history[curr_index] - min_val) * graph_h / (max_val - min_val));
+        int y2 = y + 18 + graph_h - ((battery_history[curr_index] - min_val) * graph_h / (max_val - min_val));
         
         lcd_draw_line(x1, y1, x2, y2, TFT_SAGE);
         
@@ -667,15 +747,13 @@ static void draw_battery_graph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
         }
     }
     
-    char min_str[8], max_str[8], mid_str[8];
+    // Compact labels
+    char min_str[8], max_str[8];
     snprintf(min_str, sizeof(min_str), "%.1fV", (min_val / 4095.0f) * 15.0f);
     snprintf(max_str, sizeof(max_str), "%.1fV", (max_val / 4095.0f) * 15.0f);
-    uint16_t mid_val = (min_val + max_val) / 2;
-    snprintf(mid_str, sizeof(mid_str), "%.1fV", (mid_val / 4095.0f) * 15.0f);
     
-    lcd_draw_string(x + 5, y + h - 12, min_str, TFT_SILVER, TFT_BLACK, 1);
-    lcd_draw_string(x + 5, y + (h / 2) - 3, mid_str, TFT_SILVER, TFT_BLACK, 1);
-    lcd_draw_string(x + 5, y + 20, max_str, TFT_SILVER, TFT_BLACK, 1);
+    lcd_draw_string(x + 5, y + h - 10, min_str, TFT_SILVER, TFT_BLACK, 1);
+    lcd_draw_string(x + 5, y + 15, max_str, TFT_SILVER, TFT_BLACK, 1);
 }
 
 // ===== Update functions (incremental) =====
@@ -701,12 +779,12 @@ static void update_header_time(void)
 static void update_angle_panel_value(uint16_t x, uint16_t y, float angle, float delta, uint16_t color)
 {
     // Partial redraw of angle value and delta line only
-    lcd_fill_rect(x + 5, y + 25, 140, 24, TFT_STEEL);
+    lcd_fill_rect(x + 5, y + 25, 140, 18, TFT_STEEL);  // Changed height from 24 to 18
     lcd_fill_rect(x + 50, y + 52, 95, 8, TFT_STEEL);
     
     char angle_str[16];
     snprintf(angle_str, sizeof(angle_str), "%.1f", angle);
-    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 3);
+    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 2);  // Changed from 3 to 2
     
     char delta_str[16];
     snprintf(delta_str, sizeof(delta_str), "D:%.3f", delta);
@@ -716,12 +794,12 @@ static void update_angle_panel_value(uint16_t x, uint16_t y, float angle, float 
 static void update_battery_panel_value(uint16_t x, uint16_t y)
 {
     // Partial redraw of battery text + level bar
-    lcd_fill_rect(x + 5, y + 25, 140, 24, TFT_DARKGREY);
+    lcd_fill_rect(x + 5, y + 25, 140, 18, TFT_DARKGREY);  // Changed height from 24 to 18
     lcd_fill_rect(x + 5, y + 52, 140, 8, TFT_DARKGREY);
     
     char volt_str[16];
     snprintf(volt_str, sizeof(volt_str), "%.2fV", current_data.battery_voltage);
-    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 3);
+    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 2);  // Changed from 3 to 2
     
     char adc_str[16];
     snprintf(adc_str, sizeof(adc_str), "ADC:%d", current_data.battery_adc);
@@ -772,6 +850,54 @@ static void update_status_panel(uint16_t x, uint16_t y)
     lcd_draw_string(x + 10, y + 30, status_text, text_color, status_color, 2);
 }
 
+static void update_sun_panel_value(uint16_t x, uint16_t y)
+{
+    lcd_fill_rect(x + 5, y + 20, 140, 48, TFT_NAVY);
+    
+    char el_str[16];
+    snprintf(el_str, sizeof(el_str), "E:%.1f", current_data.sun_elevation);
+    lcd_draw_string(x + 5, y + 20, el_str, TFT_SUNGLOW, TFT_NAVY, 2);
+    
+    char az_str[16];
+    snprintf(az_str, sizeof(az_str), "A:%.1f", current_data.sun_azimuth);
+    lcd_draw_string(x + 5, y + 40, az_str, TFT_SUNGLOW, TFT_NAVY, 2);
+    
+    char qual_str[16];
+    snprintf(qual_str, sizeof(qual_str), "Err:%d", current_data.tracking_quality);
+    uint16_t qual_color = (current_data.tracking_quality < 5) ? TFT_SAGE : 
+                         (current_data.tracking_quality < 15) ? TFT_AMBER : TFT_CORAL;
+    lcd_draw_string(x + 5, y + 57, qual_str, qual_color, TFT_NAVY, 1);
+}
+
+static void update_stats_panel_value(uint16_t x, uint16_t y)
+{
+    lcd_fill_rect(x + 5, y + 20, 140, 48, TFT_CHARCOAL);
+    
+    char moves_str[24];
+    snprintf(moves_str, sizeof(moves_str), "Today:%lu", (unsigned long)current_data.moves_today);
+    lcd_draw_string(x + 5, y + 20, moves_str, TFT_TEAL, TFT_CHARCOAL, 1);
+    
+    char total_str[24];
+    snprintf(total_str, sizeof(total_str), "Total:%lu", (unsigned long)current_data.total_moves);
+    lcd_draw_string(x + 5, y + 32, total_str, TFT_TEAL, TFT_CHARCOAL, 1);
+    
+    char uptime_str[16];
+    snprintf(uptime_str, sizeof(uptime_str), "Up:%dh", current_data.uptime_hours);
+    lcd_draw_string(x + 5, y + 44, uptime_str, TFT_MINT, TFT_CHARCOAL, 1);
+    
+    char rssi_str[16];
+    snprintf(rssi_str, sizeof(rssi_str), "RSSI:%ddBm", current_data.wifi_rssi);
+    uint16_t rssi_color = (current_data.wifi_rssi > -60) ? TFT_SAGE :
+                         (current_data.wifi_rssi > -75) ? TFT_AMBER : TFT_CORAL;
+    lcd_draw_string(x + 5, y + 56, rssi_str, rssi_color, TFT_CHARCOAL, 1);
+}
+
+static void update_gps_panel_value(uint16_t x, uint16_t y)
+{
+    lcd_fill_rect(x, y, 150, 36, TFT_BLACK);
+    draw_gps_panel(x, y);
+}
+
 static void update_battery_graph_incremental(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
 {
     // Currently falls back to full redraw. Optimize later to draw only latest segment.
@@ -791,11 +917,12 @@ esp_err_t lcd_init(void)
     tft_reset();
     tft_init_display();
     
+    // Initialize display data to defaults
     memset(&current_data, 0, sizeof(lcd_display_data_t));
     memset(battery_history, 0, sizeof(battery_history));
     history_index = 0;
     
-    ESP_LOGI(TAG, "LCD initialized successfully");
+    ESP_LOGI(TAG, "Display initialized");
     return ESP_OK;
 }
 
@@ -804,103 +931,92 @@ void lcd_show_init_screen(const char *status[], bool success[], int count)
     // Startup checklist screen with per-item OK/FAIL and logo
     lcd_clear_screen(TFT_BLACK);
     
-    int logo_x = (TFT_WIDTH - SUNFLOWER_LOGO_WIDTH) / 2;
-    tft_draw_image(logo_x, 20, sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
+    // Draw logo
+    tft_draw_image(TFT_WIDTH / 2 - SUNFLOWER_LOGO_WIDTH / 2, 20, 
+                   sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
     
-    lcd_draw_string(140, 50, "SUNFLOWER TRACKER", TFT_GOLDEN, TFT_BLACK, 2);
-    lcd_draw_string(180, 70, "System Initialization", TFT_SILVER, TFT_BLACK, 1);
+    lcd_draw_string(TFT_WIDTH / 2 - 60, 60, "SUNFLOWER", TFT_GOLDEN, TFT_BLACK, 2);
+    lcd_draw_string(TFT_WIDTH / 2 - 80, 85, "System Initialization", TFT_SILVER, TFT_BLACK, 1);
     
-    lcd_draw_line(40, 90, TFT_WIDTH - 40, 90, TFT_SLATE);
-    
-    int start_y = 110;
-    int item_spacing = 25;
-    
+    uint16_t y_pos = 120;
     for (int i = 0; i < count; i++) {
-        int y_pos = start_y + (i * item_spacing);
-        
-        uint16_t box_color = success[i] ? TFT_SAGE : TFT_CRIMSON;
-        lcd_fill_rect(60, y_pos, 15, 15, box_color);
-        lcd_draw_rect(60, y_pos, 15, 15, TFT_SILVER);
+        lcd_draw_string(50, y_pos, status[i], TFT_SILVER, TFT_BLACK, 1);
         
         if (success[i]) {
-            lcd_draw_line(63, y_pos + 7, 67, y_pos + 12, TFT_BLACK);
-            lcd_draw_line(67, y_pos + 12, 73, y_pos + 3, TFT_BLACK);
+            lcd_draw_string(300, y_pos, "[OK]", TFT_SAGE, TFT_BLACK, 1);
         } else {
-            lcd_draw_line(63, y_pos + 3, 72, y_pos + 12, TFT_WHITE);
-            lcd_draw_line(72, y_pos + 3, 63, y_pos + 12, TFT_WHITE);
+            lcd_draw_string(300, y_pos, "[--]", TFT_AMBER, TFT_BLACK, 1);
         }
         
-        lcd_draw_string(85, y_pos + 3, status[i], TFT_SILVER, TFT_BLACK, 1);
-        
-        const char *result_text = success[i] ? "OK" : "FAIL";
-        uint16_t result_color = success[i] ? TFT_SAGE : TFT_CRIMSON;
-        lcd_draw_string(350, y_pos + 3, result_text, result_color, TFT_BLACK, 2);
+        y_pos += 20;
     }
-    
-    lcd_draw_line(40, start_y + (count * item_spacing) + 10, 
-                  TFT_WIDTH - 40, start_y + (count * item_spacing) + 10, TFT_SLATE);
 }
 
 void lcd_show_splash(const char *message)
 {
     // Centered logo + optional message
     lcd_clear_screen(TFT_BLACK);
-    tft_draw_image(228, 120, sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
+    
+    // Draw logo
+    tft_draw_image(TFT_WIDTH / 2 - SUNFLOWER_LOGO_WIDTH / 2, TFT_HEIGHT / 2 - 40, 
+                   sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
+    
+    lcd_draw_string(TFT_WIDTH / 2 - 60, TFT_HEIGHT / 2 + 10, "SUNFLOWER", TFT_GOLDEN, TFT_BLACK, 2);
     
     if (message) {
-        int text_width = strlen(message) * 6 * 2;
-        int text_x = (TFT_WIDTH - text_width) / 2;
-        lcd_draw_string(text_x, 160, message, TFT_GOLDEN, TFT_BLACK, 2);
+        int msg_len = strlen(message);
+        int msg_x = TFT_WIDTH / 2 - (msg_len * 3);
+        lcd_draw_string(msg_x, TFT_HEIGHT / 2 + 40, message, TFT_SILVER, TFT_BLACK, 1);
     }
 }
 
 void lcd_show_error(const char *error_msg)
 {
     // Red banner at bottom for critical messages
-    lcd_fill_rect(0, TFT_HEIGHT - 40, TFT_WIDTH, 40, TFT_CRIMSON);
-    lcd_draw_string(10, TFT_HEIGHT - 30, "ERROR:", TFT_WHITE, TFT_CRIMSON, 2);
-    lcd_draw_string(10, TFT_HEIGHT - 15, error_msg, TFT_WHITE, TFT_CRIMSON, 1);
+    lcd_fill_rect(0, TFT_HEIGHT - 30, TFT_WIDTH, 30, TFT_CRIMSON);
+    
+    int msg_len = strlen(error_msg);
+    int msg_x = TFT_WIDTH / 2 - (msg_len * 3);
+    if (msg_x < 5) msg_x = 5;
+    
+    lcd_draw_string(msg_x, TFT_HEIGHT - 20, error_msg, TFT_WHITE, TFT_CRIMSON, 1);
 }
 
 void lcd_draw_dashboard(const lcd_display_data_t *data)
 {
-    // Full dashboard draw; seeds battery history with initial value
     memcpy(&current_data, data, sizeof(lcd_display_data_t));
     
     lcd_clear_screen(TFT_BLACK);
     
+    // Header
     draw_header();
+    
+    // Top row panels (y=35)
     draw_angle_panel(5, 35, "ELEVATION", data->elevation, data->delta_elevation, TFT_AMBER);
     draw_angle_panel(165, 35, "AZIMUTH", data->azimuth, data->delta_azimuth, TFT_SUNGLOW);
     draw_battery_panel(325, 35);
+    
+    // Middle row panels (y=110)
     draw_status_panel(5, 110);
+    draw_sun_panel(165, 110);
+    draw_stats_panel(325, 110);
     
-    if (data->gps_valid) {
-        char lat_str[32], lon_str[32];
-        snprintf(lat_str, sizeof(lat_str), "Lat: %.4f%c", fabs(data->latitude), data->latitude >= 0 ? 'N' : 'S');
-        snprintf(lon_str, sizeof(lon_str), "Lon: %.4f%c", fabs(data->longitude), data->longitude >= 0 ? 'E' : 'W');
-        
-        lcd_draw_string(165, 115, "GPS Location:", TFT_SILVER, TFT_BLACK, 1);
-        lcd_draw_string(165, 130, lat_str, TFT_TEAL, TFT_BLACK, 1);
-        lcd_draw_string(165, 145, lon_str, TFT_TEAL, TFT_BLACK, 1);
-    } else {
-        lcd_draw_string(165, 115, "GPS: No Fix", TFT_CORAL, TFT_BLACK, 1);
-    }
+    // GPS info area (below panels)
+    draw_gps_panel(5, 185);
     
-    lcd_draw_string(165, 160, "System v1.0", TFT_MINT, TFT_BLACK, 1);
+    lcd_draw_string(5, 220, "System v1.0", TFT_MINT, TFT_BLACK, 1);
     
+    // Battery history graph (bottom, taller now)
     for (int i = 0; i < 100; i++) {
         battery_history[i] = data->battery_adc;
     }
     history_index = 0;
     
-    draw_battery_graph(5, 185, 470, 130);
+    draw_battery_graph(5, 230, 470, 85);  // Changed from y=235, h=80 to y=230, h=85
 }
 
 void lcd_update_display(const lcd_display_data_t *data)
 {
-    // Incremental update path; avoids full-screen redraw
-    // NOTE: Battery graph still full redraw; optimize later.
     battery_history[history_index] = data->battery_adc;
     history_index = (history_index + 1) % 100;
     
@@ -913,7 +1029,11 @@ void lcd_update_display(const lcd_display_data_t *data)
         update_status_panel(5, 110);
     }
     
-    update_battery_graph_incremental(5, 185, 470, 130);
+    update_sun_panel_value(165, 110);
+    update_stats_panel_value(325, 110);
+    update_gps_panel_value(5, 185);
+    
+    update_battery_graph_incremental(5, 230, 470, 85);  // Changed from y=235, h=80 to y=230, h=85
     
     memcpy(&current_data, data, sizeof(lcd_display_data_t));
 }

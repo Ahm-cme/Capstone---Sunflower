@@ -70,11 +70,16 @@ typedef struct {
     float latitude;               // deg (-90..+90)
     float longitude;              // deg (-180..+180)
     bool gps_valid;               // true if GPS fix OK
-
-    // Optional fields (not strictly required by renderer yet)
-    uint8_t time_hour;            // If you prefer explicit time fields
-    uint8_t time_min;
-    bool motors_active;           // For future indicators
+    
+    // NEW: Extended telemetry
+    uint8_t gps_satellites;       // Number of satellites (0-255)
+    float sun_elevation;          // Calculated sun position (0-90°)
+    float sun_azimuth;            // Calculated sun position (0-360°)
+    uint32_t moves_today;         // Moves since midnight
+    uint32_t total_moves;         // Total moves since deployment
+    uint16_t uptime_hours;        // Hours since last deep sleep
+    int8_t wifi_rssi;             // WiFi signal strength (dBm)
+    uint8_t tracking_quality;     // Tracking error in degrees (0-180)
 } lcd_display_data_t;
 
 /*

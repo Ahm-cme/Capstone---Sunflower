@@ -18,10 +18,6 @@ Notes:
 - Packing/alignment: Compilers may insert padding (e.g., after uint8_t).
   If the master uses different packing, consider using a framed protocol
   (e.g., length-prefixed) or enforce packing on both sides.
-  Example (if absolutely needed on both ends):
-    #pragma pack(push, 1)
-    typedef struct { ... } tracker_data_t;
-    #pragma pack(pop)
 - Versioning: If fields change, add a version byte/field to the frame or
   switch to a JSON/CBOR format for flexibility.
 - Field ranges:
@@ -33,6 +29,12 @@ Notes:
   - status: maps to LCD tracking_status (0=standby, 1=tracking, 2=sleep,
     3=calibrating, 255=error)
   - gps_valid: 0/1
+  - gps_satellites: 0-255 (number of sats in view)
+  - sun_elevation/sun_azimuth: calculated target (0-90/0-360 deg)
+  - moves_today/total_moves: counters
+  - uptime_hours: hours since wake
+  - wifi_rssi: dBm (-128 to 0)
+  - tracking_quality: abs error in degrees (0-180)
 ===============================================================================
 */
 
@@ -56,6 +58,16 @@ typedef struct {
     float   latitude;         // degrees (-90..+90)
     float   longitude;        // degrees (-180..+180)
     uint8_t gps_valid;        // 0 = no fix, 1 = valid
+    
+    //Extended telemetry
+    uint8_t  gps_satellites;   // Number of satellites (0-255)
+    float    sun_elevation;    // Calculated sun position (0-90°)
+    float    sun_azimuth;      // Calculated sun position (0-360°)
+    uint32_t moves_today;      // Moves since midnight
+    uint32_t total_moves;      // Total moves since deployment
+    uint16_t uptime_hours;     // Hours since last deep sleep
+    int8_t   wifi_rssi;        // WiFi signal strength (dBm)
+    uint8_t  tracking_quality; // Tracking error in degrees (0-180)
 
     // NOTE: Potential padding after uint8_t fields depends on compiler ABI.
     // Keep sender and receiver toolchains aligned or serialize explicitly.
