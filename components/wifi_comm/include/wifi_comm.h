@@ -66,10 +66,19 @@ typedef struct {
     uint16_t battery_adc;         // Battery ADC reading (0-4095)
     float    battery_voltage;     // Battery voltage (V)
     uint32_t timestamp;           // Unix timestamp (seconds since epoch)
-    uint8_t  status;              // System status (see codes above)
+    uint8_t  status;              // System status (0=standby,1=tracking,2=sleep,3=calib,255=error)
     float    latitude;            // GPS latitude (decimal degrees)
     float    longitude;           // GPS longitude (decimal degrees)
     uint8_t  gps_valid;           // GPS fix status: 0=invalid, 1=valid
+    uint8_t  gps_satellites;      // Number of satellites in view (0-255)
+    float    sun_elevation;       // Calculated sun elevation (0-90°, from solar.c)
+    float    sun_azimuth;         // Calculated sun azimuth (0-360°, from solar.c)
+    uint32_t moves_today;         // Number of moves since midnight
+    uint32_t total_moves;         // Total moves since deployment
+    uint16_t uptime_hours;        // Hours since last deep sleep wake
+    int8_t   wifi_rssi;           // WiFi signal strength (dBm, -128 to 0)
+    uint8_t  tracking_quality;    // Tracking error: abs(panel - sun) in degrees (0-180)
+    
 } tracker_data_t;
 
 /*

@@ -82,3 +82,8 @@ void tracking_auto_calibrate_with_compass(void);
     Get current tracking angles (mount frame).
 */
 void tracking_get_current_angles(float *az_deg, float *el_deg);
+
+/*
+ * Get move statistics for telemetry display.
+ */
+void tracking_get_move_stats(uint32_t *moves_today, uint32_t *total_moves);

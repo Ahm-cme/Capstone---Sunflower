@@ -560,3 +560,11 @@ void tracking_get_current_angles(float *az_deg, float *el_deg) {
     if (el_deg) *el_deg = (float)s.el_cur;
 }
 
+/*
+ * Get move statistics for telemetry display.
+ */
+void tracking_get_move_stats(uint32_t *moves_today, uint32_t *total_moves) {
+    if (moves_today) *moves_today = s.moves_today;
+    if (total_moves) *total_moves = s.total_moves;
+}
+

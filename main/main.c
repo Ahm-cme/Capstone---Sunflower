@@ -88,6 +88,7 @@
 #include "driver/i2c.h"
 #include "driver/uart.h"
 #include "wifi_comm.h"
+#include "solar.h"          // ADD THIS LINE
 
 #define TAG "APP"
 
@@ -509,7 +510,14 @@ void app_main(void){
     float prev_elevation = 0.0f;
     bool first_reading = true;
     
+    // Track uptime since wake
+    time_t boot_time = time(NULL);
+    
     while (1) {
+        // Get current time
+        time_t now = time(NULL);
+        uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
+        
         // Get current tracking position from tracking module
         float current_azimuth = 0.0f;
         float current_elevation = 0.0f;
@@ -536,8 +544,26 @@ void app_main(void){
         gps_data_t gps;
         bool gps_valid = gps_get_last(&gps) && gps.valid;
         
-        // Get current time from GPS
-        time_t now = time(NULL);
+        // Get sun position (already calculated by tracking module)
+        sun_pos_t sun = solar_compute(
+            gps_valid ? gps.latitude : 0.0, 
+            gps_valid ? gps.longitude : 0.0, 
+            now
+        );
+        
+        // Calculate tracking error (how far off we are from sun)
+        float az_error = fabs(current_azimuth - sun.azimuth_deg);
+        float el_error = fabs(current_elevation - sun.elevation_deg);
+        if (az_error > 180.0f) az_error = 360.0f - az_error;  // Handle wraparound
+        uint8_t tracking_quality = (uint8_t)(fmax(az_error, el_error));
+        
+        // WiFi RSSI - not available in AP mode, set to default
+        int8_t rssi = -128;  // Default: no signal (we're the AP, not station)
+        
+        // Get move counters from tracking module
+        uint32_t moves_today = 0;
+        uint32_t total_moves = 0;
+        tracking_get_move_stats(&moves_today, &total_moves);
         
         // Get current LED status to determine system state
         status_led_mode_t led_mode = status_led_get_mode();
@@ -568,25 +594,32 @@ void app_main(void){
             .latitude = gps_valid ? (float)gps.latitude : 0.0f,
             .longitude = gps_valid ? (float)gps.longitude : 0.0f,
             .gps_valid = gps_valid ? 1 : 0,
+            .gps_satellites = gps_valid ? gps.num_satellites : 0,
+            .sun_elevation = gps_valid ? (float)sun.elevation_deg : 0.0f,
+            .sun_azimuth = gps_valid ? (float)sun.azimuth_deg : 0.0f,
+            .moves_today = moves_today,
+            .total_moves = total_moves,
+            .uptime_hours = uptime_h,
+            .wifi_rssi = rssi,
+            .tracking_quality = tracking_quality,
         };
         
         // Send data over WiFi to LCD display
-        esp_err_t ret = wifi_comm_send_data(&tx_data);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "LCD: El=%.1f° Az=%.1f° ΔEl=%.2f° ΔAz=%.2f° Batt=%.2fV GPS=%s Status=%d",
+        esp_err_t send_ret = wifi_comm_send_data(&tx_data);
+        if (send_ret == ESP_OK) {
+            ESP_LOGI(TAG, "LCD: El=%.1f° Az=%.1f° Sun[%.1f°,%.1f°] Err=%d° Moves=%lu/%lu",
                      tx_data.elevation, tx_data.azimuth,
-                     tx_data.delta_elevation, tx_data.delta_azimuth,
-                     tx_data.battery_voltage,
-                     tx_data.gps_valid ? "OK" : "NO",
-                     tx_data.status);
+                     tx_data.sun_elevation, tx_data.sun_azimuth,
+                     tx_data.tracking_quality,
+                     tx_data.moves_today, tx_data.total_moves);
             connection_wait_counter = 0;
-        } else if (ret == ESP_ERR_NOT_FOUND) {
+        } else if (send_ret == ESP_ERR_NOT_FOUND) {
             connection_wait_counter++;
             if (connection_wait_counter % 10 == 0) {
                 ESP_LOGW(TAG, "Waiting for LCD display to connect... (%lu s)", connection_wait_counter);
             }
         } else {
-            ESP_LOGE(TAG, "Failed to send data: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to send data: %s", esp_err_to_name(send_ret));
         }
         
         // Update once per second (1 Hz transmission rate)
