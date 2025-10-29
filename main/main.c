@@ -103,14 +103,14 @@
 
 // GPS module (UART communication)
 #define GPS_UART_PORT  UART_NUM_2
-#define GPS_TX_PIN     17     // Connect to GPS RX
-#define GPS_RX_PIN     16     // Connect to GPS TX
+#define GPS_TX_PIN     22     // Connect to GPS RX
+#define GPS_RX_PIN     23     // Connect to GPS TX
 #define GPS_BAUD       9600   // Default baud rate for BN-880
 
 // Compass on GPS module (I2C communication)
 #define I2C_PORT       I2C_NUM_0
-#define I2C_SDA_PIN    21     // I2C data line
-#define I2C_SCL_PIN    22     // I2C clock line
+#define I2C_SDA_PIN    27     // I2C data line
+#define I2C_SCL_PIN    26     // I2C clock line
 
 // Motor control pins
 #define MOTOR_AZ_PWM   18     // Azimuth motor speed control

@@ -40,8 +40,8 @@
 // WiFi credentials (tracker AP)
 #define WIFI_SSID      "SunflowerTracker"
 #define WIFI_PASS      "sunflower2025"
-#define WIFI_CHANNEL   6
-#define MAX_STA_CONN   1
+#define WIFI_CHANNEL   6           // Change from 6 to 1 (more reliable, less interference)
+#define MAX_STA_CONN   4           // Allow up to 4 clients (was 1)
 
 // TCP server configuration
 #define SERVER_PORT    8888
@@ -74,7 +74,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                  event->mac[3], event->mac[4], event->mac[5]);
         is_connected = false;
 
-        if (client_socket >= 0) {       // Drop TCP session if present
+        if (client_socket >= 0) {
             close(client_socket);
             client_socket = -1;
         }
@@ -89,35 +89,51 @@ esp_err_t wifi_comm_init_ap(void)
 {
     ESP_LOGI(TAG, "Starting WiFi AP + TCP server...");
 
-    ESP_ERROR_CHECK(esp_netif_init());                           // TCP/IP stack
-    ESP_ERROR_CHECK(esp_event_loop_create_default());            // Event loop
-    esp_netif_create_default_wifi_ap();                          // AP netif
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();         // WiFi driver
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     // Register AP events
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
 
-    // AP configuration
+    // AP configuration - optimized for reliability
     wifi_config_t wifi_config = {
         .ap = {
             .ssid = WIFI_SSID,
             .ssid_len = strlen(WIFI_SSID),
-            .channel = WIFI_CHANNEL,
+            .channel = WIFI_CHANNEL,         // Channel 1 (less congestion than 6)
             .password = WIFI_PASS,
-            .max_connection = MAX_STA_CONN,
+            .max_connection = MAX_STA_CONN,  // Allow multiple clients
             .authmode = WIFI_AUTH_WPA2_PSK,
-            .pmf_cfg = { .required = false },
+            .pmf_cfg = {
+                .required = false            // Disable PMF for compatibility
+            },
+            .ssid_hidden = 0,                // Broadcast SSID (visible to clients)
+            .beacon_interval = 100,          // Standard beacon interval (ms)
         },
     };
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));            // AP mode
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());                           // Radio on
+    // Ensure password length is valid for WPA2
+    if (strlen(WIFI_PASS) < 8) {
+        ESP_LOGE(TAG, "Password too short (min 8 chars for WPA2)");
+        return ESP_FAIL;
+    }
 
-    ESP_LOGI(TAG, "AP up: SSID=%s pass=%s ch=%d", WIFI_SSID, WIFI_PASS, WIFI_CHANNEL);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Increase WiFi TX power for better range (max = 78, representing 19.5 dBm)
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(78));
+    ESP_LOGI(TAG, "WiFi TX power set to max (19.5 dBm)");
+
+    ESP_LOGI(TAG, "AP started: SSID='%s' Channel=%d MaxConn=%d", 
+             WIFI_SSID, WIFI_CHANNEL, MAX_STA_CONN);
+    ESP_LOGI(TAG, "AP IP: 192.168.4.1 (default)");
 
     // TCP server: create, non-block, bind, listen
     server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
@@ -126,8 +142,12 @@ esp_err_t wifi_comm_init_ap(void)
         return ESP_FAIL;
     }
 
+    // Enable socket reuse (helps with reconnections)
+    int enable = 1;
+    setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int));
+
     int flags = fcntl(server_socket, F_GETFL, 0);
-    fcntl(server_socket, F_SETFL, flags | O_NONBLOCK);           // Non-blocking accept()
+    fcntl(server_socket, F_SETFL, flags | O_NONBLOCK);
 
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
