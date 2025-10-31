@@ -1,61 +1,35 @@
+/*
+ * LCD Display Client Implementation
+ * 
+ * Professional dashboard for Sunflower Solar Tracker
+ * Displays real-time tracking data from main tracker unit
+ */
+
 #include "lcd.h"
-#include <stdio.h>
+#include "sunflower_logo.h"
 #include <string.h>
-#include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
-#include "sunflower_logo.h"
 
-/*
---------------------------------------------------------------------------------
-Sunflower Secondary LCD (ILI9486 over SPI)
---------------------------------------------------------------------------------
-Responsibilities:
-- Initialize SPI + ILI9486 panel
-- Provide basic drawing primitives (fill, pixel, line, rect, text)
-- Render dashboard: header, angle panels, battery, status, battery graph
-- Provide splash/init/error screens
-
-Hardware notes:
-- ESP32 classic (SPI2_HOST aka VSPI). MISO unused (display write-only)
-- Pins: MOSI=23, SCLK=18, CS=5, DC=21, RST=4
-- SPI clk set to 10MHz for reliability; can push higher if wiring is short
-
-Performance notes:
-- Uses blocking spi_device_polling_transmit; acceptable for UI rate (<10 FPS)
-- Many functions draw per-pixel (slow). For production, batch to line buffers
-- Consider heap_caps_malloc(MALLOC_CAP_DMA) for DMA-friendly buffers
-
-Status semantics:
-- tracking_status: 0=STANDBY (amber), 1=TRACKING (green), 2=SLEEP (amber),
-  3=CALIB (amber), 255=ERROR (red)
-
--------------------------------------------------------------------------------
-*/
-
-// Pin definitions
-#define TFT_MOSI    23   // VSPI MOSI
-#define TFT_SCLK    18   // VSPI SCLK
-#define TFT_CS      5    // VSPI CS (handled by SPI device)
-#define TFT_DC      21   // Data/Command select
-#define TFT_RST     4    // Panel reset
+#define TAG "LCD"
 
 // ILI9486 Commands
-#define ILI9486_NOP         0x00
 #define ILI9486_SWRESET     0x01
 #define ILI9486_SLPOUT      0x11
 #define ILI9486_NORON       0x13
-#define ILI9486_INVOFF      0x20
 #define ILI9486_DISPON      0x29
-#define ILI9486_CASET       0x2A   // Column address set
-#define ILI9486_PASET       0x2B   // Page (row) address set
-#define ILI9486_RAMWR       0x2C   // Memory write
-#define ILI9486_MADCTL      0x36   // Memory Access Control (rotation)
-#define ILI9486_PIXFMT      0x3A   // Pixel format (0x55 = RGB565)
+#define ILI9486_CASET       0x2A
+#define ILI9486_PASET       0x2B
+#define ILI9486_RAMWR       0x2C
+#define ILI9486_MADCTL      0x36
+#define ILI9486_PIXFMT      0x3A
 #define ILI9486_FRMCTR1     0xB1
 #define ILI9486_INVCTR      0xB4
 #define ILI9486_DFUNCTR     0xB6
@@ -66,282 +40,159 @@ Status semantics:
 #define ILI9486_GMCTRP1     0xE0
 #define ILI9486_GMCTRN1     0xE1
 
-// Simple 5x7 bitmap font (ASCII 32-126)
-// NOTE: Compact font for low memory footprint; consider larger fonts for readability.
-const uint8_t font5x7[][5] = {
-    {0x00, 0x00, 0x00, 0x00, 0x00}, // Space
-    {0x00, 0x00, 0x5F, 0x00, 0x00}, // !
-    {0x00, 0x07, 0x00, 0x07, 0x00}, // "
-    {0x14, 0x7F, 0x14, 0x7F, 0x14}, // #
-    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, // $
-    {0x23, 0x13, 0x08, 0x64, 0x62}, // %
-    {0x36, 0x49, 0x55, 0x22, 0x50}, // &
-    {0x00, 0x05, 0x03, 0x00, 0x00}, // '
-    {0x00, 0x1C, 0x22, 0x41, 0x00}, // (
-    {0x00, 0x41, 0x22, 0x1C, 0x00}, // )
-    {0x14, 0x08, 0x3E, 0x08, 0x14}, // *
-    {0x08, 0x08, 0x3E, 0x08, 0x08}, // +
-    {0x00, 0x50, 0x30, 0x00, 0x00}, // ,
-    {0x08, 0x08, 0x08, 0x08, 0x08}, // -
-    {0x00, 0x60, 0x60, 0x00, 0x00}, // .
-    {0x20, 0x10, 0x08, 0x04, 0x02}, // /
-    {0x3E, 0x51, 0x49, 0x45, 0x3E}, // 0
-    {0x00, 0x42, 0x7F, 0x40, 0x00}, // 1
-    {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
-    {0x21, 0x41, 0x45, 0x4B, 0x31}, // 3
-    {0x18, 0x14, 0x12, 0x7F, 0x10}, // 4
-    {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
-    {0x3C, 0x4A, 0x49, 0x49, 0x30}, // 6
-    {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
-    {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
-    {0x06, 0x49, 0x49, 0x29, 0x1E}, // 9
-    {0x00, 0x36, 0x36, 0x00, 0x00}, // :
-    {0x00, 0x56, 0x36, 0x00, 0x00}, // ;
-    {0x08, 0x14, 0x22, 0x41, 0x00}, // <
-    {0x14, 0x14, 0x14, 0x14, 0x14}, // =
-    {0x00, 0x41, 0x22, 0x14, 0x08}, // >
-    {0x02, 0x01, 0x51, 0x09, 0x06}, // ?
-    {0x32, 0x49, 0x79, 0x41, 0x3E}, // @
-    {0x7E, 0x11, 0x11, 0x11, 0x7E}, // A
-    {0x7F, 0x49, 0x49, 0x49, 0x36}, // B
-    {0x3E, 0x41, 0x41, 0x41, 0x22}, // C
-    {0x7F, 0x41, 0x41, 0x22, 0x1C}, // D
-    {0x7F, 0x49, 0x49, 0x49, 0x41}, // E
-    {0x7F, 0x09, 0x09, 0x09, 0x01}, // F
-    {0x3E, 0x41, 0x49, 0x49, 0x7A}, // G
-    {0x7F, 0x08, 0x08, 0x08, 0x7F}, // H
-    {0x00, 0x41, 0x7F, 0x41, 0x00}, // I
-    {0x20, 0x40, 0x41, 0x3F, 0x01}, // J
-    {0x7F, 0x08, 0x14, 0x22, 0x41}, // K
-    {0x7F, 0x40, 0x40, 0x40, 0x40}, // L
-    {0x7F, 0x02, 0x0C, 0x02, 0x7F}, // M
-    {0x7F, 0x04, 0x08, 0x10, 0x7F}, // N
-    {0x3E, 0x41, 0x41, 0x41, 0x3E}, // O
-    {0x7F, 0x09, 0x09, 0x09, 0x06}, // P
-    {0x3E, 0x41, 0x51, 0x21, 0x5E}, // Q
-    {0x7F, 0x09, 0x19, 0x29, 0x46}, // R
-    {0x46, 0x49, 0x49, 0x49, 0x31}, // S
-    {0x01, 0x01, 0x7F, 0x01, 0x01}, // T
-    {0x3F, 0x40, 0x40, 0x40, 0x3F}, // U
-    {0x1F, 0x20, 0x40, 0x20, 0x1F}, // V
-    {0x3F, 0x40, 0x38, 0x40, 0x3F}, // W
-    {0x63, 0x14, 0x08, 0x14, 0x63}, // X
-    {0x07, 0x08, 0x70, 0x08, 0x07}, // Y
-    {0x61, 0x51, 0x49, 0x45, 0x43}, // Z
-    {0x00, 0x7F, 0x41, 0x41, 0x00}, // [
-    {0x02, 0x04, 0x08, 0x10, 0x20}, // backslash
-    {0x00, 0x41, 0x41, 0x7F, 0x00}, // ]
-    {0x04, 0x02, 0x01, 0x02, 0x04}, // ^
-    {0x40, 0x40, 0x40, 0x40, 0x40}, // _
-    {0x00, 0x01, 0x02, 0x04, 0x00}, // `
-    {0x20, 0x54, 0x54, 0x54, 0x78}, // a
-    {0x7F, 0x48, 0x44, 0x44, 0x38}, // b
-    {0x38, 0x44, 0x44, 0x44, 0x20}, // c
-    {0x38, 0x44, 0x44, 0x48, 0x7F}, // d
-    {0x38, 0x54, 0x54, 0x54, 0x18}, // e
-    {0x08, 0x7E, 0x09, 0x01, 0x02}, // f
-    {0x0C, 0x52, 0x52, 0x52, 0x3E}, // g
-    {0x7F, 0x08, 0x04, 0x04, 0x78}, // H
-    {0x00, 0x44, 0x7D, 0x40, 0x00}, // i
-    {0x20, 0x40, 0x44, 0x3D, 0x00}, // j
-    {0x7F, 0x10, 0x28, 0x44, 0x00}, // k
-    {0x00, 0x41, 0x7F, 0x40, 0x00}, // l
-    {0x7C, 0x04, 0x18, 0x04, 0x78}, // m
-    {0x7C, 0x08, 0x04, 0x04, 0x78}, // n
-    {0x38, 0x44, 0x44, 0x44, 0x38}, // o
-    {0x7C, 0x14, 0x14, 0x14, 0x08}, // p
-    {0x08, 0x14, 0x14, 0x18, 0x7C}, // q
-    {0x7C, 0x08, 0x04, 0x04, 0x08}, // r
-    {0x48, 0x54, 0x54, 0x54, 0x20}, // s
-    {0x04, 0x3F, 0x44, 0x40, 0x20}, // t
-    {0x3C, 0x40, 0x40, 0x20, 0x7C}, // u
-    {0x1C, 0x20, 0x40, 0x20, 0x1C}, // v
-    {0x3C, 0x40, 0x30, 0x40, 0x3C}, // w
-    {0x44, 0x28, 0x10, 0x28, 0x44}, // x
-    {0x0C, 0x50, 0x50, 0x50, 0x3C}, // y
-    {0x44, 0x64, 0x54, 0x4C, 0x44}, // z
+// 5x7 Bitmap Font (ASCII 32-126)
+static const uint8_t font5x7[][5] = {
+    {0x00, 0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x5F, 0x00, 0x00},
+    {0x00, 0x07, 0x00, 0x07, 0x00}, {0x14, 0x7F, 0x14, 0x7F, 0x14},
+    {0x24, 0x2A, 0x7F, 0x2A, 0x12}, {0x23, 0x13, 0x08, 0x64, 0x62},
+    {0x36, 0x49, 0x55, 0x22, 0x50}, {0x00, 0x05, 0x03, 0x00, 0x00},
+    {0x00, 0x1C, 0x22, 0x41, 0x00}, {0x00, 0x41, 0x22, 0x1C, 0x00},
+    {0x14, 0x08, 0x3E, 0x08, 0x14}, {0x08, 0x08, 0x3E, 0x08, 0x08},
+    {0x00, 0x50, 0x30, 0x00, 0x00}, {0x08, 0x08, 0x08, 0x08, 0x08},
+    {0x00, 0x60, 0x60, 0x00, 0x00}, {0x20, 0x10, 0x08, 0x04, 0x02},
+    {0x3E, 0x51, 0x49, 0x45, 0x3E}, {0x00, 0x42, 0x7F, 0x40, 0x00},
+    {0x42, 0x61, 0x51, 0x49, 0x46}, {0x21, 0x41, 0x45, 0x4B, 0x31},
+    {0x18, 0x14, 0x12, 0x7F, 0x10}, {0x27, 0x45, 0x45, 0x45, 0x39},
+    {0x3C, 0x4A, 0x49, 0x49, 0x30}, {0x01, 0x71, 0x09, 0x05, 0x03},
+    {0x36, 0x49, 0x49, 0x49, 0x36}, {0x06, 0x49, 0x49, 0x29, 0x1E},
+    {0x00, 0x36, 0x36, 0x00, 0x00}, {0x00, 0x56, 0x36, 0x00, 0x00},
+    {0x08, 0x14, 0x22, 0x41, 0x00}, {0x14, 0x14, 0x14, 0x14, 0x14},
+    {0x00, 0x41, 0x22, 0x14, 0x08}, {0x02, 0x01, 0x51, 0x09, 0x06},
+    {0x32, 0x49, 0x79, 0x41, 0x3E}, {0x7E, 0x11, 0x11, 0x11, 0x7E},
+    {0x7F, 0x49, 0x49, 0x49, 0x36}, {0x3E, 0x41, 0x41, 0x41, 0x22},
+    {0x7F, 0x41, 0x41, 0x22, 0x1C}, {0x7F, 0x49, 0x49, 0x49, 0x41},
+    {0x7F, 0x09, 0x09, 0x09, 0x01}, {0x3E, 0x41, 0x49, 0x49, 0x7A},
+    {0x7F, 0x08, 0x08, 0x08, 0x7F}, {0x00, 0x41, 0x7F, 0x41, 0x00},
+    {0x20, 0x40, 0x41, 0x3F, 0x01}, {0x7F, 0x08, 0x14, 0x22, 0x41},
+    {0x7F, 0x40, 0x40, 0x40, 0x40}, {0x7F, 0x02, 0x0C, 0x02, 0x7F},
+    {0x7F, 0x04, 0x08, 0x10, 0x7F}, {0x3E, 0x41, 0x41, 0x41, 0x3E},
+    {0x7F, 0x09, 0x09, 0x09, 0x06}, {0x3E, 0x41, 0x51, 0x21, 0x5E},
+    {0x7F, 0x09, 0x19, 0x29, 0x46}, {0x46, 0x49, 0x49, 0x49, 0x31},
+    {0x01, 0x01, 0x7F, 0x01, 0x01}, {0x3F, 0x40, 0x40, 0x40, 0x3F},
+    {0x1F, 0x20, 0x40, 0x20, 0x1F}, {0x3F, 0x40, 0x38, 0x40, 0x3F},
+    {0x63, 0x14, 0x08, 0x14, 0x63}, {0x07, 0x08, 0x70, 0x08, 0x07},
+    {0x61, 0x51, 0x49, 0x45, 0x43}, {0x00, 0x7F, 0x41, 0x41, 0x00},
+    {0x02, 0x04, 0x08, 0x10, 0x20}, {0x00, 0x41, 0x41, 0x7F, 0x00},
+    {0x04, 0x02, 0x01, 0x02, 0x04}, {0x40, 0x40, 0x40, 0x40, 0x40},
+    {0x00, 0x01, 0x02, 0x04, 0x00}, {0x20, 0x54, 0x54, 0x54, 0x78},
+    {0x7F, 0x48, 0x44, 0x44, 0x38}, {0x38, 0x44, 0x44, 0x44, 0x20},
+    {0x38, 0x44, 0x44, 0x48, 0x7F}, {0x38, 0x54, 0x54, 0x54, 0x18},
+    {0x08, 0x7E, 0x09, 0x01, 0x02}, {0x0C, 0x52, 0x52, 0x52, 0x3E},
+    {0x7F, 0x08, 0x04, 0x04, 0x78}, {0x00, 0x44, 0x7D, 0x40, 0x00},
+    {0x20, 0x40, 0x44, 0x3D, 0x00}, {0x7F, 0x10, 0x28, 0x44, 0x00},
+    {0x00, 0x41, 0x7F, 0x40, 0x00}, {0x7C, 0x04, 0x18, 0x04, 0x78},
+    {0x7C, 0x08, 0x04, 0x04, 0x78}, {0x38, 0x44, 0x44, 0x44, 0x38},
+    {0x7C, 0x14, 0x14, 0x14, 0x08}, {0x08, 0x14, 0x14, 0x18, 0x7C},
+    {0x7C, 0x08, 0x04, 0x04, 0x08}, {0x48, 0x54, 0x54, 0x54, 0x20},
+    {0x04, 0x3F, 0x44, 0x40, 0x20}, {0x3C, 0x40, 0x40, 0x20, 0x7C},
+    {0x1C, 0x20, 0x40, 0x20, 0x1C}, {0x3C, 0x40, 0x30, 0x40, 0x3C},
+    {0x44, 0x28, 0x10, 0x28, 0x44}, {0x0C, 0x50, 0x50, 0x50, 0x3C},
+    {0x44, 0x64, 0x54, 0x4C, 0x44},
 };
 
-static const char *TAG = "LCD";
-static spi_device_handle_t spi;
-static lcd_display_data_t current_data;   // Mutable copy of what's on-screen
-static uint16_t battery_history[100];     // Rolling ADC history for graph
+// Private variables
+static spi_device_handle_t spi_device;
+static int dc_pin, rst_pin, backlight_pin;
+static uint16_t voltage_history[100] = {0};
 static int history_index = 0;
+static tracker_data_t last_data = {0};
+static bool full_redraw_needed = true;
 
-// ===== Low-level SPI functions =====
+// === Low-Level SPI Functions ===
 
-static void tft_spi_pre_transfer_callback(spi_transaction_t *t)
-{
-    // DC=0 for command, DC=1 for data (value passed via txn->user)
-    int dc = (int)t->user;
-    gpio_set_level(TFT_DC, dc);
+static void lcd_spi_pre_transfer_callback(spi_transaction_t *t) {
+    gpio_set_level(dc_pin, (int)t->user);
 }
 
-static void tft_cmd(uint8_t cmd)
-{
-    // Send single-byte command (blocking)
-    // NOTE: Consider queueing for batch performance if needed.
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8;
-    t.tx_buffer = &cmd;
-    t.user = (void*)0;
-    ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
+static void lcd_cmd(uint8_t cmd) {
+    spi_transaction_t t = {
+        .length = 8,
+        .tx_buffer = &cmd,
+        .user = (void*)0
+    };
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_device, &t));
 }
 
-static void tft_data(uint8_t data)
-{
-    // Send single-byte data (blocking)
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = 8;
-    t.tx_buffer = &data;
-    t.user = (void*)1;
-    ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
+static void lcd_data(uint8_t data) {
+    spi_transaction_t t = {
+        .length = 8,
+        .tx_buffer = &data,
+        .user = (void*)1
+    };
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_device, &t));
 }
 
-static void tft_data_buf(uint8_t *data, int len)
-{
-    // Send buffer payload (blocking)
-    // TODO: Use DMA-capable buffer if we see throughput issues.
+static void lcd_data_buf(const uint8_t *data, int len) {
     if (len == 0) return;
-    esp_err_t ret;
-    spi_transaction_t t;
-    memset(&t, 0, sizeof(t));
-    t.length = len * 8;
-    t.tx_buffer = data;
-    t.user = (void*)1;
-    ret = spi_device_polling_transmit(spi, &t);
-    assert(ret == ESP_OK);
+    spi_transaction_t t = {
+        .length = len * 8,
+        .tx_buffer = data,
+        .user = (void*)1
+    };
+    ESP_ERROR_CHECK(spi_device_polling_transmit(spi_device, &t));
 }
 
-static void tft_set_addr_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
-{
-    // Set drawing window for subsequent RAMWR pixel writes
-    tft_cmd(ILI9486_CASET);
-    tft_data(x0 >> 8);
-    tft_data(x0 & 0xFF);
-    tft_data(x1 >> 8);
-    tft_data(x1 & 0xFF);
-
-    tft_cmd(ILI9486_PASET);
-    tft_data(y0 >> 8);
-    tft_data(y0 & 0xFF);
-    tft_data(y1 >> 8);
-    tft_data(y1 & 0xFF);
-
-    tft_cmd(ILI9486_RAMWR);
+static void lcd_set_addr_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    lcd_cmd(ILI9486_CASET);
+    lcd_data(x0 >> 8); lcd_data(x0 & 0xFF);
+    lcd_data(x1 >> 8); lcd_data(x1 & 0xFF);
+    lcd_cmd(ILI9486_PASET);
+    lcd_data(y0 >> 8); lcd_data(y0 & 0xFF);
+    lcd_data(y1 >> 8); lcd_data(y1 & 0xFF);
+    lcd_cmd(ILI9486_RAMWR);
 }
 
-void lcd_clear_screen(uint16_t color)
-{
-    // Fast full-screen fill using line chunks
-    // TODO: Reuse a static buffer to avoid malloc/free jitter.
-    tft_set_addr_window(0, 0, TFT_WIDTH - 1, TFT_HEIGHT - 1);
+// === Drawing Primitives ===
 
-    const int lines_per_chunk = 10;
-    uint8_t *buffer = malloc(TFT_WIDTH * 2 * lines_per_chunk);
+static void lcd_fill_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
+    if (x >= LCD_WIDTH || y >= LCD_HEIGHT || w <= 0 || h <= 0) return;
+    if (x + w > LCD_WIDTH) w = LCD_WIDTH - x;
+    if (y + h > LCD_HEIGHT) h = LCD_HEIGHT - y;
+
+    lcd_set_addr_window(x, y, x + w - 1, y + h - 1);
     
-    if (buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate buffer!");
-        return;
-    }
-
-    for (int i = 0; i < TFT_WIDTH * lines_per_chunk; i++) {
-        buffer[i * 2] = color >> 8;
-        buffer[i * 2 + 1] = color & 0xFF;
-    }
-
-    gpio_set_level(TFT_DC, 1);
-    
-    int remaining_lines = TFT_HEIGHT;
-    while (remaining_lines > 0) {
-        int lines_to_send = (remaining_lines >= lines_per_chunk) ? lines_per_chunk : remaining_lines;
-        tft_data_buf(buffer, TFT_WIDTH * 2 * lines_to_send);
-        remaining_lines -= lines_to_send;
-    }
-    
-    free(buffer);
-}
-
-void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
-{
-    // Solid rectangle fill. Clips to screen bounds.
-    // FIXME: Allocate 'line' once and reuse; current malloc per call is costly.
-    if (x >= TFT_WIDTH || y >= TFT_HEIGHT || w <= 0 || h <= 0) return;
-    if (x + w > TFT_WIDTH) w = TFT_WIDTH - x;
-    if (y + h > TFT_HEIGHT) h = TFT_HEIGHT - y;
-
-    tft_set_addr_window(x, y, x + w - 1, y + h - 1);
-
     uint8_t *line = malloc(w * 2);
-    if (line == NULL) return;
-
     for (int i = 0; i < w; i++) {
         line[i * 2] = color >> 8;
         line[i * 2 + 1] = color & 0xFF;
     }
-
-    gpio_set_level(TFT_DC, 1);
-    for (int i = 0; i < h; i++) {
-        tft_data_buf(line, w * 2);
-    }
     
+    gpio_set_level(dc_pin, 1);
+    for (int i = 0; i < h; i++) {
+        lcd_data_buf(line, w * 2);
+    }
     free(line);
 }
 
-void lcd_draw_pixel(uint16_t x, uint16_t y, uint16_t color)
-{
-    // Single pixel write (slow). Prefer batching when possible.
-    if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
-    tft_set_addr_window(x, y, x, y);
-    tft_data(color >> 8);
-    tft_data(color & 0xFF);
+static void lcd_draw_pixel(int16_t x, int16_t y, uint16_t color) {
+    if (x < 0 || x >= LCD_WIDTH || y < 0 || y >= LCD_HEIGHT) return;
+    lcd_set_addr_window(x, y, x, y);
+    lcd_data(color >> 8);
+    lcd_data(color & 0xFF);
 }
 
-void lcd_draw_line(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1, uint16_t color)
-{
-    // Bresenham line algorithm; integer math for speed
-    // TODO: Add Cohen–Sutherland clip if needed for off-screen segments.
-    int16_t dx = abs(x1 - x0);
-    int16_t dy = abs(y1 - y0);
-    int16_t sx = (x0 < x1) ? 1 : -1;
-    int16_t sy = (y0 < y1) ? 1 : -1;
+static void lcd_draw_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint16_t color) {
+    int16_t dx = abs(x1 - x0), dy = abs(y1 - y0);
+    int16_t sx = (x0 < x1) ? 1 : -1, sy = (y0 < y1) ? 1 : -1;
     int16_t err = dx - dy;
-
+    
     while (1) {
         lcd_draw_pixel(x0, y0, color);
         if (x0 == x1 && y0 == y1) break;
         int16_t e2 = 2 * err;
-        if (e2 > -dy) {
-            err -= dy;
-            x0 += sx;
-        }
-        if (e2 < dx) {
-            err += dx;
-            y0 += sy;
-        }
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
     }
 }
 
-void lcd_draw_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t color)
-{
-    // Rectangle outline using 4 lines
+static void lcd_draw_rect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t color) {
     lcd_draw_line(x, y, x + w - 1, y, color);
     lcd_draw_line(x + w - 1, y, x + w - 1, y + h - 1, color);
     lcd_draw_line(x + w - 1, y + h - 1, x, y + h - 1, color);
     lcd_draw_line(x, y + h - 1, x, y, color);
 }
 
-// ===== Text rendering functions =====
-
-static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg, uint8_t size)
-{
-    // 5x7 bitmap font scaled by 'size'; draws background to avoid artifacts
+static void lcd_draw_char(int16_t x, int16_t y, char c, uint16_t color, uint16_t bg, uint8_t size) {
     if (c < ' ' || c > 'z') c = '?';
     int index = c - ' ';
     
@@ -349,27 +200,19 @@ static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t color, uint16
         uint8_t line = font5x7[index][i];
         for (int j = 0; j < 8; j++) {
             if (line & 0x1) {
-                if (size == 1) {
-                    lcd_draw_pixel(x + i, y + j, color);
-                } else {
-                    lcd_fill_rect(x + i * size, y + j * size, size, size, color);
-                }
+                if (size == 1) lcd_draw_pixel(x + i, y + j, color);
+                else lcd_fill_rect(x + i * size, y + j * size, size, size, color);
             } else if (bg != color) {
-                if (size == 1) {
-                    lcd_draw_pixel(x + i, y + j, bg);
-                } else {
-                    lcd_fill_rect(x + i * size, y + j * size, size, size, bg);
-                }
+                if (size == 1) lcd_draw_pixel(x + i, y + j, bg);
+                else lcd_fill_rect(x + i * size, y + j * size, size, size, bg);
             }
             line >>= 1;
         }
     }
 }
 
-void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg, uint8_t size)
-{
-    // Basic string with newline support; monospaced width 6*size
-    uint16_t cursor_x = x;
+static void lcd_draw_string(int16_t x, int16_t y, const char *str, uint16_t color, uint16_t bg, uint8_t size) {
+    int cursor_x = x;
     while (*str) {
         if (*str == '\n') {
             cursor_x = x;
@@ -382,658 +225,566 @@ void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, ui
     }
 }
 
-static void tft_draw_image(uint16_t x, uint16_t y, const uint16_t *image, uint16_t w, uint16_t h, uint16_t transparent_color)
-{
-    // Very simple blit with chroma key (transparent_color). Per-pixel writes.
-    // NOTE: 'image' is const -> stored in flash; reads are fine on ESP32.
-    if (x >= TFT_WIDTH || y >= TFT_HEIGHT) return;
+static void lcd_draw_image(int16_t x, int16_t y, const uint16_t *image, int16_t w, int16_t h, uint16_t transparent) {
+    // Set address window for entire image area for faster rendering
+    lcd_set_addr_window(x, y, x + w - 1, y + h - 1);
     
-    for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
-            uint16_t pixel = image[j * w + i];
-            if (pixel != transparent_color) {
-                if (x + i >= 0 && x + i < TFT_WIDTH && y + j >= 0 && y + j < TFT_HEIGHT) {
+    // Allocate buffer for one row
+    uint8_t *row_buffer = malloc(w * 2);
+    if (!row_buffer) {
+        // Fallback to pixel-by-pixel if malloc fails
+        for (int j = 0; j < h; j++) {
+            for (int i = 0; i < w; i++) {
+                uint16_t pixel = image[j * w + i];
+                if (pixel != transparent) {
                     lcd_draw_pixel(x + i, y + j, pixel);
                 }
             }
         }
+        return;
+    }
+    
+    gpio_set_level(dc_pin, 1); // Data mode
+    
+    // Draw row by row for better performance
+    for (int j = 0; j < h; j++) {
+        int buf_idx = 0;
+        for (int i = 0; i < w; i++) {
+            uint16_t pixel = image[j * w + i];
+            // Skip transparent pixels - just don't draw them
+            // This requires pixel-by-pixel drawing for transparency
+            if (pixel != transparent) {
+                row_buffer[buf_idx++] = pixel >> 8;
+                row_buffer[buf_idx++] = pixel & 0xFF;
+            }
+        }
+        if (buf_idx > 0) {
+            lcd_data_buf(row_buffer, buf_idx);
+        }
+    }
+    
+    free(row_buffer);
+}
+
+// Better approach - just draw opaque images without transparency check
+static void lcd_draw_image_fast(int16_t x, int16_t y, const uint16_t *image, int16_t w, int16_t h) {
+    lcd_set_addr_window(x, y, x + w - 1, y + h - 1);
+    
+    uint8_t *buffer = malloc(w * h * 2);
+    if (buffer) {
+        for (int i = 0; i < w * h; i++) {
+            buffer[i * 2] = image[i] >> 8;
+            buffer[i * 2 + 1] = image[i] & 0xFF;
+        }
+        gpio_set_level(dc_pin, 1);
+        lcd_data_buf(buffer, w * h * 2);
+        free(buffer);
     }
 }
 
-// ===== Hardware initialization =====
-
-static void tft_init_pins(void)
-{
-    // Configure DC/RST as GPIO outputs. CS is managed by SPI driver.
-    gpio_set_direction(TFT_DC, GPIO_MODE_OUTPUT);
-    gpio_set_direction(TFT_RST, GPIO_MODE_OUTPUT);
-    ESP_LOGI(TAG, "GPIO pins configured");
+// Simple image draw - NO transparency, just draw all pixels
+static void lcd_draw_image_simple(int16_t x, int16_t y, const uint16_t *image, int16_t w, int16_t h) {
+    if (x < 0 || y < 0 || x + w > LCD_WIDTH || y + h > LCD_HEIGHT) return;
+    
+    lcd_set_addr_window(x, y, x + w - 1, y + h - 1);
+    
+    // Allocate buffer for entire image
+    int total_pixels = w * h;
+    uint8_t *buffer = malloc(total_pixels * 2);
+    
+    if (buffer) {
+        // Convert RGB565 array to byte stream
+        for (int i = 0; i < total_pixels; i++) {
+            buffer[i * 2] = image[i] >> 8;        // High byte
+            buffer[i * 2 + 1] = image[i] & 0xFF;  // Low byte
+        }
+        
+        // Send entire buffer at once
+        gpio_set_level(dc_pin, 1);  // Data mode
+        lcd_data_buf(buffer, total_pixels * 2);
+        
+        free(buffer);
+    } else {
+        // Fallback: send pixel by pixel if malloc fails
+        gpio_set_level(dc_pin, 1);
+        for (int i = 0; i < total_pixels; i++) {
+            uint8_t hi = image[i] >> 8;
+            uint8_t lo = image[i] & 0xFF;
+            lcd_data(hi);
+            lcd_data(lo);
+        }
+    }
 }
 
-static void tft_init_spi(void)
-{
-    // SPI2_HOST (VSPI): 10MHz, mode 0
-    // NOTE: Can try 26-40MHz with short wires and proper level shifting.
-    esp_err_t ret;
+// === Dashboard Components ===
+
+static void draw_header(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->timestamp == last_data.timestamp) return;
+    
+    lcd_fill_rect(0, 0, LCD_WIDTH, HEADER_HEIGHT, LCD_CHARCOAL);
+    
+    // Draw logo - simple, no transparency
+    lcd_draw_image_simple(10, 3, sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT);
+    
+    // Draw title
+    lcd_draw_string(40, 10, "SUNFLOWER", LCD_SUNGLOW, LCD_CHARCOAL, 2);
+    
+    // Draw time
+    time_t now = (time_t)data->timestamp;
+    struct tm *tm = localtime(&now);
+    char time_str[80];
+    snprintf(time_str, sizeof(time_str), "%02d/%02d/%04d %02d:%02d:%02d",
+             tm->tm_mon + 1, tm->tm_mday, tm->tm_year + 1900,
+             tm->tm_hour, tm->tm_min, tm->tm_sec);
+    lcd_draw_string(350, 10, time_str, LCD_WHITE, LCD_CHARCOAL, 1);
+}
+
+static void draw_elevation_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->elevation == last_data.elevation && 
+        data->delta_elevation == last_data.delta_elevation) return;
+    
+    int16_t x = 5, y = 35;
+    lcd_fill_rect(x, y, 150, PANEL_HEIGHT, LCD_DARKBLUE);
+    lcd_draw_rect(x, y, 150, PANEL_HEIGHT, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "ELEVATION", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char angle_str[16];
+    snprintf(angle_str, sizeof(angle_str), "%.1f", data->elevation);
+    lcd_draw_string(x + 5, y + 25, angle_str, LCD_SUNGLOW, LCD_DARKBLUE, 3);
+    lcd_draw_string(x + 70, y + 32, "deg", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char delta_str[16];
+    snprintf(delta_str, sizeof(delta_str), "D:%.2f", data->delta_elevation);
+    lcd_draw_string(x + 5, y + 52, delta_str, LCD_TEAL, LCD_DARKBLUE, 1);
+}
+
+static void draw_azimuth_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->azimuth == last_data.azimuth && 
+        data->delta_azimuth == last_data.delta_azimuth) return;
+    
+    int16_t x = 165, y = 35;
+    lcd_fill_rect(x, y, 150, PANEL_HEIGHT, LCD_DARKBLUE);
+    lcd_draw_rect(x, y, 150, PANEL_HEIGHT, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "AZIMUTH", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char angle_str[16];
+    snprintf(angle_str, sizeof(angle_str), "%.1f", data->azimuth);
+    lcd_draw_string(x + 5, y + 25, angle_str, LCD_SUNGLOW, LCD_DARKBLUE, 3);
+    lcd_draw_string(x + 70, y + 32, "deg", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char delta_str[16];
+    snprintf(delta_str, sizeof(delta_str), "D:%.2f", data->delta_azimuth);
+    lcd_draw_string(x + 5, y + 52, delta_str, LCD_TEAL, LCD_DARKBLUE, 1);
+}
+
+static void draw_battery_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->battery_voltage == last_data.battery_voltage && 
+        data->battery_soc_percent == last_data.battery_soc_percent &&
+        data->battery_charging == last_data.battery_charging) return;
+    
+    int16_t x = 325, y = 35;
+    lcd_fill_rect(x, y, 150, PANEL_HEIGHT, LCD_STEEL);
+    lcd_draw_rect(x, y, 150, PANEL_HEIGHT, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "BATTERY", LCD_WHITE, LCD_STEEL, 1);
+    
+    char volt_str[16];
+    snprintf(volt_str, sizeof(volt_str), "%.2fV", data->battery_voltage);
+    lcd_draw_string(x + 5, y + 20, volt_str, LCD_SUNGLOW, LCD_STEEL, 2);
+    
+    char soc_str[16];
+    snprintf(soc_str, sizeof(soc_str), "%.0f%%", data->battery_soc_percent);
+    lcd_draw_string(x + 5, y + 40, soc_str, LCD_WHITE, LCD_STEEL, 1);
+    
+    char adc_str[16];
+    snprintf(adc_str, sizeof(adc_str), "ADC:%u", data->battery_adc);
+    lcd_draw_string(x + 5, y + 52, adc_str, LCD_WHITE, LCD_STEEL, 1);
+    
+    // Battery bar
+    int bar_width = (int)(data->battery_soc_percent * 0.6f);
+    if (bar_width > 60) bar_width = 60;
+    if (bar_width < 0) bar_width = 0;
+    
+    uint16_t bar_color = LCD_SAGE;
+    if (data->battery_soc == 0) bar_color = LCD_CRIMSON;
+    else if (data->battery_soc == 1) bar_color = LCD_ORANGE;
+    
+    lcd_fill_rect(x + 80, y + 50, 60, 10, LCD_BLACK);
+    lcd_fill_rect(x + 80, y + 50, bar_width, 10, bar_color);
+    lcd_draw_rect(x + 80, y + 50, 60, 10, LCD_WHITE);
+    
+    // Charging indicator
+    if (data->battery_charging) {
+        lcd_draw_string(x + 60, y + 20, "CHG", LCD_MINT, LCD_STEEL, 1);
+    }
+}
+
+static void draw_sun_position_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->sun_elevation == last_data.sun_elevation && 
+        data->sun_azimuth == last_data.sun_azimuth) return;
+    
+    int16_t x = 5, y = 110;
+    lcd_fill_rect(x, y, 150, PANEL_HEIGHT, LCD_DARKBLUE);
+    lcd_draw_rect(x, y, 150, PANEL_HEIGHT, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "SUN POSITION", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char el_str[32];
+    snprintf(el_str, sizeof(el_str), "El:%.1f", data->sun_elevation);
+    lcd_draw_string(x + 5, y + 22, el_str, LCD_SUNGLOW, LCD_DARKBLUE, 1);
+    lcd_draw_string(x + 55, y + 22, "deg", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char az_str[32];
+    snprintf(az_str, sizeof(az_str), "Az:%.1f", data->sun_azimuth);
+    lcd_draw_string(x + 5, y + 35, az_str, LCD_SUNGLOW, LCD_DARKBLUE, 1);
+    lcd_draw_string(x + 55, y + 35, "deg", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    // Sunrise/Sunset
+    if (data->sunrise_time > 0 && data->sunset_time > 0) {
+        struct tm *sr = localtime((time_t*)&data->sunrise_time);
+        struct tm *ss = localtime((time_t*)&data->sunset_time);
+        
+        char sun_times[32];
+        snprintf(sun_times, sizeof(sun_times), "R:%02d:%02d S:%02d:%02d",
+                 sr->tm_hour, sr->tm_min, ss->tm_hour, ss->tm_min);
+        lcd_draw_string(x + 5, y + 52, sun_times, LCD_TEAL, LCD_DARKBLUE, 1);
+    }
+}
+
+static void draw_status_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->status == last_data.status && 
+        data->tracking_quality == last_data.tracking_quality &&
+        data->sd_card_status == last_data.sd_card_status) return;
+    
+    int16_t x = 165, y = 110;
+    
+    const char *status_text;
+    uint16_t status_color;
+    uint16_t text_color;
+    
+    switch(data->status) {
+        case 0:
+            status_text = "STANDBY";
+            status_color = LCD_ORANGE;
+            text_color = LCD_BLACK;
+            break;
+        case 1:
+            status_text = "TRACKING";
+            status_color = LCD_SAGE;
+            text_color = LCD_BLACK;
+            break;
+        case 2:
+            status_text = "SLEEP";
+            status_color = LCD_CHARCOAL;
+            text_color = LCD_WHITE;
+            break;
+        case 3:
+            status_text = "CALIBRATE";
+            status_color = LCD_TEAL;
+            text_color = LCD_BLACK;
+            break;
+        default:
+            status_text = "ERROR";
+            status_color = LCD_CRIMSON;
+            text_color = LCD_WHITE;
+            break;
+    }
+    
+    lcd_fill_rect(x, y, 150, PANEL_HEIGHT, status_color);
+    lcd_draw_rect(x, y, 150, PANEL_HEIGHT, LCD_WHITE);
+    
+    lcd_draw_string(x + 5, y + 5, "SYSTEM STATUS", text_color, status_color, 1);
+    lcd_draw_string(x + 20, y + 28, status_text, text_color, status_color, 2);
+    
+    char error_str[16];
+    snprintf(error_str, sizeof(error_str), "Err:%udeg", data->tracking_quality);
+    lcd_draw_string(x + 5, y + 52, error_str, text_color, status_color, 1);
+    
+    const char *sd_status[] = {"SD:OK", "SD:SLOW", "SD:FULL", "SD:FAIL"};
+    uint8_t sd_idx = (data->sd_card_status > 3) ? 3 : data->sd_card_status;
+    lcd_draw_string(x + 75, y + 52, sd_status[sd_idx], text_color, status_color, 1);
+}
+
+static void draw_gps_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->latitude == last_data.latitude && 
+        data->longitude == last_data.longitude && data->gps_valid == last_data.gps_valid &&
+        data->gps_satellites == last_data.gps_satellites) return;
+    
+    int16_t x = 325, y = 110;
+    int16_t h = 35;
+    
+    lcd_fill_rect(x, y, 150, h, LCD_DARKBLUE);
+    lcd_draw_rect(x, y, 150, h, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "GPS", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    if (data->gps_valid) {
+        char gps_str[32];
+        snprintf(gps_str, sizeof(gps_str), "%.4f,%.4f", data->latitude, data->longitude);
+        lcd_draw_string(x + 5, y + 15, gps_str, LCD_TEAL, LCD_DARKBLUE, 1);
+        
+        snprintf(gps_str, sizeof(gps_str), "Sats:%u Age:%lus", 
+                 data->gps_satellites, data->last_gps_fix_age_sec);
+        lcd_draw_string(x + 5, y + 25, gps_str, LCD_TEAL, LCD_DARKBLUE, 1);
+    } else {
+        lcd_draw_string(x + 5, y + 15, "NO FIX", LCD_CRIMSON, LCD_DARKBLUE, 1);
+        char age_str[24];
+        snprintf(age_str, sizeof(age_str), "Age:%lus", data->last_gps_fix_age_sec);
+        lcd_draw_string(x + 5, y + 25, age_str, LCD_ORANGE, LCD_DARKBLUE, 1);
+    }
+}
+
+static void draw_stats_panel(const tracker_data_t *data) {
+    if (!full_redraw_needed && data->moves_today == last_data.moves_today && 
+        data->total_moves == last_data.total_moves && data->uptime_hours == last_data.uptime_hours &&
+        data->wifi_rssi == last_data.wifi_rssi) return;
+    
+    int16_t x = 325, y = 147;
+    int16_t h = 33;
+    
+    lcd_fill_rect(x, y, 150, h, LCD_DARKBLUE);
+    lcd_draw_rect(x, y, 150, h, LCD_SLATE);
+    
+    lcd_draw_string(x + 5, y + 5, "STATISTICS", LCD_WHITE, LCD_DARKBLUE, 1);
+    
+    char stats_str[32];
+    snprintf(stats_str, sizeof(stats_str), "Today:%lu Total:%lu", 
+             data->moves_today, data->total_moves);
+    lcd_draw_string(x + 5, y + 15, stats_str, LCD_TEAL, LCD_DARKBLUE, 1);
+    
+    snprintf(stats_str, sizeof(stats_str), "Up:%uh WiFi:%ddBm", 
+             data->uptime_hours, data->wifi_rssi);
+    lcd_draw_string(x + 5, y + 24, stats_str, LCD_TEAL, LCD_DARKBLUE, 1);
+}
+
+static void draw_voltage_graph(const tracker_data_t *data) {
+    int16_t x = 5, y = GRAPH_Y_START;
+    int16_t w = 470, h = GRAPH_HEIGHT;
+    
+    if (full_redraw_needed) {
+        lcd_fill_rect(x, y, w, h, LCD_BLACK);
+        lcd_draw_rect(x, y, w, h, LCD_SLATE);
+        
+        lcd_draw_string(x + 5, y + 5, "Battery Voltage History (Last 100 Readings)", 
+                        LCD_WHITE, LCD_BLACK, 1);
+        
+        for (int i = 0; i <= 4; i++) {
+            int grid_y = y + 20 + (h - 30) * i / 4;
+            lcd_draw_line(x + 35, grid_y, x + w - 5, grid_y, LCD_CHARCOAL);
+        }
+    }
+    
+    // Fixed voltage range for 12V LiFePO4 battery
+    float min_voltage = 10.0f;  // Minimum safe voltage
+    float max_voltage = 15.0f;  // Maximum charging voltage (increased from 14.6)
+    
+    // Hardware voltage divider constants
+    // R1 = 177.9kΩ, R2 = 30.22kΩ
+    // Ratio = (R1 + R2) / R2 = 208.12 / 30.22 = 6.89
+    const float VOLTAGE_RATIO = 6.89f;
+    const float ADC_MAX = 4095.0f;
+    const float ADC_VREF = 3.3f;
+    
+    // Draw graph
+    int graph_w = w - 45;
+    int graph_h = h - 35;
+    
+    for (int i = 1; i < 100; i++) {
+        int prev_idx = (history_index + i - 1) % 100;
+        int curr_idx = (history_index + i) % 100;
+        
+        if (voltage_history[prev_idx] == 0 || voltage_history[curr_idx] == 0) continue;
+        
+        // Convert ADC to actual battery voltage
+        // V_battery = (ADC / 4095) × 3.3V × 6.89
+        float v1 = (voltage_history[prev_idx] / ADC_MAX) * ADC_VREF * VOLTAGE_RATIO;
+        float v2 = (voltage_history[curr_idx] / ADC_MAX) * ADC_VREF * VOLTAGE_RATIO;
+        
+        // Clamp to display range
+        if (v1 < min_voltage) v1 = min_voltage;
+        if (v1 > max_voltage) v1 = max_voltage;
+        if (v2 < min_voltage) v2 = min_voltage;
+        if (v2 > max_voltage) v2 = max_voltage;
+        
+        int x1 = x + 35 + (graph_w * (i - 1) / 99);
+        int y1 = y + 25 + graph_h - (int)((v1 - min_voltage) * graph_h / (max_voltage - min_voltage));
+        int x2 = x + 35 + (graph_w * i / 99);
+        int y2 = y + 25 + graph_h - (int)((v2 - min_voltage) * graph_h / (max_voltage - min_voltage));
+        
+        lcd_draw_line(x1, y1, x2, y2, LCD_SAGE);
+    }
+    
+    // Y-axis labels (show actual voltage range)
+    if (full_redraw_needed) {
+        char label[8];
+        snprintf(label, sizeof(label), "%.1fV", min_voltage);
+        lcd_draw_string(x + 5, y + h - 12, label, LCD_WHITE, LCD_BLACK, 1);
+        
+        snprintf(label, sizeof(label), "%.1fV", 12.5f);
+        lcd_draw_string(x + 3, y + (h / 2), label, LCD_WHITE, LCD_BLACK, 1);
+        
+        snprintf(label, sizeof(label), "%.1fV", max_voltage);
+        lcd_draw_string(x + 5, y + 20, label, LCD_WHITE, LCD_BLACK, 1);
+    }
+}
+
+// === Public API ===
+
+esp_err_t lcd_client_init(const lcd_config_t *config) {
+    ESP_LOGI(TAG, "Initializing LCD display...");
+    
+    dc_pin = config->dc_pin;
+    rst_pin = config->rst_pin;
+    backlight_pin = config->backlight_pin;
+    
+    gpio_set_direction(dc_pin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(rst_pin, GPIO_MODE_OUTPUT);
+    
+    gpio_set_level(rst_pin, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level(rst_pin, 1);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    
     spi_bus_config_t buscfg = {
-        .miso_io_num = -1,
-        .mosi_io_num = TFT_MOSI,
-        .sclk_io_num = TFT_SCLK,
+        .miso_io_num = config->miso_pin,
+        .mosi_io_num = config->mosi_pin,
+        .sclk_io_num = config->sclk_pin,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = TFT_WIDTH * 2 * 40,
-        .flags = 0
+        .max_transfer_sz = LCD_WIDTH * 2 * 40
     };
-
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+    
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 10 * 1000 * 1000,
         .mode = 0,
-        .spics_io_num = TFT_CS,
+        .spics_io_num = config->cs_pin,
         .queue_size = 7,
-        .pre_cb = tft_spi_pre_transfer_callback,
-        .flags = 0
+        .pre_cb = lcd_spi_pre_transfer_callback
     };
-
-    ret = spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
-    ESP_ERROR_CHECK(ret);
-    ret = spi_bus_add_device(SPI2_HOST, &devcfg, &spi);
-    ESP_ERROR_CHECK(ret);
-    ESP_LOGI(TAG, "SPI initialized at 10 MHz");
-}
-
-static void tft_reset(void)
-{
-    // Hard reset pulse
-    gpio_set_level(TFT_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(TFT_RST, 1);
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi_device));
+    
+    lcd_cmd(ILI9486_SWRESET);
     vTaskDelay(pdMS_TO_TICKS(150));
-}
-
-static void tft_init_display(void)
-{
-    // Basic ILI9486 bring-up sequence (RGB565, rotation, gamma, power)
-    // MADCTL=0x28 -> landscape orientation chosen for 480x320
-    tft_cmd(ILI9486_SWRESET);
-    vTaskDelay(pdMS_TO_TICKS(150));
-    
-    tft_cmd(0xB0);
-    tft_data(0x00);
-    
-    tft_cmd(ILI9486_SLPOUT);
+    lcd_cmd(0xB0); lcd_data(0x00);
+    lcd_cmd(ILI9486_SLPOUT);
     vTaskDelay(pdMS_TO_TICKS(120));
-    
-    tft_cmd(ILI9486_PIXFMT);
-    tft_data(0x55);
-    
-    tft_cmd(ILI9486_PWCTR1);
-    tft_data(0x19);
-    tft_data(0x1A);
-    
-    tft_cmd(ILI9486_PWCTR2);
-    tft_data(0x45);
-    tft_data(0x00);
-    
-    tft_cmd(ILI9486_PWCTR3);
-    tft_data(0x33);
-    
-    tft_cmd(ILI9486_VMCTR1);
-    tft_data(0x00);
-    tft_data(0x12);
-    tft_data(0x80);
-    
-    tft_cmd(ILI9486_MADCTL);
-    tft_data(0x28);
-    
-    tft_cmd(ILI9486_DFUNCTR);
-    tft_data(0x00);
-    tft_data(0x02);
-    tft_data(0x3B);
-    
-    tft_cmd(ILI9486_FRMCTR1);
-    tft_data(0xB0);
-    tft_data(0x11);
-    
-    tft_cmd(ILI9486_INVCTR);
-    tft_data(0x02);
-    
-    tft_cmd(ILI9486_GMCTRP1);
-    tft_data(0x0F); tft_data(0x24); tft_data(0x1C); tft_data(0x0A);
-    tft_data(0x0F); tft_data(0x08); tft_data(0x43); tft_data(0x88);
-    tft_data(0x32); tft_data(0x0F); tft_data(0x10); tft_data(0x06);
-    tft_data(0x0F); tft_data(0x07); tft_data(0x00);
-    
-    tft_cmd(ILI9486_GMCTRN1);
-    tft_data(0x0F); tft_data(0x38); tft_data(0x30); tft_data(0x09);
-    tft_data(0x0F); tft_data(0x0F); tft_data(0x4E); tft_data(0x77);
-    tft_data(0x3C); tft_data(0x07); tft_data(0x10); tft_data(0x05);
-    tft_data(0x23); tft_data(0x1B); tft_data(0x00);
-    
-    tft_cmd(ILI9486_SLPOUT);
-    vTaskDelay(pdMS_TO_TICKS(120));
-    
-    tft_cmd(ILI9486_DISPON);
+    lcd_cmd(ILI9486_PIXFMT); lcd_data(0x55);
+    lcd_cmd(ILI9486_PWCTR1); lcd_data(0x19); lcd_data(0x1A);
+    lcd_cmd(ILI9486_PWCTR2); lcd_data(0x45); lcd_data(0x00);
+    lcd_cmd(ILI9486_PWCTR3); lcd_data(0x33);
+    lcd_cmd(ILI9486_VMCTR1); lcd_data(0x00); lcd_data(0x12); lcd_data(0x80);
+    lcd_cmd(ILI9486_MADCTL); lcd_data(0x28);
+    lcd_cmd(ILI9486_DFUNCTR); lcd_data(0x00); lcd_data(0x02); lcd_data(0x3B);
+    lcd_cmd(ILI9486_FRMCTR1); lcd_data(0xB0); lcd_data(0x11);
+    lcd_cmd(ILI9486_INVCTR); lcd_data(0x02);
+    lcd_cmd(ILI9486_DISPON);
     vTaskDelay(pdMS_TO_TICKS(25));
+    lcd_cmd(ILI9486_NORON);
     
-    tft_cmd(ILI9486_NORON);
-    ESP_LOGI(TAG, "Display initialized");
-}
-
-// ===== Dashboard drawing functions =====
-
-static void draw_header(void)
-{
-    // Top bar: logo, title, 12-hour clock with AM/PM
-    // Time derived from current_data.timestamp (seconds)
-    lcd_fill_rect(0, 0, TFT_WIDTH, 30, TFT_CHARCOAL);
-    
-    tft_draw_image(10, 3, sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_CHARCOAL);
-    
-    lcd_draw_string(40, 10, "SUNFLOWER", TFT_GOLDEN, TFT_CHARCOAL, 2);
-    
-    uint32_t hours = (current_data.timestamp / 3600) % 24;
-    uint32_t minutes = (current_data.timestamp / 60) % 60;
-    uint32_t seconds = current_data.timestamp % 60;
-    
-    const char *period = (hours < 12) ? "AM" : "PM";
-    uint32_t display_hours = hours % 12;
-    if (display_hours == 0) display_hours = 12;
-    
-    char time_str[24];
-    snprintf(time_str, sizeof(time_str), "%02lu:%02lu:%02lu%s", display_hours, minutes, seconds, period);
-    lcd_draw_string(330, 10, time_str, TFT_GOLDEN, TFT_CHARCOAL, 2);
-}
-
-static void draw_angle_panel(uint16_t x, uint16_t y, const char *label, float angle, float delta, uint16_t color)
-{
-    // Generic panel used for Elevation/Azimuth with large value + delta
-    lcd_fill_rect(x, y, 150, 70, TFT_STEEL);
-    lcd_draw_rect(x, y, 150, 70, TFT_SLATE);
-    
-    lcd_draw_string(x + 5, y + 5, label, TFT_SILVER, TFT_STEEL, 1);
-    
-    char angle_str[16];
-    snprintf(angle_str, sizeof(angle_str), "%.1f", angle);
-    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 2);  // Changed from 3 to 2
-    lcd_draw_string(x + 5, y + 52, "deg", TFT_SILVER, TFT_STEEL, 1);
-    
-    char delta_str[16];
-    snprintf(delta_str, sizeof(delta_str), "D:%.3f", delta);
-    lcd_draw_string(x + 50, y + 52, delta_str, TFT_TEAL, TFT_STEEL, 1);
-}
-
-static void draw_battery_panel(uint16_t x, uint16_t y)
-{
-    // Battery panel: voltage (big), ADC raw, and a simple level bar
-    // FIXME: ADC->bar mapping (2000..3400) is placeholder; calibrate with real pack.
-    lcd_fill_rect(x, y, 150, 70, TFT_DARKGREY);
-    lcd_draw_rect(x, y, 150, 70, TFT_SAGE);
-    
-    lcd_draw_string(x + 5, y + 5, "BATTERY", TFT_SILVER, TFT_DARKGREY, 1);
-    
-    char volt_str[16];
-    snprintf(volt_str, sizeof(volt_str), "%.2fV", current_data.battery_voltage);
-    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 2);  // Changed from 3 to 2
-    
-    char adc_str[16];
-    snprintf(adc_str, sizeof(adc_str), "ADC:%d", current_data.battery_adc);
-    lcd_draw_string(x + 5, y + 52, adc_str, TFT_SILVER, TFT_DARKGREY, 1);
-    
-    int bar_width = (int)(((current_data.battery_adc - 2000) / 1400.0f) * 60);
-    if (bar_width > 60) bar_width = 60;
-    if (bar_width < 0) bar_width = 0;
-    
-    lcd_fill_rect(x + 80, y + 50, 60, 8, TFT_BLACK);
-    lcd_fill_rect(x + 80, y + 50, bar_width, 8, TFT_SAGE);
-    lcd_draw_rect(x + 80, y + 50, 60, 8, TFT_SILVER);
-}
-
-static void draw_status_panel(uint16_t x, uint16_t y)
-{
-    // Status panel color coding:
-    // 1=TRACKING(GREEN), 0/2/3=AMBER, 255=ERROR(RED)
-    uint16_t status_color;
-    const char *status_text;
-    uint16_t text_color;
-    
-    if (current_data.tracking_status == 1) {
-        status_color = TFT_SAGE;
-        status_text = "TRACKING";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 2) {
-        status_color = TFT_AMBER;
-        status_text = "SLEEPING";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 3) {
-        status_color = TFT_AMBER;
-        status_text = "CALIBRATE";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 255) {
-        status_color = TFT_CRIMSON;
-        status_text = "ERROR";
-        text_color = TFT_WHITE;
-    } else {
-        status_color = TFT_AMBER;
-        status_text = "STANDBY";
-        text_color = TFT_BLACK;
+    if (backlight_pin >= 0) {
+        ledc_timer_config_t ledc_timer = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_8_BIT,
+            .timer_num = LEDC_TIMER_0,
+            .freq_hz = 5000,
+            .clk_cfg = LEDC_AUTO_CLK
+        };
+        ledc_timer_config(&ledc_timer);
+        
+        ledc_channel_config_t ledc_channel = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .channel = LEDC_CHANNEL_0,
+            .timer_sel = LEDC_TIMER_0,
+            .intr_type = LEDC_INTR_DISABLE,
+            .gpio_num = backlight_pin,
+            .duty = 255,
+            .hpoint = 0
+        };
+        ledc_channel_config(&ledc_channel);
     }
     
-    lcd_fill_rect(x, y, 150, 70, status_color);
-    lcd_draw_rect(x, y, 150, 70, TFT_SILVER);
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK);
     
-    lcd_draw_string(x + 5, y + 5, "STATUS", TFT_BLACK, status_color, 1);
-    lcd_draw_string(x + 10, y + 30, status_text, text_color, status_color, 2);
-}
-
-static void draw_sun_panel(uint16_t x, uint16_t y)
-{
-    // Sun position panel showing calculated sun angles
-    lcd_fill_rect(x, y, 150, 70, TFT_NAVY);
-    lcd_draw_rect(x, y, 150, 70, TFT_GOLDEN);
-    
-    lcd_draw_string(x + 5, y + 5, "SUN POS", TFT_GOLDEN, TFT_NAVY, 1);
-    
-    char el_str[16];
-    snprintf(el_str, sizeof(el_str), "E:%.1f", current_data.sun_elevation);
-    lcd_draw_string(x + 5, y + 20, el_str, TFT_SUNGLOW, TFT_NAVY, 2);
-    
-    char az_str[16];
-    snprintf(az_str, sizeof(az_str), "A:%.1f", current_data.sun_azimuth);
-    lcd_draw_string(x + 5, y + 40, az_str, TFT_SUNGLOW, TFT_NAVY, 2);
-    
-    char qual_str[16];
-    snprintf(qual_str, sizeof(qual_str), "Err:%d", current_data.tracking_quality);
-    uint16_t qual_color = (current_data.tracking_quality < 5) ? TFT_SAGE : 
-                         (current_data.tracking_quality < 15) ? TFT_AMBER : TFT_CORAL;
-    lcd_draw_string(x + 5, y + 57, qual_str, qual_color, TFT_NAVY, 1);
-}
-
-static void draw_stats_panel(uint16_t x, uint16_t y)
-{
-    // System statistics panel
-    lcd_fill_rect(x, y, 150, 70, TFT_CHARCOAL);
-    lcd_draw_rect(x, y, 150, 70, TFT_SILVER);
-    
-    lcd_draw_string(x + 5, y + 5, "STATS", TFT_SILVER, TFT_CHARCOAL, 1);
-    
-    char moves_str[24];
-    snprintf(moves_str, sizeof(moves_str), "Today:%lu", (unsigned long)current_data.moves_today);
-    lcd_draw_string(x + 5, y + 20, moves_str, TFT_TEAL, TFT_CHARCOAL, 1);
-    
-    char total_str[24];
-    snprintf(total_str, sizeof(total_str), "Total:%lu", (unsigned long)current_data.total_moves);
-    lcd_draw_string(x + 5, y + 32, total_str, TFT_TEAL, TFT_CHARCOAL, 1);
-    
-    char uptime_str[16];
-    snprintf(uptime_str, sizeof(uptime_str), "Up:%dh", current_data.uptime_hours);
-    lcd_draw_string(x + 5, y + 44, uptime_str, TFT_MINT, TFT_CHARCOAL, 1);
-    
-    char rssi_str[16];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI:%ddBm", current_data.wifi_rssi);
-    uint16_t rssi_color = (current_data.wifi_rssi > -60) ? TFT_SAGE :
-                         (current_data.wifi_rssi > -75) ? TFT_AMBER : TFT_CORAL;
-    lcd_draw_string(x + 5, y + 56, rssi_str, rssi_color, TFT_CHARCOAL, 1);
-}
-
-static void draw_gps_panel(uint16_t x, uint16_t y)
-{
-    // GPS details panel with satellite count
-    if (current_data.gps_valid) {
-        char lat_str[20], lon_str[20];
-        snprintf(lat_str, sizeof(lat_str), "%.4f%c", fabs(current_data.latitude), 
-                 current_data.latitude >= 0 ? 'N' : 'S');
-        snprintf(lon_str, sizeof(lon_str), "%.4f%c", fabs(current_data.longitude), 
-                 current_data.longitude >= 0 ? 'E' : 'W');
-        
-        lcd_draw_string(x, y, "GPS:", TFT_SILVER, TFT_BLACK, 1);
-        lcd_draw_string(x + 30, y, lat_str, TFT_TEAL, TFT_BLACK, 1);
-        lcd_draw_string(x, y + 12, lon_str, TFT_TEAL, TFT_BLACK, 1);
-        
-        char sat_str[16];
-        snprintf(sat_str, sizeof(sat_str), "Sats:%d", current_data.gps_satellites);
-        uint16_t sat_color = (current_data.gps_satellites >= 6) ? TFT_SAGE :
-                            (current_data.gps_satellites >= 4) ? TFT_AMBER : TFT_CORAL;
-        lcd_draw_string(x, y + 24, sat_str, sat_color, TFT_BLACK, 1);
-    } else {
-        lcd_draw_string(x, y, "GPS: No Fix", TFT_CORAL, TFT_BLACK, 1);
-        
-        char sat_str[16];
-        snprintf(sat_str, sizeof(sat_str), "Sats:%d", current_data.gps_satellites);
-        lcd_draw_string(x, y + 12, sat_str, TFT_AMBER, TFT_BLACK, 1);
-    }
-}
-
-// Replace the draw_battery_graph function with this smaller version:
-
-static void draw_battery_graph(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
-{
-    // Historic battery ADC plot (100 samples). Min/Max autoscale.
-    lcd_fill_rect(x, y, w, h, TFT_BLACK);
-    lcd_draw_rect(x, y, w, h, TFT_SLATE);
-    
-    lcd_draw_string(x + 5, y + 3, "Battery History", TFT_SILVER, TFT_BLACK, 1);
-    
-    // Draw grid lines
-    for (int i = 0; i <= 4; i++) {  // Changed from 3 to 4 for more grid lines
-        int grid_y = y + 15 + (h - 20) * i / 4;
-        lcd_draw_line(x + 35, grid_y, x + w - 5, grid_y, TFT_DARKGREY);
-    }
-    
-    uint16_t min_val = 4095, max_val = 0;
-    for (int i = 0; i < 100; i++) {
-        if (battery_history[i] < min_val) min_val = battery_history[i];
-        if (battery_history[i] > max_val) max_val = battery_history[i];
-    }
-    
-    if (max_val == min_val) max_val = min_val + 100;
-    
-    int graph_w = w - 45;
-    int graph_h = h - 25;
-    
-    for (int i = 1; i < 100; i++) {
-        int prev_index = (history_index + i - 1) % 100;
-        int curr_index = (history_index + i) % 100;
-        
-        int x1 = x + 35 + (graph_w * (i - 1) / 99);
-        int y1 = y + 18 + graph_h - ((battery_history[prev_index] - min_val) * graph_h / (max_val - min_val));
-        
-        int x2 = x + 35 + (graph_w * i / 99);
-        int y2 = y + 18 + graph_h - ((battery_history[curr_index] - min_val) * graph_h / (max_val - min_val));
-        
-        lcd_draw_line(x1, y1, x2, y2, TFT_SAGE);
-        
-        if (i == 99) {
-            lcd_fill_rect(x2 - 1, y2 - 1, 3, 3, TFT_AMBER);
-        }
-    }
-    
-    // Compact labels
-    char min_str[8], max_str[8];
-    snprintf(min_str, sizeof(min_str), "%.1fV", (min_val / 4095.0f) * 15.0f);
-    snprintf(max_str, sizeof(max_str), "%.1fV", (max_val / 4095.0f) * 15.0f);
-    
-    lcd_draw_string(x + 5, y + h - 10, min_str, TFT_SILVER, TFT_BLACK, 1);
-    lcd_draw_string(x + 5, y + 15, max_str, TFT_SILVER, TFT_BLACK, 1);
-}
-
-// ===== Update functions (incremental) =====
-
-static void update_header_time(void)
-{
-    // Rewrite only the time area in the header to reduce flicker
-    uint32_t hours = (current_data.timestamp / 3600) % 24;
-    uint32_t minutes = (current_data.timestamp / 60) % 60;
-    uint32_t seconds = current_data.timestamp % 60;
-    
-    const char *period = (hours < 12) ? "AM" : "PM";
-    uint32_t display_hours = hours % 12;
-    if (display_hours == 0) display_hours = 12;
-    
-    char time_str[24];
-    snprintf(time_str, sizeof(time_str), "%02lu:%02lu:%02lu%s", display_hours, minutes, seconds, period);
-    
-    lcd_fill_rect(330, 10, 140, 16, TFT_CHARCOAL);
-    lcd_draw_string(330, 10, time_str, TFT_GOLDEN, TFT_CHARCOAL, 2);
-}
-
-static void update_angle_panel_value(uint16_t x, uint16_t y, float angle, float delta, uint16_t color)
-{
-    // Partial redraw of angle value and delta line only
-    lcd_fill_rect(x + 5, y + 25, 140, 18, TFT_STEEL);  // Changed height from 24 to 18
-    lcd_fill_rect(x + 50, y + 52, 95, 8, TFT_STEEL);
-    
-    char angle_str[16];
-    snprintf(angle_str, sizeof(angle_str), "%.1f", angle);
-    lcd_draw_string(x + 5, y + 25, angle_str, color, TFT_STEEL, 2);  // Changed from 3 to 2
-    
-    char delta_str[16];
-    snprintf(delta_str, sizeof(delta_str), "D:%.3f", delta);
-    lcd_draw_string(x + 50, y + 52, delta_str, TFT_TEAL, TFT_STEEL, 1);
-}
-
-static void update_battery_panel_value(uint16_t x, uint16_t y)
-{
-    // Partial redraw of battery text + level bar
-    lcd_fill_rect(x + 5, y + 25, 140, 18, TFT_DARKGREY);  // Changed height from 24 to 18
-    lcd_fill_rect(x + 5, y + 52, 140, 8, TFT_DARKGREY);
-    
-    char volt_str[16];
-    snprintf(volt_str, sizeof(volt_str), "%.2fV", current_data.battery_voltage);
-    lcd_draw_string(x + 5, y + 25, volt_str, TFT_GOLDEN, TFT_DARKGREY, 2);  // Changed from 3 to 2
-    
-    char adc_str[16];
-    snprintf(adc_str, sizeof(adc_str), "ADC:%d", current_data.battery_adc);
-    lcd_draw_string(x + 5, y + 52, adc_str, TFT_SILVER, TFT_DARKGREY, 1);
-    
-    int bar_width = (int)(((current_data.battery_adc - 2000) / 1400.0f) * 60);
-    if (bar_width > 60) bar_width = 60;
-    if (bar_width < 0) bar_width = 0;
-    
-    lcd_fill_rect(x + 80, y + 50, 60, 8, TFT_BLACK);
-    lcd_fill_rect(x + 80, y + 50, bar_width, 8, TFT_SAGE);
-    lcd_draw_rect(x + 80, y + 50, 60, 8, TFT_SILVER);
-}
-
-static void update_status_panel(uint16_t x, uint16_t y)
-{
-    // Full redraw of status panel due to background color change per state
-    uint16_t status_color;
-    const char *status_text;
-    uint16_t text_color;
-    
-    if (current_data.tracking_status == 1) {
-        status_color = TFT_SAGE;
-        status_text = "TRACKING";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 2) {
-        status_color = TFT_AMBER;
-        status_text = "SLEEPING";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 3) {
-        status_color = TFT_AMBER;
-        status_text = "CALIBRATE";
-        text_color = TFT_BLACK;
-    } else if (current_data.tracking_status == 255) {
-        status_color = TFT_CRIMSON;
-        status_text = "ERROR";
-        text_color = TFT_WHITE;
-    } else {
-        status_color = TFT_AMBER;
-        status_text = "STANDBY";
-        text_color = TFT_BLACK;
-    }
-    
-    lcd_fill_rect(x, y, 150, 70, status_color);
-    lcd_draw_rect(x, y, 150, 70, TFT_SILVER);
-    
-    lcd_draw_string(x + 5, y + 5, "STATUS", TFT_BLACK, status_color, 1);
-    lcd_draw_string(x + 10, y + 30, status_text, text_color, status_color, 2);
-}
-
-static void update_sun_panel_value(uint16_t x, uint16_t y)
-{
-    lcd_fill_rect(x + 5, y + 20, 140, 48, TFT_NAVY);
-    
-    char el_str[16];
-    snprintf(el_str, sizeof(el_str), "E:%.1f", current_data.sun_elevation);
-    lcd_draw_string(x + 5, y + 20, el_str, TFT_SUNGLOW, TFT_NAVY, 2);
-    
-    char az_str[16];
-    snprintf(az_str, sizeof(az_str), "A:%.1f", current_data.sun_azimuth);
-    lcd_draw_string(x + 5, y + 40, az_str, TFT_SUNGLOW, TFT_NAVY, 2);
-    
-    char qual_str[16];
-    snprintf(qual_str, sizeof(qual_str), "Err:%d", current_data.tracking_quality);
-    uint16_t qual_color = (current_data.tracking_quality < 5) ? TFT_SAGE : 
-                         (current_data.tracking_quality < 15) ? TFT_AMBER : TFT_CORAL;
-    lcd_draw_string(x + 5, y + 57, qual_str, qual_color, TFT_NAVY, 1);
-}
-
-static void update_stats_panel_value(uint16_t x, uint16_t y)
-{
-    lcd_fill_rect(x + 5, y + 20, 140, 48, TFT_CHARCOAL);
-    
-    char moves_str[24];
-    snprintf(moves_str, sizeof(moves_str), "Today:%lu", (unsigned long)current_data.moves_today);
-    lcd_draw_string(x + 5, y + 20, moves_str, TFT_TEAL, TFT_CHARCOAL, 1);
-    
-    char total_str[24];
-    snprintf(total_str, sizeof(total_str), "Total:%lu", (unsigned long)current_data.total_moves);
-    lcd_draw_string(x + 5, y + 32, total_str, TFT_TEAL, TFT_CHARCOAL, 1);
-    
-    char uptime_str[16];
-    snprintf(uptime_str, sizeof(uptime_str), "Up:%dh", current_data.uptime_hours);
-    lcd_draw_string(x + 5, y + 44, uptime_str, TFT_MINT, TFT_CHARCOAL, 1);
-    
-    char rssi_str[16];
-    snprintf(rssi_str, sizeof(rssi_str), "RSSI:%ddBm", current_data.wifi_rssi);
-    uint16_t rssi_color = (current_data.wifi_rssi > -60) ? TFT_SAGE :
-                         (current_data.wifi_rssi > -75) ? TFT_AMBER : TFT_CORAL;
-    lcd_draw_string(x + 5, y + 56, rssi_str, rssi_color, TFT_CHARCOAL, 1);
-}
-
-static void update_gps_panel_value(uint16_t x, uint16_t y)
-{
-    lcd_fill_rect(x, y, 150, 36, TFT_BLACK);
-    draw_gps_panel(x, y);
-}
-
-static void update_battery_graph_incremental(uint16_t x, uint16_t y, uint16_t w, uint16_t h)
-{
-    // Currently falls back to full redraw. Optimize later to draw only latest segment.
-    // FIXME: Draw only last segment between (index-1)->(index) to cut SPI traffic.
-    draw_battery_graph(x, y, w, h);
-}
-
-// ===== Public API functions =====
-
-esp_err_t lcd_init(void)
-{
-    // Bring-up sequence: pins -> SPI -> reset -> panel init -> clear state
-    ESP_LOGI(TAG, "Initializing LCD display...");
-    
-    tft_init_pins();
-    tft_init_spi();
-    tft_reset();
-    tft_init_display();
-    
-    // Initialize display data to defaults
-    memset(&current_data, 0, sizeof(lcd_display_data_t));
-    memset(battery_history, 0, sizeof(battery_history));
-    history_index = 0;
-    
-    ESP_LOGI(TAG, "Display initialized");
+    ESP_LOGI(TAG, "LCD initialized successfully");
     return ESP_OK;
 }
 
-void lcd_show_init_screen(const char *status[], bool success[], int count)
-{
-    // Startup checklist screen with per-item OK/FAIL and logo
-    lcd_clear_screen(TFT_BLACK);
-    
-    // Draw logo
-    tft_draw_image(TFT_WIDTH / 2 - SUNFLOWER_LOGO_WIDTH / 2, 20, 
-                   sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
-    
-    lcd_draw_string(TFT_WIDTH / 2 - 60, 60, "SUNFLOWER", TFT_GOLDEN, TFT_BLACK, 2);
-    lcd_draw_string(TFT_WIDTH / 2 - 80, 85, "System Initialization", TFT_SILVER, TFT_BLACK, 1);
-    
-    uint16_t y_pos = 120;
-    for (int i = 0; i < count; i++) {
-        lcd_draw_string(50, y_pos, status[i], TFT_SILVER, TFT_BLACK, 1);
-        
-        if (success[i]) {
-            lcd_draw_string(300, y_pos, "[OK]", TFT_SAGE, TFT_BLACK, 1);
-        } else {
-            lcd_draw_string(300, y_pos, "[--]", TFT_AMBER, TFT_BLACK, 1);
-        }
-        
-        y_pos += 20;
+void lcd_client_set_brightness(uint8_t brightness) {
+    if (backlight_pin >= 0) {
+        uint32_t duty = (brightness * 255) / 100;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     }
 }
 
-void lcd_show_splash(const char *message)
-{
-    // Centered logo + optional message
-    lcd_clear_screen(TFT_BLACK);
+void lcd_client_show_init_screen(const char *message) {
+    full_redraw_needed = true;
     
-    // Draw logo
-    tft_draw_image(TFT_WIDTH / 2 - SUNFLOWER_LOGO_WIDTH / 2, TFT_HEIGHT / 2 - 40, 
-                   sunflower_logo, SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT, TFT_BLACK);
+    // CLEAR ENTIRE SCREEN FIRST
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK);
     
-    lcd_draw_string(TFT_WIDTH / 2 - 60, TFT_HEIGHT / 2 + 10, "SUNFLOWER", TFT_GOLDEN, TFT_BLACK, 2);
+    // Draw logo centered - simple, no transparency
+    int logo_x = (LCD_WIDTH - SUNFLOWER_LOGO_WIDTH) / 2;
+    int logo_y = 100;
+    lcd_draw_image_simple(logo_x, logo_y, sunflower_logo, 
+                          SUNFLOWER_LOGO_WIDTH, SUNFLOWER_LOGO_HEIGHT);
     
-    if (message) {
-        int msg_len = strlen(message);
-        int msg_x = TFT_WIDTH / 2 - (msg_len * 3);
-        lcd_draw_string(msg_x, TFT_HEIGHT / 2 + 40, message, TFT_SILVER, TFT_BLACK, 1);
+    // Draw title below logo
+    const char *title = "SUNFLOWER";
+    int title_x = (LCD_WIDTH - (strlen(title) * 12)) / 2;  // size 2 = 12 pixels wide per char
+    lcd_draw_string(title_x, 160, title, LCD_SUNGLOW, LCD_BLACK, 2);
+    
+    // Draw message centered
+    int msg_x = (LCD_WIDTH - (strlen(message) * 6)) / 2;
+    lcd_draw_string(msg_x, 200, message, LCD_WHITE, LCD_BLACK, 1);
+    
+    // Draw animated dots
+    static int dot_count = 0;
+    char dots[5] = "";
+    for (int i = 0; i < (dot_count % 4); i++) {
+        strcat(dots, ".");
     }
+    lcd_draw_string(msg_x + strlen(message) * 6, 200, dots, LCD_MINT, LCD_BLACK, 1);
+    lcd_draw_string(msg_x + strlen(message) * 6 + 24, 200, "    ", LCD_BLACK, LCD_BLACK, 1); // Clear old dots
+    dot_count++;
 }
 
-void lcd_show_error(const char *error_msg)
-{
-    // Red banner at bottom for critical messages
-    lcd_fill_rect(0, TFT_HEIGHT - 30, TFT_WIDTH, 30, TFT_CRIMSON);
-    
-    int msg_len = strlen(error_msg);
-    int msg_x = TFT_WIDTH / 2 - (msg_len * 3);
-    if (msg_x < 5) msg_x = 5;
-    
-    lcd_draw_string(msg_x, TFT_HEIGHT - 20, error_msg, TFT_WHITE, TFT_CRIMSON, 1);
-}
-
-void lcd_draw_dashboard(const lcd_display_data_t *data)
-{
-    memcpy(&current_data, data, sizeof(lcd_display_data_t));
-    
-    lcd_clear_screen(TFT_BLACK);
-    
-    // Header
-    draw_header();
-    
-    // Top row panels (y=35)
-    draw_angle_panel(5, 35, "ELEVATION", data->elevation, data->delta_elevation, TFT_AMBER);
-    draw_angle_panel(165, 35, "AZIMUTH", data->azimuth, data->delta_azimuth, TFT_SUNGLOW);
-    draw_battery_panel(325, 35);
-    
-    // Middle row panels (y=110)
-    draw_status_panel(5, 110);
-    draw_sun_panel(165, 110);
-    draw_stats_panel(325, 110);
-    
-    // GPS info area (below panels)
-    draw_gps_panel(5, 185);
-    
-    lcd_draw_string(5, 220, "System v1.0", TFT_MINT, TFT_BLACK, 1);
-    
-    // Battery history graph (bottom, taller now)
-    for (int i = 0; i < 100; i++) {
-        battery_history[i] = data->battery_adc;
+void lcd_client_display_dashboard(const tracker_data_t *data) {
+    // CLEAR SCREEN ON FIRST DASHBOARD DRAW
+    if (full_redraw_needed) {
+        lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_BLACK);
     }
-    history_index = 0;
     
-    draw_battery_graph(5, 230, 470, 85);  // Changed from y=235, h=80 to y=230, h=85
-}
-
-void lcd_update_display(const lcd_display_data_t *data)
-{
-    battery_history[history_index] = data->battery_adc;
+    voltage_history[history_index] = data->battery_adc;
     history_index = (history_index + 1) % 100;
     
-    update_header_time();
-    update_angle_panel_value(5, 35, data->elevation, data->delta_elevation, TFT_AMBER);
-    update_angle_panel_value(165, 35, data->azimuth, data->delta_azimuth, TFT_SUNGLOW);
-    update_battery_panel_value(325, 35);
+    draw_header(data);
+    draw_elevation_panel(data);
+    draw_azimuth_panel(data);
+    draw_battery_panel(data);
+    draw_sun_position_panel(data);
+    draw_status_panel(data);
+    draw_gps_panel(data);
+    draw_stats_panel(data);
+    draw_voltage_graph(data);
     
-    if (data->tracking_status != current_data.tracking_status) {
-        update_status_panel(5, 110);
-    }
+    memcpy(&last_data, data, sizeof(tracker_data_t));
+    full_redraw_needed = false;
+}
+
+void lcd_client_show_error(const char *message) {
+    full_redraw_needed = true;
     
-    update_sun_panel_value(165, 110);
-    update_stats_panel_value(325, 110);
-    update_gps_panel_value(5, 185);
+    // CLEAR ENTIRE SCREEN
+    lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, LCD_CRIMSON);
     
-    update_battery_graph_incremental(5, 230, 470, 85);  // Changed from y=235, h=80 to y=230, h=85
+    const char *title = "CONNECTION LOST";
+    int title_x = (LCD_WIDTH - (strlen(title) * 12)) / 2;
+    lcd_draw_string(title_x, 140, title, LCD_WHITE, LCD_CRIMSON, 2);
     
-    memcpy(&current_data, data, sizeof(lcd_display_data_t));
+    int msg_x = (LCD_WIDTH - (strlen(message) * 6)) / 2;
+    lcd_draw_string(msg_x, 170, message, LCD_WHITE, LCD_CRIMSON, 1);
 }

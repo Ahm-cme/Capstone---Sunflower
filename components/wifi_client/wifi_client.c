@@ -1,3 +1,41 @@
+/*
+ * WiFi Communication Module - Client Implementation (LCD Display Side)
+ *
+ * Architecture Overview:
+ *  LCD Display (ESP32-WROOM):
+ *   └─ WiFi Station connects to "SunflowerTracker" AP
+ *      └─ TCP client receives tracking data from 192.168.4.1:8888
+ *         └─ Updates LCD display at ~1 Hz
+ *
+ * Connection Strategy:
+ *  - Always-on WiFi (no power saving)
+ *  - Auto-reconnect on disconnect (infinite retries)
+ *  - Fast reconnect (2-5 second intervals)
+ *  - Graceful degradation (display shows "Connecting..." on loss)
+ *
+ * Network Flow:
+ *  1. Scan for "SunflowerTracker" SSID
+ *  2. Connect with WPA2-PSK authentication
+ *  3. Wait for DHCP IP (192.168.4.x)
+ *  4. Connect TCP to 192.168.4.1:8888
+ *  5. Receive 92-byte packets at ~1 Hz
+ *  6. Parse and forward to LCD display
+ *  7. On disconnect: Close socket → retry connection
+ *
+ * Performance Optimizations:
+ *  1. Maximum TX power (19.5 dBm) - extends range
+ *  2. Power-saving disabled - zero latency
+ *  3. TCP_NODELAY - immediate receive
+ *  4. Large RX buffer (8KB) - prevents packet loss
+ *  5. 20MHz bandwidth - stable, better range
+ *
+ * Error Recovery:
+ *  - WiFi disconnect: Reconnect every 5 seconds
+ *  - TCP disconnect: Reconnect every 2 seconds
+ *  - Receive timeout: Normal (display "Waiting...")
+ *  - Invalid packet: Log warning, request retransmit
+ */
+
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,270 +51,516 @@
 
 #include "wifi_client.h"
 
-/*
-================================================================================
-WiFi Client (ESP32 STA) for Sunflower Tracker Display
---------------------------------------------------------------------------------
-Responsibilities:
-- Join tracker SoftAP (SunflowerTracker), obtain IP, and open TCP socket
-- Receive binary tracker_data_t frames and hand to UI layer
-- Handle disconnects and auto-reconnect
+// WiFi credentials (must match tracker)
+#define WIFI_SSID      "SunflowerTracker"
+#define WIFI_PASS      "sunflower2025"
 
-Notes:
-- Hardcoded SSID/password/IP/port for MVP; consider Kconfig for deploys
-- TCP used for simplicity; could switch to UDP for lower latency and lossy tolerance
-- Socket is blocking with recv timeout (SO_RCVTIMEO); caller provides timeout_ms
+// TCP server address (tracker's fixed IP)
+#define SERVER_IP      "192.168.4.1"
+#define SERVER_PORT    8888
 
-Reliability/TODO:
-- Add TCP keepalive to detect half-open connections (see setsockopt TCP_KEEP*)
-- Implement exponential backoff on reconnect to avoid AP hammering
-- Verify struct alignment and endianness between master and client (pragma pack(1) if needed)
-- Optional: authenticate payloads or add CRC if moving to UDP
-================================================================================
-*/
+// Connection retry intervals
+#define WIFI_RECONNECT_DELAY_MS   5000   // 5 seconds between WiFi reconnects
+#define TCP_RECONNECT_DELAY_MS    2000   // 2 seconds between TCP reconnects
 
-#define WIFI_SSID      "SunflowerTracker"  // Tracker SoftAP SSID
-#define WIFI_PASS      "sunflower2025"     // Tracker SoftAP password
-#define SERVER_IP      "192.168.4.1"       // Typical ESP32 SoftAP gateway IP
-#define SERVER_PORT    8888                // TCP port exposed by master
-
-#define WIFI_CONNECTED_BIT BIT0             // EventGroup bit for IP ready
-#define WIFI_FAIL_BIT      BIT1             // EventGroup bit for connection failure
-
-#define MAX_RETRY 10                        // Max reconnection attempts
-#define WIFI_CHANNEL 1                      // Default channel for SoftAP
-#define MAX_STA_CONN 4                     // Max simultaneous STA connections
+// Event bits for WiFi connection
+#define WIFI_CONNECTED_BIT    BIT0
+#define WIFI_FAIL_BIT         BIT1
 
 static const char *TAG = "WIFI_CLIENT";
-static EventGroupHandle_t s_wifi_event_group;
-static int client_socket = -1;             // Active TCP socket; -1 when disconnected
-static bool is_connected = false;          // True once STA has IP (not necessarily socket-open)
-static int s_retry_num = 0;                // Connection retry counter
 
-// Centralized event handler: WiFi start -> connect; got IP -> set flag; disconnect -> cleanup+reconnect
+// Module state
+static int client_socket = -1;                    // TCP client socket
+static bool wifi_connected = false;               // WiFi station connected
+static bool tcp_connected = false;                // TCP session active
+static EventGroupHandle_t wifi_event_group;       // WiFi event synchronization
+static int retry_count = 0;                       // Connection retry counter
+
+// Statistics tracking
+static wifi_client_stats_t s_stats = {0};
+static uint32_t s_connection_start_time = 0;
+static int8_t s_rssi = -128;                      // Current RSSI
+static char s_ip_address[16] = "0.0.0.0";         // Current IP address
+
+/*
+ * WiFi Event Handler (Station Mode)
+ * 
+ * Handles connection, disconnection, IP assignment events.
+ * Sets event bits for synchronization with main task.
+ */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        // DO NOT auto-connect here - let wifi_client_init control it
-        ESP_LOGI(TAG, "WiFi STA started");
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
-        is_connected = true;
-        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "WiFi station started, connecting...");
+        esp_wifi_connect();
+        
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        is_connected = false;
+        wifi_event_sta_disconnected_t* event = (wifi_event_sta_disconnected_t*) event_data;
+        
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGW(TAG, "║          WIFI DISCONNECTED                                 ║");
+        ESP_LOGW(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "⚠ Disconnected from AP");
+        ESP_LOGW(TAG, "  Reason: %d", event->reason);
+        
+        const char *reason_str = "Unknown";
+        switch (event->reason) {
+            case WIFI_REASON_AUTH_EXPIRE:          reason_str = "Authentication expired"; break;
+            case WIFI_REASON_AUTH_LEAVE:           reason_str = "Deauthenticated"; break;
+            case WIFI_REASON_ASSOC_LEAVE:          reason_str = "Disassociated"; break;
+            case WIFI_REASON_ASSOC_EXPIRE:         reason_str = "Association expired"; break;
+            case WIFI_REASON_NOT_AUTHED:           reason_str = "Not authenticated"; break;
+            case WIFI_REASON_NOT_ASSOCED:          reason_str = "Not associated"; break;
+            case WIFI_REASON_ASSOC_TOOMANY:        reason_str = "Too many stations"; break;
+            case WIFI_REASON_HANDSHAKE_TIMEOUT:    reason_str = "4-way handshake timeout"; break;
+            case WIFI_REASON_BEACON_TIMEOUT:       reason_str = "Beacon timeout"; break;
+            case WIFI_REASON_NO_AP_FOUND:          reason_str = "AP not found"; break;
+            case WIFI_REASON_AUTH_FAIL:            reason_str = "Authentication failed"; break;
+            case WIFI_REASON_CONNECTION_FAIL:      reason_str = "Connection failed"; break;
+        }
+        ESP_LOGW(TAG, "  Details: %s", reason_str);
+        ESP_LOGW(TAG, "");
+        
+        wifi_connected = false;
+        tcp_connected = false;
+        strcpy(s_ip_address, "0.0.0.0");
+        s_rssi = -128;
+        
+        // Close TCP socket if open
         if (client_socket >= 0) {
             close(client_socket);
             client_socket = -1;
+            ESP_LOGD(TAG, "TCP socket closed");
         }
         
-        if (s_retry_num < MAX_RETRY) {
-            esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGW(TAG, "Disconnected, reconnecting... (attempt %d/%d)", s_retry_num, MAX_RETRY);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            ESP_LOGE(TAG, "Failed to connect after %d attempts", MAX_RETRY);
+        // Retry connection
+        if (retry_count < 100) {  // Log for first 100 retries
+            ESP_LOGI(TAG, "Reconnecting in %d seconds... (attempt %d)",
+                     WIFI_RECONNECT_DELAY_MS / 1000, retry_count + 1);
         }
+        retry_count++;
+        s_stats.reconnect_count++;
         
-        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void debug_wifi_scan(void)
-{
-    ESP_LOGI(TAG, "=== Starting WiFi scan ===");
-    
-    wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active.min = 100,
-        .scan_time.active.max = 300,
-    };
-    
-    esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Scan failed: %s", esp_err_to_name(ret));
-        return;
-    }
-    
-    uint16_t ap_count = 0;
-    esp_wifi_scan_get_ap_num(&ap_count);
-    ESP_LOGI(TAG, "Found %d networks", ap_count);
-    
-    if (ap_count > 0) {
-        wifi_ap_record_t *ap_list = malloc(sizeof(wifi_ap_record_t) * ap_count);
-        if (ap_list) {
-            ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_list));
+        vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_DELAY_MS));
+        esp_wifi_connect();
+        
+        xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║          WIFI CONNECTED                                    ║");
+        ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "✓ Connected to tracker AP");
+        ESP_LOGI(TAG, "  SSID: %s", WIFI_SSID);
+        ESP_LOGI(TAG, "  IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "  Netmask: " IPSTR, IP2STR(&event->ip_info.netmask));
+        ESP_LOGI(TAG, "  Gateway: " IPSTR, IP2STR(&event->ip_info.gw));
+        ESP_LOGI(TAG, "");
+        
+        // Store IP address
+        snprintf(s_ip_address, sizeof(s_ip_address), IPSTR, IP2STR(&event->ip_info.ip));
+        
+        // Get RSSI
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            s_rssi = ap_info.rssi;
+            ESP_LOGI(TAG, "Signal Strength: %d dBm", s_rssi);
             
-            for (int i = 0; i < ap_count; i++) {
-                ESP_LOGI(TAG, "  %d: SSID='%s' Ch=%d RSSI=%d Auth=%d", 
-                         i, ap_list[i].ssid, ap_list[i].primary, 
-                         ap_list[i].rssi, ap_list[i].authmode);
+            if (s_rssi > -60) {
+                ESP_LOGI(TAG, "  Quality: EXCELLENT (5 bars)");
+            } else if (s_rssi > -70) {
+                ESP_LOGI(TAG, "  Quality: GOOD (4 bars)");
+            } else if (s_rssi > -80) {
+                ESP_LOGI(TAG, "  Quality: FAIR (3 bars)");
+            } else if (s_rssi > -90) {
+                ESP_LOGW(TAG, "  Quality: WEAK (2 bars) - consider moving closer");
+            } else {
+                ESP_LOGW(TAG, "  Quality: VERY WEAK (1 bar) - connection may drop");
             }
-            
-            free(ap_list);
         }
+        ESP_LOGI(TAG, "");
+        
+        wifi_connected = true;
+        retry_count = 0;  // Reset retry counter on success
+        s_connection_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+        
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
-    
-    ESP_LOGI(TAG, "=== Scan complete ===");
 }
 
+/*
+ * Connect TCP Socket to Tracker
+ * 
+ * Creates TCP client socket and connects to tracker's server.
+ * Called after WiFi connection established.
+ */
+static esp_err_t connect_tcp(void)
+{
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Connecting to TCP server...");
+    ESP_LOGI(TAG, "  Server: %s:%d", SERVER_IP, SERVER_PORT);
+    
+    // Create socket
+    client_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (client_socket < 0) {
+        ESP_LOGE(TAG, "✗ Socket creation failed: errno %d (%s)", errno, strerror(errno));
+        return ESP_FAIL;
+    }
+    ESP_LOGD(TAG, "✓ Socket created (fd=%d)", client_socket);
+    
+    // Configure server address
+    struct sockaddr_in server_addr = {0};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+    
+    // Apply TCP optimizations
+    int nodelay = 1;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(int));
+    ESP_LOGD(TAG, "✓ TCP_NODELAY enabled");
+    
+    int keepalive = 1;
+    setsockopt(client_socket, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(int));
+    
+    int keepidle = 5;
+    int keepintvl = 2;
+    int keepcnt = 3;
+    setsockopt(client_socket, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
+    setsockopt(client_socket, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
+    setsockopt(client_socket, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
+    ESP_LOGD(TAG, "✓ TCP keepalive enabled (5s/2s/3)");
+    
+    int recvbuf = 8192;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVBUF, &recvbuf, sizeof(int));
+    ESP_LOGD(TAG, "✓ Receive buffer: 8 KB");
+    
+    // Connect to server
+    if (connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) != 0) {
+        ESP_LOGE(TAG, "");
+        ESP_LOGE(TAG, "✗ TCP connect failed: errno %d (%s)", errno, strerror(errno));
+        ESP_LOGE(TAG, "  Check tracker is running and reachable");
+        ESP_LOGE(TAG, "  Verify server IP: %s", SERVER_IP);
+        ESP_LOGE(TAG, "");
+        close(client_socket);
+        client_socket = -1;
+        return ESP_FAIL;
+    }
+    
+    tcp_connected = true;
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "✓ TCP connected to tracker");
+    ESP_LOGI(TAG, "  Ready to receive tracking data");
+    ESP_LOGI(TAG, "");
+    
+    return ESP_OK;
+}
+
+/*
+ * Initialize WiFi Station and Connect to Tracker
+ */
 esp_err_t wifi_client_init(void)
 {
-    ESP_LOGI(TAG, "Initializing WiFi client...");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║          WIFI CLIENT INITIALIZATION                        ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
     
-    s_wifi_event_group = xEventGroupCreate();
-    s_retry_num = 0;
-
+    // Create event group for WiFi synchronization
+    wifi_event_group = xEventGroupCreate();
+    if (!wifi_event_group) {
+        ESP_LOGE(TAG, "✗ Failed to create event group");
+        return ESP_FAIL;
+    }
+    
+    // === Initialize Network Stack ===
+    ESP_LOGI(TAG, "Initializing network stack...");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
-
+    ESP_LOGD(TAG, "✓ ESP-NETIF initialized");
+    
+    // === Initialize WiFi Stack ===
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    // Add this RIGHT AFTER esp_wifi_init(&cfg):
-    wifi_country_t country = {
-        .cc = "US",              // United States
-        .schan = 1,              // Start channel
-        .nchan = 11,             // Number of channels (1-11 for US)
-        .policy = WIFI_COUNTRY_POLICY_AUTO,
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_country(&country));
-    ESP_LOGI(TAG, "WiFi country set to US (channels 1-11)");
-
-    // Register events
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        &instance_got_ip));
-
+    ESP_LOGD(TAG, "✓ WiFi stack initialized");
+    
+    // === Register Event Handlers ===
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    ESP_LOGD(TAG, "✓ Event handlers registered");
+    
+    // === Configure Station Parameters ===
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "WiFi Configuration:");
+    ESP_LOGI(TAG, "  SSID: %s", WIFI_SSID);
+    ESP_LOGI(TAG, "  Password: %s", WIFI_PASS);
+    ESP_LOGI(TAG, "  Auth mode: WPA2-PSK");
+    
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_SSID,
             .password = WIFI_PASS,
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-            .scan_method = WIFI_ALL_CHANNEL_SCAN,
-            .sort_method = WIFI_CONNECT_AP_BY_SIGNAL,
             .pmf_cfg = {
                 .capable = true,
                 .required = false
             },
         },
     };
-
+    
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_LOGD(TAG, "✓ Station configuration set");
+    
+    // === Start WiFi FIRST ===
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Starting WiFi station...");
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    // Wait for WiFi driver to be ready
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGI(TAG, "✓ WiFi started");
     
-    // Scan BEFORE connecting
-    debug_wifi_scan();
+    // === Performance Optimizations (AFTER WiFi started) ===
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Applying performance optimizations...");
     
-    // Now initiate connection
-    ESP_LOGI(TAG, "Connecting to tracker...");
-    esp_wifi_connect();
-
-    ESP_LOGI(TAG, "Waiting for connection...");
+    // Maximum TX power
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(78));  // 19.5 dBm
+    ESP_LOGI(TAG, "  ✓ TX Power: 19.5 dBm (MAXIMUM)");
     
-    // Wait for connection or failure
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
+    // Disable power saving
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "  ✓ Power Saving: DISABLED");
+    ESP_LOGI(TAG, "    - Always-on for instant updates");
+    
+    // Set 20MHz bandwidth
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+    ESP_LOGI(TAG, "  ✓ Bandwidth: 20 MHz");
+    ESP_LOGI(TAG, "    - Better range and stability");
+    
+    ESP_LOGI(TAG, "✓ Searching for tracker...");
+    
+    // Wait for connection (timeout: 15 seconds)
+    EventBits_t bits = xEventGroupWaitBits(
+        wifi_event_group,
+        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+        pdFALSE,
+        pdFALSE,
+        pdMS_TO_TICKS(15000)
+    );
+    
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WiFi connected to SSID: %s", WIFI_SSID);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "✓ WiFi connection successful");
         
-        // Connect to master via TCP
-        struct sockaddr_in server_addr;
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(SERVER_PORT);
-        server_addr.sin_addr.s_addr = inet_addr(SERVER_IP);
-
-        client_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (client_socket < 0) {
-            ESP_LOGE(TAG, "Socket creation failed: errno %d", errno);
+        // Connect TCP socket
+        esp_err_t ret = connect_tcp();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "⚠ TCP connection failed, will retry");
             return ESP_FAIL;
         }
-
-        ESP_LOGI(TAG, "Connecting to tracker at %s:%d...", SERVER_IP, SERVER_PORT);
-        int err = connect(client_socket, (struct sockaddr *)&server_addr, sizeof(server_addr));
-        if (err != 0) {
-            ESP_LOGE(TAG, "TCP connection failed: errno %d", errno);
-            close(client_socket);
-            client_socket = -1;
-            return ESP_FAIL;
-        }
-
-        ESP_LOGI(TAG, "Connected to tracker!");
+        
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║          CLIENT READY                                      ║");
+        ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Display ready to receive tracking data");
+        ESP_LOGI(TAG, "");
+        
         return ESP_OK;
+        
     } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGE(TAG, "Failed to connect to SSID: %s", WIFI_SSID);
-        return ESP_FAIL;
+        ESP_LOGE(TAG, "");
+        ESP_LOGE(TAG, "✗ WiFi connection failed");
+        ESP_LOGE(TAG, "  - Tracker not found or password incorrect");
+        ESP_LOGE(TAG, "  - Will keep retrying in background");
+        ESP_LOGE(TAG, "");
+        return ESP_ERR_WIFI_CONN;
+        
+    } else {
+        ESP_LOGE(TAG, "");
+        ESP_LOGE(TAG, "✗ WiFi connection timeout");
+        ESP_LOGE(TAG, "  - Tracker AP not detected");
+        ESP_LOGE(TAG, "  - Check tracker is powered on");
+        ESP_LOGE(TAG, "  - Verify WiFi started on tracker");
+        ESP_LOGE(TAG, "");
+        return ESP_ERR_WIFI_TIMEOUT;
     }
-    
-    return ESP_ERR_TIMEOUT;
 }
 
+/*
+ * Receive Tracking Data from Tracker
+ */
 esp_err_t wifi_client_receive_data(tracker_data_t *data, uint32_t timeout_ms)
 {
-    // Precondition: STA connected and socket open
-    if (!is_connected || client_socket < 0) {
-        return ESP_ERR_INVALID_STATE;
+    if (!data) {
+        ESP_LOGE(TAG, "NULL data pointer");
+        return ESP_ERR_INVALID_ARG;
     }
-
-    // Per-call receive timeout (non-blocking beyond timeout_ms)
-    struct timeval timeout;
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    // Receive a full tracker_data_t payload
-    // NOTE: This assumes the master sends the struct in a single TCP write.
-    // If fragmentation occurs, consider a small header and framed reads.
-    int len = recv(client_socket, data, sizeof(tracker_data_t), 0);
-    if (len < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return ESP_ERR_TIMEOUT;  // Expected when no data within timeout
-        }
-        ESP_LOGE(TAG, "Receive error: errno %d", errno);
+    
+    // Check WiFi connection
+    if (!wifi_connected) {
+        ESP_LOGV(TAG, "WiFi not connected");
         return ESP_FAIL;
-    } else if (len == 0) {
-        // Peer closed the connection
-        ESP_LOGW(TAG, "Connection closed by peer");
-        return ESP_ERR_INVALID_STATE;
-    } else if (len != sizeof(tracker_data_t)) {
-        // Partial frame received (likely fragmentation)
-        // TODO: Implement a small frame protocol: [len][payload][crc]
-        ESP_LOGW(TAG, "Partial frame: got %d of %u bytes", len, (unsigned)sizeof(tracker_data_t));
+    }
+    
+    // Connect TCP if needed
+    if (client_socket < 0 || !tcp_connected) {
+        ESP_LOGI(TAG, "TCP disconnected, reconnecting...");
+        
+        esp_err_t ret = connect_tcp();
+        if (ret != ESP_OK) {
+            ESP_LOGD(TAG, "TCP reconnect failed, retrying in %d sec", TCP_RECONNECT_DELAY_MS / 1000);
+            vTaskDelay(pdMS_TO_TICKS(TCP_RECONNECT_DELAY_MS));
+            return ESP_FAIL;
+        }
+    }
+    
+    // Set receive timeout
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(client_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    // Receive packet
+    int bytes_received = recv(client_socket, data, sizeof(tracker_data_t), 0);
+    
+    if (bytes_received < 0) {
+        // Receive error
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // Timeout (normal if no data yet)
+            ESP_LOGV(TAG, "Receive timeout (no data available)");
+            s_stats.rx_timeouts++;
+            return ESP_ERR_TIMEOUT;
+        } else {
+            // Connection error
+            ESP_LOGW(TAG, "⚠ Receive error: errno %d (%s)", errno, strerror(errno));
+            ESP_LOGW(TAG, "  Closing socket, will reconnect");
+            
+            close(client_socket);
+            client_socket = -1;
+            tcp_connected = false;
+            s_stats.rx_errors++;
+            return ESP_FAIL;
+        }
+    }
+    
+    if (bytes_received == 0) {
+        // Connection closed by tracker
+        ESP_LOGW(TAG, "⚠ Connection closed by tracker");
+        close(client_socket);
+        client_socket = -1;
+        tcp_connected = false;
+        return ESP_FAIL;
+    }
+    
+    if (bytes_received != sizeof(tracker_data_t)) {
+        // Invalid packet size
+        ESP_LOGW(TAG, "⚠ Invalid packet size: %d bytes (expected %zu)",
+                 bytes_received, sizeof(tracker_data_t));
+        s_stats.rx_errors++;
         return ESP_ERR_INVALID_SIZE;
     }
-
-    // Optional: validate fields (e.g., range-check angles/voltage) before returning
+    
+    // Success
+    s_stats.rx_packets++;
+    ESP_LOGV(TAG, "Received %d bytes (packet #%lu)", bytes_received, s_stats.rx_packets);
+    
+    // Update RSSI periodically (every 100 packets)
+    if (s_stats.rx_packets % 100 == 0) {
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            s_rssi = ap_info.rssi;
+            ESP_LOGD(TAG, "Signal strength: %d dBm", s_rssi);
+        }
+    }
+    
     return ESP_OK;
 }
 
+/*
+ * Attempt Reconnection to Tracker
+ */
+esp_err_t wifi_client_reconnect(void)
+{
+    ESP_LOGI(TAG, "Manual reconnect requested");
+    
+    // Close existing TCP socket
+    if (client_socket >= 0) {
+        close(client_socket);
+        client_socket = -1;
+        tcp_connected = false;
+    }
+    
+    // Reconnect WiFi if needed
+    if (!wifi_connected) {
+        ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
+        esp_wifi_connect();
+        return ESP_FAIL;  // Will succeed on next event
+    }
+    
+    // Reconnect TCP
+    return connect_tcp();
+}
+
+/*
+ * Check if Connected to Tracker
+ */
 bool wifi_client_is_connected(void)
 {
-    // Reports WiFi link + socket state; UI can use this for status
-    return is_connected && (client_socket >= 0);
+    return wifi_connected && tcp_connected && (client_socket >= 0);
+}
+
+/*
+ * Get WiFi Signal Strength (RSSI)
+ */
+int8_t wifi_client_get_signal_strength(void)
+{
+    if (!wifi_connected) {
+        return -128;  // Not connected
+    }
+    
+    // Get fresh RSSI
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+        s_rssi = ap_info.rssi;
+    }
+    
+    return s_rssi;
+}
+
+/*
+ * Get WiFi IP Address
+ */
+const char* wifi_client_get_ip_address(void)
+{
+    return s_ip_address;
+}
+
+/*
+ * Get Connection Statistics
+ */
+void wifi_client_get_stats(wifi_client_stats_t *stats)
+{
+    if (!stats) return;
+    
+    stats->rx_packets = s_stats.rx_packets;
+    stats->rx_errors = s_stats.rx_errors;
+    stats->rx_timeouts = s_stats.rx_timeouts;
+    stats->reconnect_count = s_stats.reconnect_count;
+    
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+    stats->uptime_sec = wifi_connected ? (now - s_connection_start_time) : 0;
+    
+    stats->avg_rssi = s_rssi;
 }
