@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <sys/time.h>
 #include "driver/uart.h"
 #include "driver/i2c.h"
 #include "esp_log.h"
@@ -16,6 +17,12 @@
     - Maintains a cached last valid fix (s_last).
     - Talks to HMC5883 via I2C, supports calibration saved in NVS.
     - Provides magnetic declination correction for true north conversion.
+    
+    System Check Integration:
+    - gps_init() returns ESP_OK (GPS+compass OK), ESP_FAIL (GPS OK, compass failed),
+      or ESP_ERR_INVALID_STATE (GPS failed - critical)
+    - gps_test_communication() added for quick hardware check
+    - gps_is_compass_present() added for system diagnostics
 */
 
 #define TAG "GPS"
@@ -43,6 +50,8 @@ typedef struct {
 static gps_cfg_t  s_cfg;
 static gps_data_t s_last = {0};
 static compass_cal_t s_compass_cal = {0};
+static bool s_gps_initialized = false;
+static bool s_compass_present = false;
 
 /* ────────────────────── Magnetic Declination Helpers ─────────────────── */
 
@@ -150,34 +159,49 @@ static esp_err_t hmc5883_read_reg(uint8_t reg, uint8_t *buf, size_t len) {
 static esp_err_t hmc5883_init(void) {
     esp_err_t ret;
     
+    ESP_LOGI(TAG, "Detecting HMC5883 compass...");
+    
     // Verify device ID (should read 'H43' = 0x48, 0x34, 0x33)
     uint8_t id[3];
     ret = hmc5883_read_reg(HMC5883_REG_ID_A, id, 3);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "HMC5883 not responding on I2C");
+        ESP_LOGW(TAG, "HMC5883 not responding on I2C (error: %s)", esp_err_to_name(ret));
+        s_compass_present = false;
         return ret;
     }
     
     if (id[0] != 0x48 || id[1] != 0x34 || id[2] != 0x33) {
-        ESP_LOGE(TAG, "HMC5883 ID mismatch: %02X %02X %02X", id[0], id[1], id[2]);
+        ESP_LOGW(TAG, "HMC5883 ID mismatch: %02X %02X %02X (expected 48 34 33)", 
+                 id[0], id[1], id[2]);
+        s_compass_present = false;
         return ESP_ERR_NOT_FOUND;
     }
     
-    ESP_LOGI(TAG, "HMC5883 compass detected");
+    ESP_LOGI(TAG, "✓ HMC5883 compass detected (ID: H43)");
+    s_compass_present = true;
     
     // Configure: 8 samples averaged, 15 Hz output rate, normal measurement
     ret = hmc5883_write_reg(HMC5883_REG_CONFIG_A, 0x70);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure HMC5883 config A");
+        return ret;
+    }
     
     // Set gain to ±1.3 Ga (default, good for most locations)
     ret = hmc5883_write_reg(HMC5883_REG_CONFIG_B, 0x20);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure HMC5883 config B");
+        return ret;
+    }
     
     // Set continuous measurement mode
     ret = hmc5883_write_reg(HMC5883_REG_MODE, 0x00);
-    if (ret != ESP_OK) return ret;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set HMC5883 mode");
+        return ret;
+    }
     
-    ESP_LOGI(TAG, "HMC5883 configured: 15Hz, continuous mode");
+    ESP_LOGI(TAG, "✓ HMC5883 configured: 15Hz output, continuous mode");
     
     return ESP_OK;
 }
@@ -201,7 +225,7 @@ static void compass_load_calibration(void) {
     nvs_handle_t h;
     esp_err_t ret = nvs_open("gps", NVS_READONLY, &h);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "No compass calibration in NVS");
+        ESP_LOGI(TAG, "No compass calibration in NVS (first boot)");
         s_compass_cal.calibrated = false;
         s_compass_cal.declination_deg = 0.0f;
         return;
@@ -212,13 +236,14 @@ static void compass_load_calibration(void) {
     nvs_close(h);
     
     if (ret == ESP_OK && s_compass_cal.calibrated) {
-        ESP_LOGI(TAG, "Compass calibration loaded: X[%d,%d] Y[%d,%d] Z[%d,%d] decl=%.1f°",
+        ESP_LOGI(TAG, "✓ Compass calibration loaded from NVS");
+        ESP_LOGI(TAG, "  X: [%d, %d] Y: [%d, %d] Z: [%d, %d]",
                  s_compass_cal.x_min, s_compass_cal.x_max,
                  s_compass_cal.y_min, s_compass_cal.y_max,
-                 s_compass_cal.z_min, s_compass_cal.z_max,
-                 s_compass_cal.declination_deg);
+                 s_compass_cal.z_min, s_compass_cal.z_max);
+        ESP_LOGI(TAG, "  Declination: %.1f°", s_compass_cal.declination_deg);
     } else {
-        ESP_LOGW(TAG, "Compass not calibrated - heading will be inaccurate");
+        ESP_LOGI(TAG, "Compass not calibrated - use double-press button to calibrate");
         s_compass_cal.calibrated = false;
         s_compass_cal.declination_deg = 0.0f;
     }
@@ -229,14 +254,21 @@ static void compass_save_calibration(void) {
     nvs_handle_t h;
     esp_err_t ret = nvs_open("gps", NVS_READWRITE, &h);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for compass calibration");
+        ESP_LOGE(TAG, "Failed to open NVS for compass calibration: %s", esp_err_to_name(ret));
         return;
     }
     
     ret = nvs_set_blob(h, "compass_cal", &s_compass_cal, sizeof(compass_cal_t));
     if (ret == ESP_OK) {
-        nvs_commit(h);
-        ESP_LOGI(TAG, "Compass calibration saved to NVS (decl=%.1f°)", s_compass_cal.declination_deg);
+        ret = nvs_commit(h);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Compass calibration saved to NVS (decl=%.1f°)", 
+                     s_compass_cal.declination_deg);
+        } else {
+            ESP_LOGE(TAG, "Failed to commit NVS: %s", esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to write NVS: %s", esp_err_to_name(ret));
     }
     nvs_close(h);
 }
@@ -255,7 +287,7 @@ static bool parse_gga(const char *sentence, gps_data_t *g) {
         &fix_quality, &g->num_satellites, &g->altitude_m);
     
     if (parsed < 7) {
-        ESP_LOGD(TAG, "GGA parse failed (parsed %d fields)", parsed);
+        ESP_LOGD(TAG, "GGA parse failed (parsed %d/7 fields)", parsed);
         return false;
     }
     
@@ -263,9 +295,10 @@ static bool parse_gga(const char *sentence, gps_data_t *g) {
     g->longitude = nmea_to_degrees(lon_raw, lon_dir);
     g->fix_type = (fix_quality > 0) ? fix_quality : 0;
     
-    ESP_LOGD(TAG, "GGA: lat=%.7f lon=%.7f alt=%.1f fix=%u sats=%u",
-             g->latitude, g->longitude, g->altitude_m, 
-             g->fix_type, g->num_satellites);
+    ESP_LOGD(TAG, "GGA: %.7f°%c %.7f°%c alt=%.1fm fix=%u sats=%u",
+             fabs(g->latitude), (g->latitude >= 0) ? 'N' : 'S',
+             fabs(g->longitude), (g->longitude >= 0) ? 'E' : 'W',
+             g->altitude_m, g->fix_type, g->num_satellites);
     
     return (fix_quality > 0);
 }
@@ -281,7 +314,8 @@ static bool parse_rmc(const char *sentence, gps_data_t *g) {
         &speed_knots, &track_deg);
     
     if (parsed < 7 || status != 'A') {
-        ESP_LOGD(TAG, "RMC parse failed or invalid (parsed %d, status %c)", parsed, status);
+        ESP_LOGD(TAG, "RMC: %s (parsed %d, status '%c')", 
+                 (status == 'A') ? "invalid data" : "no fix", parsed, status);
         return false;
     }
     
@@ -290,8 +324,7 @@ static bool parse_rmc(const char *sentence, gps_data_t *g) {
     g->ground_speed_mps = speed_knots * 0.514444f;
     g->heading_deg = (float)track_deg;
     
-    ESP_LOGD(TAG, "RMC: lat=%.7f lon=%.7f speed=%.2f m/s heading=%.1f°",
-             g->latitude, g->longitude, g->ground_speed_mps, g->heading_deg);
+    ESP_LOGD(TAG, "RMC: speed=%.1fm/s heading=%.1f°", g->ground_speed_mps, g->heading_deg);
     
     return true;
 }
@@ -301,7 +334,11 @@ static bool parse_rmc(const char *sentence, gps_data_t *g) {
 esp_err_t gps_init(const gps_cfg_t *cfg) {
     s_cfg = *cfg;
     
-    ESP_LOGI(TAG, "Initializing BN-880 GPS module + HMC5883 compass...");
+    ESP_LOGI(TAG, "Initializing BN-880 GPS + HMC5883 compass...");
+    ESP_LOGI(TAG, "  UART%d: TX=GPIO%d RX=GPIO%d @ %d baud",
+             s_cfg.uart_port, s_cfg.tx_io, s_cfg.rx_io, s_cfg.baud_rate);
+    ESP_LOGI(TAG, "  I2C%d: SDA=GPIO%d SCL=GPIO%d @ 100kHz",
+             s_cfg.i2c_port, s_cfg.sda_io, s_cfg.scl_io);
     
     // Configure UART for GPS
     uart_config_t uart_config = {
@@ -313,17 +350,28 @@ esp_err_t gps_init(const gps_cfg_t *cfg) {
         .source_clk = UART_SCLK_DEFAULT,
     };
     
-    ESP_ERROR_CHECK(uart_param_config(s_cfg.uart_port, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(s_cfg.uart_port, 
-                                  s_cfg.tx_io, s_cfg.rx_io,
-                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(s_cfg.uart_port, UART_BUF_SIZE, 
-                                         0, 0, NULL, 0));
+    esp_err_t ret = uart_param_config(s_cfg.uart_port, &uart_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ UART config failed: %s", esp_err_to_name(ret));
+        return ESP_ERR_INVALID_STATE;
+    }
     
-    ESP_LOGI(TAG, "GPS UART%d: TX=%d RX=%d @ %d baud",
-             s_cfg.uart_port, s_cfg.tx_io, s_cfg.rx_io, s_cfg.baud_rate);
+    ret = uart_set_pin(s_cfg.uart_port, 
+                       s_cfg.tx_io, s_cfg.rx_io,
+                       UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ UART pin config failed: %s", esp_err_to_name(ret));
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    ret = uart_driver_install(s_cfg.uart_port, UART_BUF_SIZE, 0, 0, NULL, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ UART driver install failed: %s", esp_err_to_name(ret));
+        return ESP_ERR_INVALID_STATE;
+    }
     
     uart_flush(s_cfg.uart_port);
+    ESP_LOGI(TAG, "✓ GPS UART initialized");
     
     // Configure I2C for compass
     i2c_config_t i2c_conf = {
@@ -335,24 +383,96 @@ esp_err_t gps_init(const gps_cfg_t *cfg) {
         .master.clk_speed = 100000,  // 100 kHz for HMC5883
     };
     
-    ESP_ERROR_CHECK(i2c_param_config(s_cfg.i2c_port, &i2c_conf));
-    ESP_ERROR_CHECK(i2c_driver_install(s_cfg.i2c_port, I2C_MODE_MASTER, 0, 0, 0));
+    ret = i2c_param_config(s_cfg.i2c_port, &i2c_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠ I2C config failed: %s (compass disabled)", esp_err_to_name(ret));
+        s_gps_initialized = true;
+        return ESP_OK;  // GPS OK, compass failed
+    }
     
-    ESP_LOGI(TAG, "I2C%d: SDA=%d SCL=%d @ 100kHz",
-             s_cfg.i2c_port, s_cfg.sda_io, s_cfg.scl_io);
+    ret = i2c_driver_install(s_cfg.i2c_port, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "⚠ I2C driver install failed: %s (compass disabled)", esp_err_to_name(ret));
+        s_gps_initialized = true;
+        return ESP_OK;  // GPS OK, compass failed
+    }
+    
+    ESP_LOGI(TAG, "✓ I2C bus initialized");
     
     // Initialize HMC5883 compass
-    esp_err_t ret = hmc5883_init();
+    ret = hmc5883_init();
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "HMC5883 init failed - compass features disabled");
-    } else {
-        compass_load_calibration();
+        ESP_LOGW(TAG, "⚠ Compass initialization failed (GPS still functional)");
+        s_gps_initialized = true;
+        return ESP_OK;  // GPS OK, compass failed
     }
+    
+    // Load compass calibration if present
+    compass_load_calibration();
+    
+    s_gps_initialized = true;
+    ESP_LOGI(TAG, "✓ GPS module fully initialized");
     
     return ESP_OK;
 }
 
+bool gps_test_communication(uint32_t timeout_ms) {
+    if (!s_gps_initialized) {
+        ESP_LOGW(TAG, "GPS not initialized");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "Testing GPS communication (%lu ms timeout)...", timeout_ms);
+    
+    char line[NMEA_MAX_LINE];
+    int line_pos = 0;
+    uint32_t start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    int sentence_count = 0;
+    
+    while ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_ms) < timeout_ms) {
+        uint8_t byte;
+        int len = uart_read_bytes(s_cfg.uart_port, &byte, 1, pdMS_TO_TICKS(100));
+        
+        if (len <= 0) continue;
+        
+        if (byte == '\n') {
+            line[line_pos] = '\0';
+            
+            if (line_pos > 0 && line[0] == '$') {
+                sentence_count++;
+                
+                if (nmea_verify(line)) {
+                    ESP_LOGI(TAG, "✓ GPS responding: %s", line);
+                    ESP_LOGI(TAG, "  Communication OK (%d sentences in %lu ms)",
+                             sentence_count, 
+                             xTaskGetTickCount() * portTICK_PERIOD_MS - start_ms);
+                    return true;
+                } else {
+                    ESP_LOGW(TAG, "  Checksum error: %s", line);
+                }
+            }
+            
+            line_pos = 0;
+        } else if (line_pos < NMEA_MAX_LINE - 1) {
+            line[line_pos++] = byte;
+        }
+    }
+    
+    if (sentence_count > 0) {
+        ESP_LOGW(TAG, "GPS responding but all checksums failed (%d sentences)", sentence_count);
+    } else {
+        ESP_LOGE(TAG, "No GPS data received (check wiring)");
+    }
+    
+    return false;
+}
+
 bool gps_poll_nav_pvt(gps_data_t *out) {
+    if (!s_gps_initialized) {
+        ESP_LOGW(TAG, "GPS not initialized");
+        return false;
+    }
+    
     char line[NMEA_MAX_LINE];
     int line_pos = 0;
     bool got_gga = false;
@@ -391,9 +511,11 @@ bool gps_poll_nav_pvt(gps_data_t *out) {
                         
                         if (out) *out = temp;
                         
-                        ESP_LOGI(TAG, "Fix=%u SV=%u Lat=%.7f Lon=%.7f Alt=%.1fm V=%.2fm/s Head=%.1f°",
-                                 temp.fix_type, temp.num_satellites, temp.latitude, temp.longitude,
-                                 temp.altitude_m, temp.ground_speed_mps, temp.heading_deg);
+                        ESP_LOGI(TAG, "✓ GPS Fix: %.7f°%c %.7f°%c alt=%.1fm sats=%u speed=%.1fm/s heading=%.1f°",
+                                 fabs(temp.latitude), (temp.latitude >= 0) ? 'N' : 'S',
+                                 fabs(temp.longitude), (temp.longitude >= 0) ? 'E' : 'W',
+                                 temp.altitude_m, temp.num_satellites, 
+                                 temp.ground_speed_mps, temp.heading_deg);
                         
                         return true;
                     }
@@ -406,17 +528,25 @@ bool gps_poll_nav_pvt(gps_data_t *out) {
         }
     }
     
-    ESP_LOGD(TAG, "GPS poll timeout (got_gga=%d got_rmc=%d)", got_gga, got_rmc);
+    ESP_LOGD(TAG, "GPS poll timeout (GGA=%d RMC=%d)", got_gga, got_rmc);
     return false;
 }
 
 bool gps_get_last(gps_data_t *out) {
-    if (!s_last.valid) return false;
+    if (!s_last.valid) {
+        ESP_LOGD(TAG, "No valid GPS fix cached");
+        return false;
+    }
     if (out) *out = s_last;
     return true;
 }
 
 bool gps_get_compass_heading(float *heading_deg) {
+    if (!s_compass_present) {
+        ESP_LOGD(TAG, "Compass not available");
+        return false;
+    }
+    
     int16_t x, y, z;
     
     // Read raw magnetic field
@@ -441,7 +571,10 @@ bool gps_get_compass_heading(float *heading_deg) {
     
     *heading_deg = heading;
     
-    ESP_LOGD(TAG, "Compass: raw[%d,%d,%d] magnetic_heading=%.1f°", x, y, z, heading);
+    ESP_LOGD(TAG, "Compass: raw[%d,%d,%d] %s heading=%.1f°", 
+             x, y, z, 
+             s_compass_cal.calibrated ? "cal" : "uncal",
+             heading);
     
     return true;
 }
@@ -484,7 +617,7 @@ void gps_set_magnetic_declination(float declination_deg) {
     s_compass_cal.declination_deg = declination_deg;
     compass_save_calibration();
     
-    ESP_LOGI(TAG, "Magnetic declination set to %.1f°", declination_deg);
+    ESP_LOGI(TAG, "✓ Magnetic declination set to %.1f°", declination_deg);
 }
 
 float gps_get_magnetic_declination(void) {
@@ -492,8 +625,25 @@ float gps_get_magnetic_declination(void) {
 }
 
 bool gps_calibrate_compass(void) {
-    ESP_LOGI(TAG, "=== COMPASS CALIBRATION ===");
-    ESP_LOGI(TAG, "Slowly rotate system 360° horizontally (2-3 circles)...");
+    if (!s_compass_present) {
+        ESP_LOGE(TAG, "Compass not available - cannot calibrate");
+        return false;
+    }
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║          COMPASS CALIBRATION PROCEDURE             ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Instructions:");
+    ESP_LOGI(TAG, "  1. Keep system level (horizontal)");
+    ESP_LOGI(TAG, "  2. Slowly rotate 360° (2-3 complete circles)");
+    ESP_LOGI(TAG, "  3. Duration: 20 seconds");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Starting in 3 seconds...");
+    
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    ESP_LOGI(TAG, "▶ ROTATE NOW!");
     
     // Reset calibration data (but preserve declination)
     float saved_decl = s_compass_cal.declination_deg;
@@ -509,6 +659,7 @@ bool gps_calibrate_compass(void) {
     // Collect samples for 20 seconds
     uint32_t start = xTaskGetTickCount();
     int sample_count = 0;
+    int progress = 0;
     
     while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(20000)) {
         int16_t x, y, z;
@@ -524,10 +675,14 @@ bool gps_calibrate_compass(void) {
             
             sample_count++;
             
-            // Log progress every 2 seconds
-            if (sample_count % 30 == 0) {
-                ESP_LOGI(TAG, "Samples: %d, X[%d,%d] Y[%d,%d] Z[%d,%d]",
-                         sample_count,
+            // Progress bar every 4 seconds (20%)
+            uint32_t elapsed_ms = (xTaskGetTickCount() - start) * portTICK_PERIOD_MS;
+            int new_progress = (elapsed_ms / 4000) * 20;
+            
+            if (new_progress > progress) {
+                progress = new_progress;
+                ESP_LOGI(TAG, "[%d%%] Samples: %d, X[%d,%d] Y[%d,%d] Z[%d,%d]",
+                         progress, sample_count,
                          s_compass_cal.x_min, s_compass_cal.x_max,
                          s_compass_cal.y_min, s_compass_cal.y_max,
                          s_compass_cal.z_min, s_compass_cal.z_max);
@@ -537,26 +692,43 @@ bool gps_calibrate_compass(void) {
         vTaskDelay(pdMS_TO_TICKS(67));  // ~15 Hz
     }
     
+    ESP_LOGI(TAG, "■ STOP rotating");
+    ESP_LOGI(TAG, "");
+    
     // Validate calibration quality
     int x_range = s_compass_cal.x_max - s_compass_cal.x_min;
     int y_range = s_compass_cal.y_max - s_compass_cal.y_min;
+    int z_range = s_compass_cal.z_max - s_compass_cal.z_min;
+    
+    ESP_LOGI(TAG, "Calibration Results:");
+    ESP_LOGI(TAG, "  Samples collected: %d", sample_count);
+    ESP_LOGI(TAG, "  X range: %d", x_range);
+    ESP_LOGI(TAG, "  Y range: %d", y_range);
+    ESP_LOGI(TAG, "  Z range: %d", z_range);
     
     if (x_range < 200 || y_range < 200) {
-        ESP_LOGW(TAG, "Calibration failed: insufficient rotation (X=%d Y=%d)",
-                 x_range, y_range);
+        ESP_LOGE(TAG, "");
+        ESP_LOGE(TAG, "✗ CALIBRATION FAILED");
+        ESP_LOGE(TAG, "  Insufficient rotation detected");
+        ESP_LOGE(TAG, "  Minimum required: X=200, Y=200");
+        ESP_LOGE(TAG, "  Try again with more complete rotation");
         return false;
     }
     
     s_compass_cal.calibrated = true;
     compass_save_calibration();
     
-    ESP_LOGI(TAG, "Calibration complete: %d samples collected", sample_count);
-    ESP_LOGI(TAG, "Ranges: X=%d Y=%d Z=%d", x_range, y_range,
-             s_compass_cal.z_max - s_compass_cal.z_min);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "✓ CALIBRATION SUCCESSFUL");
+    ESP_LOGI(TAG, "  Compass ready for accurate heading");
     
     return true;
 }
 
 bool gps_is_compass_calibrated(void) {
     return s_compass_cal.calibrated;
+}
+
+bool gps_is_compass_present(void) {
+    return s_compass_present;
 }

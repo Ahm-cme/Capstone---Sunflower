@@ -59,16 +59,26 @@ typedef struct {
     Initialize UART (NMEA 9600-8-N-1) and I2C compass.
     - Sets UART RX buffer for NMEA lines.
     - Puts HMC5883 into continuous-conversion mode.
-    - Returns ESP_OK on success.
+    - Returns ESP_OK on success, ESP_FAIL if compass failed (GPS still works)
+    - Returns ESP_ERR_INVALID_STATE if UART init failed (critical)
 */
 esp_err_t gps_init(const gps_cfg_t *cfg);
 
 /*
     Poll UART, parse NMEA (GGA/RMC).
     - On success: fills 'out', updates internal last-fix cache, returns true.
-    - May block briefly while reading.
+    - May block briefly while reading (2 second timeout).
+    - Returns false if no valid fix within timeout.
 */
 bool gps_poll_nav_pvt(gps_data_t *out);
+
+/*
+    Quick communication test - checks if GPS is responding.
+    - Waits up to timeout_ms for any NMEA sentence.
+    - Does NOT require valid fix, just communication.
+    - Returns true if GPS is sending data, false if no response.
+*/
+bool gps_test_communication(uint32_t timeout_ms);
 
 /*
     Copy last valid fix (from internal cache) into 'out'.
@@ -124,5 +134,22 @@ void gps_set_magnetic_declination(float declination_deg);
  */
 float gps_get_magnetic_declination(void);
 
+/*
+ * Calibrate compass by rotating system 360° horizontally.
+ * - Takes 20 seconds, logs progress.
+ * - Returns true on success, false if insufficient rotation.
+ * - Saves calibration to NVS automatically.
+ */
 bool gps_calibrate_compass(void);
+
+/*
+ * Check if compass has been calibrated.
+ * - Returns true if calibration data exists in NVS.
+ */
 bool gps_is_compass_calibrated(void);
+
+/*
+ * Check if compass hardware is present and responding.
+ * - Returns true if HMC5883 is detected on I2C bus.
+ */
+bool gps_is_compass_present(void);
