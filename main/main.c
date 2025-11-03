@@ -139,6 +139,7 @@ void app_main(void)
     uint32_t loop_count = 0;
     uint32_t no_data_counter = 0;
     uint32_t last_log_time = 0;
+    bool first_data_received = false;  // Track if we've ever received data
     
     while (1) {
         tracker_data_t data;
@@ -158,6 +159,7 @@ void app_main(void)
         if (rx_ret == ESP_OK) {
             // ═══ SUCCESS - Update Display ═══
             no_data_counter = 0;
+            first_data_received = true;  // Mark that we've received data
             
             // Update dashboard with new data
             lcd_client_display_dashboard(&data);
@@ -167,6 +169,9 @@ void app_main(void)
             // Periodic logging (every 10 seconds)
             uint32_t now = esp_log_timestamp() / 1000;
             if ((now - last_log_time) >= 10) {
+                // Get fresh RSSI from client side
+                int8_t client_rssi = wifi_client_get_signal_strength();
+                
                 ESP_LOGI(TAG, "");
                 ESP_LOGI(TAG, "─────────────────────────────────────────────────────");
                 ESP_LOGI(TAG, "Display Update #%lu", loop_count);
@@ -189,7 +194,8 @@ void app_main(void)
                 ESP_LOGI(TAG, "System:");
                 ESP_LOGI(TAG, "  Status:    %u", data.status);
                 ESP_LOGI(TAG, "  Quality:   %u°", data.tracking_quality);
-                ESP_LOGI(TAG, "  WiFi RSSI: %d dBm", wifi_client_get_signal_strength());
+                ESP_LOGI(TAG, "  WiFi RSSI (Client): %d dBm", client_rssi);  // Client's view of signal
+                ESP_LOGI(TAG, "  WiFi RSSI (Tracker): %d dBm", data.wifi_rssi);  // Tracker's view (from received packet)
                 ESP_LOGI(TAG, "Statistics:");
                 ESP_LOGI(TAG, "  Moves Today: %lu", data.moves_today);
                 ESP_LOGI(TAG, "  Total Moves: %lu", data.total_moves);
@@ -208,10 +214,13 @@ void app_main(void)
                 ESP_LOGD(TAG, "Waiting for data (timeout)");
             } else if (no_data_counter == 3) {
                 ESP_LOGW(TAG, "⚠ No data for %lu seconds", no_data_counter * 2);
-            } else if (no_data_counter >= 5) {
+            } else if (no_data_counter >= 10 && first_data_received) {
+                // Only show error if we've successfully received data before
+                // This prevents showing error during initial startup
                 ESP_LOGW(TAG, "⚠ No data for %lu seconds - displaying error", no_data_counter * 2);
                 lcd_client_show_error("Waiting for tracker data");
             }
+            // If first_data_received is false, we're still at startup - keep showing init screen
             
         } else if (rx_ret == ESP_ERR_INVALID_SIZE) {
             // ═══ INVALID PACKET ═══
@@ -221,7 +230,11 @@ void app_main(void)
         } else {
             // ═══ CONNECTION ERROR ═══
             ESP_LOGE(TAG, "✗ Receive error: %s", esp_err_to_name(rx_ret));
-            lcd_client_show_error("Connection error");
+            
+            // Only show error screen if we've received data before
+            if (first_data_received) {
+                lcd_client_show_error("Connection error");
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
         

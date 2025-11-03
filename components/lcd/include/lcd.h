@@ -89,27 +89,27 @@
 // ═══════════════════════════════════════════════════════════════
 // RGB565 format: RRRRR GGGGGG BBBBB
 
-// Neutral colors (backgrounds, borders, text)
+// Neutral colors (backgrounds, borders, text) - FIXED TO MATCH lcd_template.c
 #define LCD_BLACK       0x0000  // Pure black
 #define LCD_WHITE       0xFFFF  // Pure white
-#define LCD_CHARCOAL    0x18C3  // Dark blue-gray (header background)
-#define LCD_STEEL       0x3186  // Medium blue-gray (secondary backgrounds)
+#define LCD_CHARCOAL    0x3186  // Dark blue-gray (header background) - WAS 0x18C3
+#define LCD_STEEL       0x6B4D  // Medium blue-gray (secondary backgrounds) - WAS 0x3186
 #define LCD_SILVER      0xC618  // Light gray (labels)
-#define LCD_SLATE       0x4A49  // Slate blue (borders)
+#define LCD_SLATE       0x9CF3  // Slate blue (borders) - WAS 0x4A49
 #define LCD_DARKBLUE    0x2945  // Dark navy blue (panel backgrounds)
 
-// Warm colors (primary values, sunlight theme)
+// Warm colors (primary values, sunlight theme) - THESE ARE CORRECT
 #define LCD_GOLDEN      0xFEA0  // Golden yellow (primary values)
 #define LCD_AMBER       0xFD20  // Deep amber (elevation values)
 #define LCD_SUNGLOW     0xFFE0  // Bright yellow (azimuth values)
 #define LCD_ORANGE      0xFD20  // Orange (standby status)
 
-// Cool colors (secondary values, nature theme)
+// Cool colors (secondary values, nature theme) - THESE ARE CORRECT
 #define LCD_TEAL        0x07FF  // Cyan-blue (delta values)
 #define LCD_MINT        0x87F0  // Light teal (GPS data)
 #define LCD_SAGE        0x07E0  // Green (good status, battery)
 
-// Alert colors (status indicators)
+// Alert colors (status indicators) - THESE ARE CORRECT
 #define LCD_CORAL       0xFBEA  // Light red (warnings)
 #define LCD_CRIMSON     0xF800  // Pure red (errors, critical)
 

@@ -82,6 +82,9 @@ static uint32_t s_connection_start_time = 0;
 static int8_t s_rssi = -128;                      // Current RSSI
 static char s_ip_address[16] = "0.0.0.0";         // Current IP address
 
+// Forward declaration
+static esp_err_t connect_tcp(void);
+
 /*
  * WiFi Event Handler (Station Mode)
  * 
@@ -135,6 +138,9 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             client_socket = -1;
             ESP_LOGD(TAG, "TCP socket closed");
         }
+        
+        // Clear CONNECTED bit before retrying
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTED_BIT);
         
         // Retry connection
         if (retry_count < 100) {  // Log for first 100 retries
@@ -191,7 +197,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         retry_count = 0;  // Reset retry counter on success
         s_connection_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
         
+        // Clear FAIL bit and set CONNECTED bit
+        xEventGroupClearBits(wifi_event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        
+        // Proactively reconnect TCP
+        ESP_LOGI(TAG, "Establishing TCP connection...");
+        if (connect_tcp() == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Full connection restored");
+        } else {
+            ESP_LOGW(TAG, "⚠ TCP reconnection failed, will retry in receive loop");
+        }
     }
 }
 
@@ -408,15 +424,29 @@ esp_err_t wifi_client_receive_data(tracker_data_t *data, uint32_t timeout_ms)
         return ESP_ERR_INVALID_ARG;
     }
     
-    // Check WiFi connection
+    // Check WiFi connection - try to reconnect if needed
     if (!wifi_connected) {
-        ESP_LOGV(TAG, "WiFi not connected");
-        return ESP_FAIL;
+        ESP_LOGV(TAG, "WiFi not connected, checking...");
+        
+        // Check if we're actually connected but flag is stale
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi is actually connected, updating flag");
+            wifi_connected = true;
+        } else {
+            return ESP_FAIL;
+        }
     }
     
-    // Connect TCP if needed
+    // Connect TCP if needed (with verification)
     if (client_socket < 0 || !tcp_connected) {
         ESP_LOGI(TAG, "TCP disconnected, reconnecting...");
+        
+        // Close old socket if exists
+        if (client_socket >= 0) {
+            close(client_socket);
+            client_socket = -1;
+        }
         
         esp_err_t ret = connect_tcp();
         if (ret != ESP_OK) {
@@ -424,6 +454,18 @@ esp_err_t wifi_client_receive_data(tracker_data_t *data, uint32_t timeout_ms)
             vTaskDelay(pdMS_TO_TICKS(TCP_RECONNECT_DELAY_MS));
             return ESP_FAIL;
         }
+        
+        // Verify connection with a test send (0-byte send should succeed if connected)
+        int test = send(client_socket, NULL, 0, MSG_DONTWAIT);
+        if (test < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGW(TAG, "TCP connection verification failed: %d (%s)", errno, strerror(errno));
+            close(client_socket);
+            client_socket = -1;
+            tcp_connected = false;
+            return ESP_FAIL;
+        }
+        
+        ESP_LOGI(TAG, "✓ TCP connection verified and ready");
     }
     
     // Set receive timeout
@@ -505,12 +547,36 @@ esp_err_t wifi_client_reconnect(void)
     // Reconnect WiFi if needed
     if (!wifi_connected) {
         ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
-        esp_wifi_connect();
-        return ESP_FAIL;  // Will succeed on next event
+        
+        // Verify we're not already connected with stale flag
+        wifi_ap_record_t ap_info;
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            ESP_LOGI(TAG, "WiFi is actually connected, updating flag");
+            wifi_connected = true;
+            // Fall through to TCP reconnect
+        } else {
+            // Actually disconnected, trigger reconnect
+            esp_wifi_connect();
+            return ESP_FAIL;  // Will succeed on next event
+        }
     }
     
     // Reconnect TCP
-    return connect_tcp();
+    esp_err_t ret = connect_tcp();
+    if (ret == ESP_OK) {
+        // Verify with test send
+        int test = send(client_socket, NULL, 0, MSG_DONTWAIT);
+        if (test < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ESP_LOGW(TAG, "TCP connection verification failed after reconnect");
+            close(client_socket);
+            client_socket = -1;
+            tcp_connected = false;
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "✓ Reconnection successful and verified");
+    }
+    
+    return ret;
 }
 
 /*
@@ -518,7 +584,39 @@ esp_err_t wifi_client_reconnect(void)
  */
 bool wifi_client_is_connected(void)
 {
-    return wifi_connected && tcp_connected && (client_socket >= 0);
+    // Check WiFi first
+    if (!wifi_connected) {
+        return false;
+    }
+    
+    // Check TCP socket exists
+    if (client_socket < 0) {
+        tcp_connected = false;
+        return false;
+    }
+    
+    // Verify socket is actually alive using SO_ERROR
+    int error = 0;
+    socklen_t len = sizeof(error);
+    if (getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
+        // getsockopt failed, socket is dead
+        ESP_LOGW(TAG, "Socket state check failed, marking as disconnected");
+        close(client_socket);
+        client_socket = -1;
+        tcp_connected = false;
+        return false;
+    }
+    
+    if (error != 0) {
+        // Socket has pending error, it's dead
+        ESP_LOGW(TAG, "Socket has error: %d (%s)", error, strerror(error));
+        close(client_socket);
+        client_socket = -1;
+        tcp_connected = false;
+        return false;
+    }
+    
+    return tcp_connected;
 }
 
 /*
