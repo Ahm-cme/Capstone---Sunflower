@@ -774,10 +774,18 @@ void app_main(void){
         ESP_LOGI(TAG, "Press START button to begin tracking");
         ESP_LOGI(TAG, "");
         
-        // ADD THESE VARIABLES:
+        time_t boot_time = time(NULL);
+        uint32_t button_wait_seconds = 0;
         bool button_pressed = false;
-        bool waiting_for_double_press = false;
+        
+        // Initialize previous values for delta calculation
+        float prev_azimuth = 0.0f;
+        float prev_elevation = 0.0f;
+        bool first_reading = true;
+        
+        // Button press detection state
         uint32_t last_press_time = 0;
+        bool waiting_for_double_press = false;
         
         while (!button_pressed) {
             // === CHECK FOR BUTTON EVENTS ONLY ===
