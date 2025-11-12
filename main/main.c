@@ -78,11 +78,9 @@
 #include "esp_sleep.h"
 #include "driver/i2c.h"
 #include "driver/uart.h"
-#include "wifi_comm.h"
 #include "solar.h"
 #include "battery.h"
 #include "esp_adc/adc_oneshot.h"  
-#include "esp_wifi.h"             
 
 #define TAG "APP"
 
@@ -478,51 +476,14 @@ static bool perform_system_check(bool init_results[9]) {
         warnings++;
     }
     
-    // === 8. WiFi AP Check ===
+    // === 8. WiFi AP Check === DISABLED FOR NO-WIFI BUILD
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "[8/9] Checking WiFi Access Point...");
-    if (init_results[6]) {
-        ESP_LOGI(TAG, "  ✓ WiFi AP: ACTIVE");
-        ESP_LOGI(TAG, "    - SSID: SunflowerTracker");
-        ESP_LOGI(TAG, "    - Password: sunflower2025");
-        ESP_LOGI(TAG, "    - IP: 192.168.4.1");
-        ESP_LOGI(TAG, "    - TCP Port: 8888");
-        ESP_LOGI(TAG, "    - Channel: 1 (2.4GHz)");
-        
-        // Check WiFi configuration
-        wifi_bandwidth_t bw;
-        esp_wifi_get_bandwidth(WIFI_IF_AP, &bw);
-        int8_t power;
-        esp_wifi_get_max_tx_power(&power);
-        wifi_ps_type_t ps_type;
-        esp_wifi_get_ps(&ps_type);
-        
-        ESP_LOGI(TAG, "    - TX Power: %.1f dBm (MAX)", power * 0.25f);
-        ESP_LOGI(TAG, "    - Bandwidth: %s", bw == WIFI_BW_HT20 ? "20MHz" : "40MHz");
-        ESP_LOGI(TAG, "    - Power Save: %s", ps_type == WIFI_PS_NONE ? "DISABLED" : "ENABLED");
-        ESP_LOGI(TAG, "    - Data rate: 1 Hz (92 bytes/packet)");
-        
-        // Check for connected clients
-        wifi_sta_list_t sta_list = {0};
-        if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
-            if (sta_list.num > 0) {
-                ESP_LOGI(TAG, "  ✓ LCD Display: CONNECTED (%u client%s)", 
-                         sta_list.num, sta_list.num == 1 ? "" : "s");
-            } else {
-                ESP_LOGI(TAG, "    - No clients connected yet");
-            }
-        }
-        
-        if (init_results[2]) {
-            sdlog_printf("WiFi OK: AP ready for LCD display (TX: %.1fdBm)", power * 0.25f);
-        }
-    } else {
-        ESP_LOGW(TAG, "  ⚠ WiFi AP: INITIALIZATION FAILED");
-        ESP_LOGW(TAG, "    - LCD display will not be available");
-        ESP_LOGW(TAG, "    - Tracker will operate normally");
-        ESP_LOGW(TAG, "    - Data logged to SD card only");
-        warnings++;
-    }
+    ESP_LOGI(TAG, "[8/9] WiFi Access Point...");
+    ESP_LOGI(TAG, "  ⓘ WiFi DISABLED (no-wifi-lcd build)");
+    ESP_LOGI(TAG, "    - LCD display not available");
+    ESP_LOGI(TAG, "    - Tracker operates standalone");
+    ESP_LOGI(TAG, "    - Data logged to SD card only");
+    init_results[6] = true;  // Mark as "success" (disabled)
     
     // === 9. Compass Check (Optional) ===
     ESP_LOGI(TAG, "");
@@ -751,10 +712,9 @@ void app_main(void){
     ret = battery_init(&battery_config);
     init_results[7] = (ret == ESP_OK);  // Battery is index 7
 
-    // === Initialize WiFi Access Point ===
-    ESP_LOGI(TAG, "Initializing WiFi AP for LCD display...");
-    ret = wifi_comm_init_ap();
-    init_results[6] = (ret == ESP_OK);
+    // === Initialize WiFi Access Point === DISABLED
+    ESP_LOGI(TAG, "WiFi AP disabled (no-wifi-lcd build)");
+    init_results[6] = true;  // Skip WiFi init
 
     // Compass check will be done in system check (index 8)
     init_results[8] = gps_is_compass_calibrated();
@@ -810,48 +770,29 @@ void app_main(void){
         }
         
         // === NON-BLOCKING BUTTON WAIT WITH DATA TRANSMISSION ===
-        ESP_LOGI(TAG, "Starting background data transmission...");
+        ESP_LOGI(TAG, "Starting button wait (no background transmission)...");
         ESP_LOGI(TAG, "Press START button to begin tracking");
         ESP_LOGI(TAG, "");
         
-        time_t boot_time = time(NULL);
-        uint32_t button_wait_seconds = 0;
-        bool button_pressed = false;
-        
-        // Initialize previous values for delta calculation
-        float prev_azimuth = 0.0f;
-        float prev_elevation = 0.0f;
-        bool first_reading = true;
-        
-        // Button press detection state
-        uint32_t last_press_time = 0;
-        bool waiting_for_double_press = false;
-        
         while (!button_pressed) {
-            // === CHECK FOR BUTTON EVENTS (BEFORE DATA TRANSMISSION) ===
-            
-            // Check for button press using proper wait function
-            if (button_wait_for_press(10)) {  // 10ms timeout (non-blocking check)
+            // === CHECK FOR BUTTON EVENTS ONLY ===
+            if (button_wait_for_press(100)) {
                 uint32_t press_time = xTaskGetTickCount();
                 uint32_t time_since_last = pdTICKS_TO_MS(press_time - last_press_time);
                 
-                ESP_LOGI(TAG, "Button pressed (time since last: %lu ms)", 
-                         (unsigned long)time_since_last);
+                ESP_LOGI(TAG, "Button pressed");
                 
-                // Check for DOUBLE-PRESS (for compass calibration)
+                // Check for DOUBLE-PRESS (compass calibration)
                 if (waiting_for_double_press && time_since_last < 1000) {
-                    ESP_LOGI(TAG, "✓ DOUBLE-PRESS detected - starting compass calibration");
-                    
+                    ESP_LOGI(TAG, "✓ DOUBLE-PRESS detected - compass calibration");
                     status_led_set_mode(LED_STARTUP);
-                    sdlog_printf("Compass calibration started (double-press)");
+                    sdlog_printf("Compass calibration started");
                     
                     bool success = gps_calibrate_compass();
                     
                     if (success) {
                         ESP_LOGI(TAG, "✓ Compass calibration successful");
                         sdlog_printf("Compass calibration: OK");
-                        
-                        // Blink LED 3 times
                         for (int i = 0; i < 3; i++) {
                             status_led_set_mode(LED_ERROR);
                             vTaskDelay(pdMS_TO_TICKS(200));
@@ -868,10 +809,10 @@ void app_main(void){
                     status_led_set_mode(LED_WAITING);
                     waiting_for_double_press = false;
                     last_press_time = 0;
-                    continue;  // Stay in button wait loop
+                    continue;
                 }
                 
-                // Check for LONG-PRESS (for mount calibration)
+                // Check for LONG-PRESS (mount calibration)
                 uint32_t hold_start = xTaskGetTickCount();
                 bool is_long_press = false;
                 
@@ -881,23 +822,15 @@ void app_main(void){
                     
                     if (hold_time >= 3000) {
                         is_long_press = true;
-                        ESP_LOGI(TAG, "✓ LONG-PRESS detected (3+ seconds) - starting mount calibration");
-                        
+                        ESP_LOGI(TAG, "✓ LONG-PRESS - mount calibration");
                         status_led_set_mode(LED_STARTUP);
-                        sdlog_printf("Mount calibration started (long-press)");
-                        
+                        sdlog_printf("Mount calibration started");
                         tracking_calibrate_mount_offset_now();
-                        
                         ESP_LOGI(TAG, "✓ Mount calibration complete");
-                        sdlog_printf("Mount calibration: OK");
-                        
                         status_led_set_mode(LED_WAITING);
-                        
-                        // Wait for release
                         while (button_is_pressed()) {
                             vTaskDelay(pdMS_TO_TICKS(50));
                         }
-                        
                         break;
                     }
                 }
@@ -905,171 +838,50 @@ void app_main(void){
                 if (is_long_press) {
                     waiting_for_double_press = false;
                     last_press_time = 0;
-                    continue;  // Stay in button wait loop
+                    continue;
                 }
                 
                 // SINGLE-PRESS: Start tracking
                 if (!is_long_press && !waiting_for_double_press) {
-                    ESP_LOGI(TAG, "✓ SINGLE-PRESS detected - waiting 1s for possible double-press");
+                    ESP_LOGI(TAG, "✓ SINGLE-PRESS - waiting for double-press timeout");
                     waiting_for_double_press = true;
                     last_press_time = press_time;
-                    
-                    // Wait 1 second to see if there's a second press
                     vTaskDelay(pdMS_TO_TICKS(1000));
                     
                     if (waiting_for_double_press) {
-                        // No second press within 1 second = START TRACKING
-                        ESP_LOGI(TAG, "✓ Starting tracking (no second press detected)");
+                        ESP_LOGI(TAG, "✓ Starting tracking");
                         button_pressed = true;
-                        
                         if (init_results[2]) {
-                            sdlog_printf("Button pressed after %lu seconds - starting tracking", 
-                                         (unsigned long)button_wait_seconds);
+                            sdlog_printf("Button pressed - starting tracking");
                         }
                         break;
                     }
                 }
             }
             
-            // === BACKGROUND DATA TRANSMISSION (SAME AS BEFORE) ===
-            
-            // Get current time
-            time_t now = time(NULL);
-            uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
-            
-            // Get current position (will be default/last known while waiting)
-            float current_azimuth = 0.0f;
-            float current_elevation = 0.0f;
-            tracking_get_current_angles(&current_azimuth, &current_elevation);
-            
-            // Calculate deltas
-            float delta_az = 0.0f;
-            float delta_elev = 0.0f;
-            if (!first_reading) {
-                delta_az = current_azimuth - prev_azimuth;
-                delta_elev = current_elevation - prev_elevation;
-                if (delta_az > 180.0f) delta_az -= 360.0f;
-                if (delta_az < -180.0f) delta_az += 360.0f;
-            }
-            first_reading = false;
-            prev_azimuth = current_azimuth;
-            prev_elevation = current_elevation;
-            
-            // Get GPS data (continue background acquisition)
-            gps_data_t g = {0};
-            bool gps_fresh = gps_poll_nav_pvt(&g);
-            bool gps_valid = gps_fresh || gps_get_last(&g);
-            uint32_t gps_fix_age_sec = gps_valid ? (uint32_t)(now - g.timestamp) : 9999;
-            
-            // Get battery data
-            battery_data_t battery;
-            uint16_t battery_adc_raw = 0;
-            float battery_v = 0.0f;
-            float battery_soc = 0.0f;
-            uint8_t battery_soc_level = 0;
-            uint8_t battery_charging = 0;
-            
-            if (battery_read(&battery) == ESP_OK) {
-                battery_adc_raw = battery.adc_raw;
-                battery_v = battery.voltage;
-                battery_soc = battery.soc_percent;
-                battery_soc_level = (uint8_t)battery.soc_level;
-                battery_charging = battery.is_charging ? 1 : 0;
-            }
-            
-            // Calculate sun position (if GPS available)
-            sun_pos_t sun = {0};
-            if (gps_valid) {
-                sun = solar_compute(g.latitude, g.longitude, now);
-            }
-            
-            // Calculate sunrise/sunset
-            uint32_t sunrise_time = 0;
-            uint32_t sunset_time = 0;
-            if (gps_valid) {
-                solar_events_t events = solar_events(g.latitude, g.longitude, now);
-                if (events.has_sunrise) sunrise_time = (uint32_t)events.sunrise_utc;
-                if (events.has_sunset)  sunset_time  = (uint32_t)events.sunset_utc;
-            }
-            
-            // Get WiFi client count
-            uint8_t wifi_client_count = 0;
-            wifi_sta_list_t sta_list = {0};
-            if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
-                wifi_client_count = (uint8_t)sta_list.num;
-            }
-            
-            // Get SD status
-            uint8_t sd_status = sdlog_get_status();
-            
-            // System status = WAITING (0)
-            uint8_t system_status = 0;
-            
-            // Prepare data packet
-            tracker_data_t tx_data = {
-                .elevation = current_elevation,
-                .azimuth = current_azimuth,
-                .delta_elevation = delta_elev,
-                .delta_azimuth = delta_az,
-                .battery_adc = battery_adc_raw,
-                .battery_voltage = battery_v,
-                .battery_soc_percent = battery_soc,
-                .battery_soc = battery_soc_level,
-                .battery_charging = battery_charging,
-                .timestamp = (uint32_t)now,
-                .sunrise_time = sunrise_time,
-                .sunset_time = sunset_time,
-                .status = system_status,  // WAITING = 0
-                .latitude = gps_valid ? (float)g.latitude : 0.0f,
-                .longitude = gps_valid ? (float)g.longitude : 0.0f,
-                .gps_valid = gps_valid ? 1 : 0,
-                .gps_satellites = gps_valid ? g.num_satellites : 0,
-                .last_gps_fix_age_sec = gps_fix_age_sec,
-                .sun_elevation = gps_valid ? (float)sun.elevation_deg : 0.0f,
-                .sun_azimuth = gps_valid ? (float)sun.azimuth_deg : 0.0f,
-                .moves_today = 0,  // No moves yet
-                .total_moves = 0,  // No moves yet
-                .uptime_hours = uptime_h,
-                .wifi_rssi = -128,
-                .wifi_clients = wifi_client_count,
-                .sd_card_status = sd_status,
-                .tracking_quality = 255,  // No tracking active
-            };
-            
-            // Send data to LCD
-            esp_err_t send_ret = wifi_comm_send_data(&tx_data);
-            if (send_ret == ESP_OK) {
-                // Log every 10 seconds to reduce spam
-                if (button_wait_seconds % 10 == 0) {
-                    ESP_LOGI(TAG, "WAITING[%lu]: Batt=%.2fV GPS=%s(%u) Clients=%u (Press button to start)",
-                             (unsigned long)button_wait_seconds,  // FIXED: Cast to unsigned long
-                             battery_v,
-                             gps_valid ? "OK" : "NO_FIX",
-                             gps_valid ? g.num_satellites : 0,
-                             wifi_client_count);
+            // Simple status update every 10 seconds (no WiFi transmission)
+            static uint32_t last_status_log = 0;
+            uint32_t now_ticks = xTaskGetTickCount();
+            if (pdTICKS_TO_MS(now_ticks - last_status_log) >= 10000) {
+                gps_data_t g;
+                bool gps_valid = gps_poll_nav_pvt(&g) || gps_get_last(&g);
+                
+                battery_data_t battery;
+                float battery_v = 0.0f;
+                if (battery_read(&battery) == ESP_OK) {
+                    battery_v = battery.voltage;
                 }
-            } else if (send_ret == ESP_ERR_NOT_FOUND) {
-                if (button_wait_seconds % 30 == 0) {
-                    ESP_LOGW(TAG, "Waiting for LCD display connection... (%lu seconds)", 
-                             (unsigned long)button_wait_seconds);  // FIXED
-                }
+                
+                ESP_LOGI(TAG, "WAITING: Batt=%.2fV GPS=%s(%u sats)",
+                         battery_v,
+                         gps_valid ? "OK" : "NO_FIX",
+                         gps_valid ? g.num_satellites : 0);
+                
+                last_status_log = now_ticks;
             }
             
-            // Wait 100ms before next iteration (responsive button check)
-            vTaskDelay(pdMS_TO_TICKS(100));
-            button_wait_seconds++;
-            
-            // Log reminders every 60 seconds
-            if (button_wait_seconds % 600 == 0) {  // Every 60 seconds (600 * 100ms)
-                ESP_LOGI(TAG, "Still waiting for button press (%lu seconds elapsed)...", 
-                         (unsigned long)(button_wait_seconds / 10));
-                if (init_results[2]) {
-                    sdlog_printf("Button wait: %lu seconds", 
-                                 (unsigned long)(button_wait_seconds / 10));
-                }
-            }
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
-        
     } else {
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
@@ -1243,262 +1055,68 @@ void app_main(void){
     sdlog_printf("System ready - transmitting to LCD display via WiFi");
     
     // === Main Loop: Transmit Tracking Data to LCD Display ===
-    ESP_LOGI(TAG, "Entering WiFi data transmission loop (1 Hz)...");
+    ESP_LOGI(TAG, "Entering tracking monitor loop...");
     
-    uint32_t connection_wait_counter = 0;
-    
-    // Initialize previous values for delta calculation
-    float prev_azimuth = 0.0f;
-    float prev_elevation = 0.0f;
-    bool first_reading = true;
-    
-    // Track uptime since wake
     time_t boot_time = time(NULL);
     
     while (1) {
-        // Get current time
         time_t now = time(NULL);
-        uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
         
-        // Get current tracking position from tracking module
+        // Get tracking status
         float current_azimuth = 0.0f;
         float current_elevation = 0.0f;
         tracking_get_current_angles(&current_azimuth, &current_elevation);
         
-        // Calculate deltas (change since last transmission)
-        float delta_az = 0.0f;
-        float delta_elev = 0.0f;
-        if (!first_reading) {
-            delta_az = current_azimuth - prev_azimuth;
-            delta_elev = current_elevation - prev_elevation;
-            
-            // Handle azimuth wraparound (e.g., 359° -> 1° should be +2°, not -358°)
-            if (delta_az > 180.0f) delta_az -= 360.0f;
-            if (delta_az < -180.0f) delta_az += 360.0f;
-        }
-        first_reading = false;
-        
-        // Store current values for next iteration
-        prev_azimuth = current_azimuth;
-        prev_elevation = current_elevation;
-        
-        // Get GPS data and calculate fix age
+        // Get GPS data
         gps_data_t g = {0};
-        bool gps_fresh = gps_poll_nav_pvt(&g);
-        bool gps_valid = gps_fresh || gps_get_last(&g);
-        uint32_t gps_fix_age_sec = 0;
-        
-        if (gps_valid) {
-            // Calculate how long since last valid fix
-            gps_fix_age_sec = (uint32_t)(now - g.timestamp);
-            
-            // Warn if GPS data is stale (>5 minutes)
-            if (gps_fix_age_sec > 300) {
-                static uint32_t last_stale_warn = 0;
-                if ((now - last_stale_warn) >= 60) {
-                    ESP_LOGW(TAG, "GPS data stale: %lu seconds old", 
-                             (unsigned long)gps_fix_age_sec);  // FIXED
-                    last_stale_warn = now;
-                }
-                
-                // GPS STALE: Set LED to waiting/standby
-                if (gps_fix_age_sec > 600) {  // >10 minutes = error
-                    status_led_set_mode(LED_ERROR);
-                } else {  // 5-10 minutes = waiting
-                    status_led_set_mode(LED_WAITING);
-                }
-            }
-        } else {
-            // NO GPS AT ALL: Set LED to waiting/standby
-            status_led_set_mode(LED_WAITING);  // ADD THIS LINE
-            
-            static uint32_t last_no_gps_warn = 0;
-            if ((now - last_no_gps_warn) >= 30) {
-                ESP_LOGW(TAG, "No GPS fix - system in standby");
-                last_no_gps_warn = now;
-            }
-        }
-        
-        // Calculate sunrise/sunset times for today
-        uint32_t sunrise_time = 0;
-        uint32_t sunset_time = 0;
-        
-        if (gps_valid) {
-            solar_events_t events = solar_events(g.latitude, g.longitude, now);
-            if (events.has_sunrise) sunrise_time = (uint32_t)events.sunrise_utc;
-            if (events.has_sunset)  sunset_time  = (uint32_t)events.sunset_utc;
-            
-            // Log sunrise/sunset once per day at startup or midnight
-            static uint32_t last_event_log = 0;
-            if ((now - last_event_log) >= 86400 || last_event_log == 0) {
-                struct tm *sunrise_tm = localtime(&events.sunrise_utc);
-                struct tm *sunset_tm = localtime(&events.sunset_utc);
-                
-                ESP_LOGI(TAG, "Solar times: Sunrise %02d:%02d, Sunset %02d:%02d",
-                         sunrise_tm->tm_hour, sunrise_tm->tm_min,
-                         sunset_tm->tm_hour, sunset_tm->tm_min);
-                         
-                sdlog_printf("Today: sunrise %02d:%02d, sunset %02d:%02d",
-                             sunrise_tm->tm_hour, sunrise_tm->tm_min,
-                             sunset_tm->tm_hour, sunset_tm->tm_min);
-                             
-                last_event_log = now;
-            }
-        }
-        
-        // Get SD card status
-        uint8_t sd_status = sdlog_get_status();
-        
-        // Get number of WiFi clients connected to AP
-        uint8_t wifi_client_count = 0;
-        wifi_sta_list_t sta_list = {0};
-        if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
-            wifi_client_count = (uint8_t)sta_list.num;
-            
-            // Log client connections/disconnections
-            static uint8_t last_client_count = 0;
-            if (wifi_client_count != last_client_count) {
-                if (wifi_client_count > last_client_count) {
-                    ESP_LOGI(TAG, "LCD display connected (%u total clients)", wifi_client_count);
-                    sdlog_printf("Display connected (clients: %u)", wifi_client_count);
-                } else {
-                    ESP_LOGI(TAG, "LCD display disconnected (%u remaining)", wifi_client_count);
-                    sdlog_printf("Display disconnected (clients: %u)", wifi_client_count);
-                }
-                last_client_count = wifi_client_count;
-            }
-        }
-        
-        // Get sun position
-        sun_pos_t sun = solar_compute(
-            gps_valid ? g.latitude : 0.0, 
-            gps_valid ? g.longitude : 0.0, 
-            now
-        );
-        
-        // Calculate tracking error (how far off we are from sun)
-        float az_error = fabs(current_azimuth - sun.azimuth_deg);
-        float el_error = fabs(current_elevation - sun.elevation_deg);
-        if (az_error > 180.0f) az_error = 360.0f - az_error;  // Handle wraparound
-        uint8_t tracking_quality = (uint8_t)(fmax(az_error, el_error));
-        
-        // WiFi RSSI - not available in AP mode, set to default
-        int8_t rssi = -128;  // Default: no signal (we're the AP, not station)
-        
-        // Get move counters from tracking module
-        uint32_t moves_today = 0;
-        uint32_t total_moves = 0;
-        tracking_get_move_stats(&moves_today, &total_moves);
-        
-        // Get current LED status to determine system state
-        status_led_mode_t led_mode = status_led_get_mode();
-        uint8_t system_status = 1;  // Default: tracking
-        switch(led_mode) {
-            case LED_STARTUP:   system_status = 3; break;  // Calibrating
-            case LED_WAITING:   system_status = 0; break;  // Standby
-            case LED_TRACKING:  system_status = 1; break;  // Tracking
-            case LED_ERROR:     system_status = 255; break; // Error
-            case LED_SLEEP:     system_status = 2; break;  // Sleep
-            default:            system_status = 1; break;  // Default to tracking
-        }
+        bool gps_valid = gps_poll_nav_pvt(&g) || gps_get_last(&g);
+        uint32_t gps_fix_age_sec = gps_valid ? (uint32_t)(now - g.timestamp) : 9999;
         
         // Get battery data
         battery_data_t battery;
-        uint16_t battery_adc_raw = 0;
         float battery_v = 0.0f;
         float battery_soc = 0.0f;
-        uint8_t battery_soc_level = 0;
-        uint8_t battery_charging = 0;
-        
         if (battery_read(&battery) == ESP_OK) {
-            battery_adc_raw = battery.adc_raw;
             battery_v = battery.voltage;
             battery_soc = battery.soc_percent;
-            battery_soc_level = (uint8_t)battery.soc_level;
-            battery_charging = battery.is_charging ? 1 : 0;
-            
-            // Log battery status every 60 seconds
-            static uint32_t last_battery_log = 0;
-            if ((now - last_battery_log) >= 60) {
-                ESP_LOGI(TAG, "Battery: %.2fV (%.0f%% SOC) [%s] %s",
-                         battery.voltage, battery.soc_percent,
-                         battery_soc_level_to_string(battery.soc_level),
-                         battery.is_charging ? "CHARGING" : "DISCHARGING");
-                         
-                sdlog_printf("Battery: %.2fV %.0f%% %s ADC=%u",
-                             battery.voltage, battery.soc_percent,
-                             battery_get_status_string(&battery),
-                             battery.adc_raw);
-                             
-                last_battery_log = now;
-            }
-            
-            // Check for critical battery
-            if (battery_is_critical()) {
-                ESP_LOGE(TAG, "⚠ CRITICAL BATTERY VOLTAGE: %.2fV (%.0f%% SOC)", 
-                         battery.voltage, battery.soc_percent);
-                status_led_set_mode(LED_ERROR);
-                sdlog_printf("CRITICAL: Battery %.2fV %.0f%% - shutdown recommended", 
-                             battery.voltage, battery.soc_percent);
-            }
-        } else {
-            ESP_LOGW(TAG, "Battery read failed - using defaults");
         }
         
-        // Prepare data packet for LCD display with ALL new fields
-        tracker_data_t tx_data = {
-            .elevation = current_elevation,
-            .azimuth = current_azimuth,
-            .delta_elevation = delta_elev,
-            .delta_azimuth = delta_az,
-            .battery_adc = battery_adc_raw,
-            .battery_voltage = battery_v,
-            .battery_soc_percent = battery_soc,
-            .battery_soc = battery_soc_level,
-            .battery_charging = battery_charging,
-            .timestamp = (uint32_t)now,
-            .sunrise_time = sunrise_time,
-            .sunset_time = sunset_time,
-            .status = system_status,
-            .latitude = gps_valid ? (float)g.latitude : 0.0f,
-            .longitude = gps_valid ? (float)g.longitude : 0.0f,
-            .gps_valid = gps_valid ? 1 : 0,
-            .gps_satellites = gps_valid ? g.num_satellites : 0,
-            .last_gps_fix_age_sec = gps_fix_age_sec,
-            .sun_elevation = gps_valid ? (float)sun.elevation_deg : 0.0f,
-            .sun_azimuth = gps_valid ? (float)sun.azimuth_deg : 0.0f,
-            .moves_today = moves_today,
-            .total_moves = total_moves,
-            .uptime_hours = uptime_h,
-            .wifi_rssi = rssi,
-            .wifi_clients = wifi_client_count,
-            .sd_card_status = sd_status,
-            .tracking_quality = tracking_quality,
-        };
-        
-        // Send data over WiFi to LCD display
-        esp_err_t send_ret = wifi_comm_send_data(&tx_data);
-        if (send_ret == ESP_OK) {
-            // Enhanced log with new data
-            ESP_LOGI(TAG, "LCD[%u]: El=%.1f° Az=%.1f° Batt=%.2fV(%.0f%%) GPS=%lus SD=%u Sun[%.1f°,%.1f°]",
-                     wifi_client_count,
-                     tx_data.elevation, tx_data.azimuth,
-                     tx_data.battery_voltage, tx_data.battery_soc_percent,
-                     (unsigned long)gps_fix_age_sec,  // FIXED
-                     sd_status,
-                     tx_data.sun_elevation, tx_data.sun_azimuth);
-            connection_wait_counter = 0;
-        } else if (send_ret == ESP_ERR_NOT_FOUND) {
-            connection_wait_counter++;
-            if (connection_wait_counter % 10 == 0) {
-                ESP_LOGW(TAG, "Waiting for LCD display to connect... (%lu s)", 
-                         (unsigned long)connection_wait_counter);  // FIXED
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to send data: %s", esp_err_to_name(send_ret));
+        // Get sun position
+        sun_pos_t sun = {0};
+        if (gps_valid) {
+            sun = solar_compute(g.latitude, g.longitude, now);
         }
         
-        // Update once per second (1 Hz transmission rate)
+        // Log status every 10 seconds
+        static uint32_t last_log = 0;
+        if ((now - last_log) >= 10) {
+            ESP_LOGI(TAG, "TRACK: Panel[%.1f°,%.1f°] Sun[%.1f°,%.1f°] Batt=%.2fV(%.0f%%) GPS=%lus",
+                     current_elevation, current_azimuth,
+                     sun.elevation_deg, sun.azimuth_deg,
+                     battery_v, battery_soc,
+                     (unsigned long)gps_fix_age_sec);
+            
+            if (init_results[2]) {
+                sdlog_printf("Track: El=%.1f Az=%.1f Sun[%.1f,%.1f] Batt=%.2fV GPS=%lus",
+                             current_elevation, current_azimuth,
+                             sun.elevation_deg, sun.azimuth_deg,
+                             battery_v, (unsigned long)gps_fix_age_sec);
+            }
+            
+            last_log = now;
+        }
+        
+        // Check for stale GPS
+        if (gps_valid && gps_fix_age_sec > 300) {
+            status_led_set_mode(gps_fix_age_sec > 600 ? LED_ERROR : LED_WAITING);
+        }
+        
+        // Check for critical battery
+        if (battery_is_critical()) {
+            ESP_LOGE(TAG, "⚠ CRITICAL BATTERY: %.2fV", battery_v);
+            status_led_set_mode(LED_ERROR);
+        }
+        
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
