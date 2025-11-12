@@ -21,7 +21,7 @@
 
     Behavior:
     - sdlog_init mounts /sdcard using esp_vfs_fat_sdspi_mount.
-    - sdlog_printf appends timestamped lines to /sdcard/Sunflower.log.
+    - sdlog_printf appends timestamped lines to /sdcard/SUNFLOW.log.
     - sdlog_write_csv_header_if_new creates a CSV file with a single header row.
     - sdlog_write_csv appends single CSV rows matching tracker_data_t structure.
     - Logging is non-fatal: if SD is not mounted or a write fails, functions return quietly.
@@ -329,15 +329,15 @@ bool sdlog_init(const sdlog_cfg_t *cfg){
     sdlog_printf("Disk: %llu MB free / %llu MB total", s_free_space_mb, s_total_space_mb);
 
     ESP_LOGI(TAG, "✓ SD logging ready");
-    ESP_LOGI(TAG, "  Log file: /sdcard/Sunflower.log");
-    ESP_LOGI(TAG, "  CSV file: /sdcard/soltrac.csv");
+    ESP_LOGI(TAG, "  Log file: /sdcard/SUNFLOW.log");
+    ESP_LOGI(TAG, "  CSV file: /sdcard/SUNFLOW.csv");
     ESP_LOGI(TAG, "");
     
     return true;
 }
 
 /*
-    Append a timestamped line to /sdcard/Sunflower.log.
+    Append a timestamped line to /sdcard/SUNFLOW.log.
     Safe to call periodically; returns quietly if SD is not mounted.
 */
 void sdlog_printf(const char *fmt, ...){
@@ -348,9 +348,9 @@ void sdlog_printf(const char *fmt, ...){
 
     uint32_t start_tick = xTaskGetTickCount();
     
-    FILE *f = fopen("/sdcard/Sunflower.log", "a");
+    FILE *f = fopen("/sdcard/SUNFLOW.LOG", "a");  // CHANGED: 8.3 format
     if (!f) {
-        ESP_LOGW(TAG, "Failed to open Sunflower.log");
+        ESP_LOGW(TAG, "Failed to open SUNFLOW.LOG");
         s_failed_writes++;
         if (s_failed_writes > 3) {
             s_sd_status = SDLOG_STATUS_FAILED;

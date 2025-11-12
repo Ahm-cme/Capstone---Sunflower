@@ -5,6 +5,18 @@
 /*
     Solar Position & Events Module
 
+    Summary:
+    - Append-only logging to FAT filesystem mounted at /sdcard.
+    - Files are opened, written, flushed, and closed on each call.
+    - Two use cases: human-readable text log + CSV telemetry.
+    - Provides real-time health monitoring for display integration.
+
+    Files Created:
+    - /sdcard/SUNFLOW.LOG    - Human-readable timestamped events (8.3 format)
+    - /sdcard/SUNFLOW.CSV    - Machine-readable tracking telemetry (8.3 format)
+    
+    Note: Filenames use 8.3 format for maximum FAT32 compatibility
+
     What this module provides:
     - solar_compute: Calculate sun azimuth/elevation at any location and time
     - solar_events: Find sunrise/sunset times for any day and location

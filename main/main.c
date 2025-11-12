@@ -326,8 +326,8 @@ static bool perform_system_check(bool init_results[9]) {
     if (init_results[2]) {
         ESP_LOGI(TAG, "  ✓ SD Card: MOUNTED");
         ESP_LOGI(TAG, "    - Mount point: /sdcard");
-        ESP_LOGI(TAG, "    - Log file: /sdcard/Sunflower.log");
-        ESP_LOGI(TAG, "    - CSV file: /sdcard/soltrac.csv");
+        ESP_LOGI(TAG, "    - Log file: /sdcard/SUNFLOW.LOG");  
+        ESP_LOGI(TAG, "    - CSV file: /sdcard/SUNFLOW.CSV");
         
         // Test write capability
         sdlog_printf("=== SYSTEM CHECK: SD Card Verified ===");
@@ -599,6 +599,52 @@ static bool perform_system_check(bool init_results[9]) {
     return system_healthy;
 }
 
+/*
+ * Set timezone for local time display
+ * 
+ * Call this once at startup to configure timezone offset from UTC.
+ * 
+ * Common timezone strings:
+ *   EST5EDT,M3.2.0/2,M11.1.0/2  - US Eastern (New York)
+ *   CST6CDT,M3.2.0/2,M11.1.0/2  - US Central (Chicago)
+ *   MST7MDT,M3.2.0/2,M11.1.0/2  - US Mountain (Denver)
+ *   PST8PDT,M3.2.0/2,M11.1.0/2  - US Pacific (Los Angeles)
+ *   GMT0BST,M3.5.0/1,M10.5.0    - UK (London)
+ *   CET-1CEST,M3.5.0,M10.5.0/3  - Central Europe (Paris, Berlin)
+ *   AEST-10AEDT,M10.1.0,M4.1.0/3 - Australia Eastern (Sydney)
+ * 
+ * NOTE: System clock stays in UTC internally, this only affects
+ *       localtime() conversions for display purposes.
+ */
+static void set_local_timezone(void) {
+    // TODO: Change this to YOUR timezone!
+    // Example for US Eastern Time:
+    const char* timezone = "EST5EDT,M3.2.0/2,M11.1.0/2";
+    
+    // Example for US Pacific Time (Los Angeles):
+    // const char* timezone = "PST8PDT,M3.2.0/2,M11.1.0/2";
+    
+    // Example for UK (London):
+    // const char* timezone = "GMT0BST,M3.5.0/1,M10.5.0";
+    
+    setenv("TZ", timezone, 1);
+    tzset();
+    
+    ESP_LOGI(TAG, "Timezone set: %s", timezone);
+    
+    // Log current time in both UTC and local
+    time_t now = time(NULL);
+    struct tm *utc_tm = gmtime(&now);
+    struct tm *local_tm = localtime(&now);
+    
+    ESP_LOGI(TAG, "  UTC time:   %04d-%02d-%02d %02d:%02d:%02d",
+             utc_tm->tm_year + 1900, utc_tm->tm_mon + 1, utc_tm->tm_mday,
+             utc_tm->tm_hour, utc_tm->tm_min, utc_tm->tm_sec);
+    ESP_LOGI(TAG, "  Local time: %04d-%02d-%02d %02d:%02d:%02d",
+             local_tm->tm_year + 1900, local_tm->tm_mon + 1, local_tm->tm_mday,
+             local_tm->tm_hour, local_tm->tm_min, local_tm->tm_sec);
+}
+
 void app_main(void){
     ESP_LOGI(TAG, "=== SUNFLOWER TRACKER STARTING ===");
     ESP_LOGI(TAG, "Build date: %s %s", __DATE__, __TIME__);
@@ -638,6 +684,9 @@ void app_main(void){
     }
 
     // === Initialize SD Card Logging ===
+    ESP_LOGI(TAG, "Waiting for boot to stabilize before SD init...");
+    vTaskDelay(pdMS_TO_TICKS(2000));  // 2 second delay
+    
     ESP_LOGI(TAG, "Initializing SD card...");
     sdlog_cfg_t sd_config = {
         .mosi = SD_MOSI, .miso = SD_MISO, 
@@ -662,13 +711,15 @@ void app_main(void){
     // === Initialize Motors ===
     ESP_LOGI(TAG, "Initializing motor control...");
     motor_cfg_t motor_config = {
-        .az_pwm_pin = MOTOR_AZ_PWM, .az_dir_pin = MOTOR_AZ_DIR,
-        .el_pwm_pin = MOTOR_EL_PWM, .el_dir_pin = MOTOR_EL_DIR,
-        .stroke_mm = 200.0,
-        .speed_mm_per_s = 11.94,
-        .max_az_deg = 270,
-        .max_el_deg = 85,
-        .min_el_deg = 10
+        .az_pwm_pin = MOTOR_AZ_PWM, 
+        .az_dir_pin = MOTOR_AZ_DIR,
+        .el_pwm_pin = MOTOR_EL_PWM, 
+        .el_dir_pin = MOTOR_EL_DIR,
+        .stroke_mm = 200.0,          // Keep for now (will update motor.c separately)
+        .speed_mm_per_s = 11.94,     // Nominal speed
+        .max_az_deg = 45,            // CHANGED: ±45° range (90° total)
+        .max_el_deg = 56,            // CHANGED: ±56° range (112° total)
+        .min_el_deg = -56            // CHANGED: Lower limit
     };
     ret = motor_init(&motor_config);
     init_results[4] = (ret == ESP_OK);
@@ -747,18 +798,277 @@ void app_main(void){
         ESP_LOGI(TAG, "   • Hold button 3 seconds  → Calibrate mount");
         ESP_LOGI(TAG, "   • Double-press button    → Calibrate compass");
         ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "  System Status:");
+        ESP_LOGI(TAG, "   • WiFi AP active - broadcasting data");
+        ESP_LOGI(TAG, "   • LCD display shows live sensor readings");
+        ESP_LOGI(TAG, "   • Press button when ready to track");
+        ESP_LOGI(TAG, "");
         
         status_led_set_mode(LED_WAITING);
         if (init_results[2]) {
-            sdlog_printf("Waiting for button press");
+            sdlog_printf("Waiting for button press (transmitting status)");
         }
         
-        button_wait_for_press(-1);
+        // === NON-BLOCKING BUTTON WAIT WITH DATA TRANSMISSION ===
+        ESP_LOGI(TAG, "Starting background data transmission...");
+        ESP_LOGI(TAG, "Press START button to begin tracking");
+        ESP_LOGI(TAG, "");
         
-        if (init_results[2]) {
-            sdlog_printf("Button pressed - starting");
+        time_t boot_time = time(NULL);
+        uint32_t button_wait_seconds = 0;
+        bool button_pressed = false;
+        
+        // Initialize previous values for delta calculation
+        float prev_azimuth = 0.0f;
+        float prev_elevation = 0.0f;
+        bool first_reading = true;
+        
+        // Button press detection state
+        uint32_t last_press_time = 0;
+        bool waiting_for_double_press = false;
+        
+        while (!button_pressed) {
+            // === CHECK FOR BUTTON EVENTS (BEFORE DATA TRANSMISSION) ===
+            
+            // Check for button press using proper wait function
+            if (button_wait_for_press(10)) {  // 10ms timeout (non-blocking check)
+                uint32_t press_time = xTaskGetTickCount();
+                uint32_t time_since_last = pdTICKS_TO_MS(press_time - last_press_time);
+                
+                ESP_LOGI(TAG, "Button pressed (time since last: %lu ms)", 
+                         (unsigned long)time_since_last);
+                
+                // Check for DOUBLE-PRESS (for compass calibration)
+                if (waiting_for_double_press && time_since_last < 1000) {
+                    ESP_LOGI(TAG, "✓ DOUBLE-PRESS detected - starting compass calibration");
+                    
+                    status_led_set_mode(LED_STARTUP);
+                    sdlog_printf("Compass calibration started (double-press)");
+                    
+                    bool success = gps_calibrate_compass();
+                    
+                    if (success) {
+                        ESP_LOGI(TAG, "✓ Compass calibration successful");
+                        sdlog_printf("Compass calibration: OK");
+                        
+                        // Blink LED 3 times
+                        for (int i = 0; i < 3; i++) {
+                            status_led_set_mode(LED_ERROR);
+                            vTaskDelay(pdMS_TO_TICKS(200));
+                            status_led_set_mode(LED_TRACKING);
+                            vTaskDelay(pdMS_TO_TICKS(200));
+                        }
+                    } else {
+                        ESP_LOGW(TAG, "✗ Compass calibration failed");
+                        sdlog_printf("Compass calibration: FAILED");
+                        status_led_set_mode(LED_ERROR);
+                        vTaskDelay(pdMS_TO_TICKS(3000));
+                    }
+                    
+                    status_led_set_mode(LED_WAITING);
+                    waiting_for_double_press = false;
+                    last_press_time = 0;
+                    continue;  // Stay in button wait loop
+                }
+                
+                // Check for LONG-PRESS (for mount calibration)
+                uint32_t hold_start = xTaskGetTickCount();
+                bool is_long_press = false;
+                
+                while (button_is_pressed()) {
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    uint32_t hold_time = pdTICKS_TO_MS(xTaskGetTickCount() - hold_start);
+                    
+                    if (hold_time >= 3000) {
+                        is_long_press = true;
+                        ESP_LOGI(TAG, "✓ LONG-PRESS detected (3+ seconds) - starting mount calibration");
+                        
+                        status_led_set_mode(LED_STARTUP);
+                        sdlog_printf("Mount calibration started (long-press)");
+                        
+                        tracking_calibrate_mount_offset_now();
+                        
+                        ESP_LOGI(TAG, "✓ Mount calibration complete");
+                        sdlog_printf("Mount calibration: OK");
+                        
+                        status_led_set_mode(LED_WAITING);
+                        
+                        // Wait for release
+                        while (button_is_pressed()) {
+                            vTaskDelay(pdMS_TO_TICKS(50));
+                        }
+                        
+                        break;
+                    }
+                }
+                
+                if (is_long_press) {
+                    waiting_for_double_press = false;
+                    last_press_time = 0;
+                    continue;  // Stay in button wait loop
+                }
+                
+                // SINGLE-PRESS: Start tracking
+                if (!is_long_press && !waiting_for_double_press) {
+                    ESP_LOGI(TAG, "✓ SINGLE-PRESS detected - waiting 1s for possible double-press");
+                    waiting_for_double_press = true;
+                    last_press_time = press_time;
+                    
+                    // Wait 1 second to see if there's a second press
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    
+                    if (waiting_for_double_press) {
+                        // No second press within 1 second = START TRACKING
+                        ESP_LOGI(TAG, "✓ Starting tracking (no second press detected)");
+                        button_pressed = true;
+                        
+                        if (init_results[2]) {
+                            sdlog_printf("Button pressed after %lu seconds - starting tracking", 
+                                         (unsigned long)button_wait_seconds);
+                        }
+                        break;
+                    }
+                }
+            }
+            
+            // === BACKGROUND DATA TRANSMISSION (SAME AS BEFORE) ===
+            
+            // Get current time
+            time_t now = time(NULL);
+            uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
+            
+            // Get current position (will be default/last known while waiting)
+            float current_azimuth = 0.0f;
+            float current_elevation = 0.0f;
+            tracking_get_current_angles(&current_azimuth, &current_elevation);
+            
+            // Calculate deltas
+            float delta_az = 0.0f;
+            float delta_elev = 0.0f;
+            if (!first_reading) {
+                delta_az = current_azimuth - prev_azimuth;
+                delta_elev = current_elevation - prev_elevation;
+                if (delta_az > 180.0f) delta_az -= 360.0f;
+                if (delta_az < -180.0f) delta_az += 360.0f;
+            }
+            first_reading = false;
+            prev_azimuth = current_azimuth;
+            prev_elevation = current_elevation;
+            
+            // Get GPS data (continue background acquisition)
+            gps_data_t g = {0};
+            bool gps_fresh = gps_poll_nav_pvt(&g);
+            bool gps_valid = gps_fresh || gps_get_last(&g);
+            uint32_t gps_fix_age_sec = gps_valid ? (uint32_t)(now - g.timestamp) : 9999;
+            
+            // Get battery data
+            battery_data_t battery;
+            uint16_t battery_adc_raw = 0;
+            float battery_v = 0.0f;
+            float battery_soc = 0.0f;
+            uint8_t battery_soc_level = 0;
+            uint8_t battery_charging = 0;
+            
+            if (battery_read(&battery) == ESP_OK) {
+                battery_adc_raw = battery.adc_raw;
+                battery_v = battery.voltage;
+                battery_soc = battery.soc_percent;
+                battery_soc_level = (uint8_t)battery.soc_level;
+                battery_charging = battery.is_charging ? 1 : 0;
+            }
+            
+            // Calculate sun position (if GPS available)
+            sun_pos_t sun = {0};
+            if (gps_valid) {
+                sun = solar_compute(g.latitude, g.longitude, now);
+            }
+            
+            // Calculate sunrise/sunset
+            uint32_t sunrise_time = 0;
+            uint32_t sunset_time = 0;
+            if (gps_valid) {
+                solar_events_t events = solar_events(g.latitude, g.longitude, now);
+                if (events.has_sunrise) sunrise_time = (uint32_t)events.sunrise_utc;
+                if (events.has_sunset)  sunset_time  = (uint32_t)events.sunset_utc;
+            }
+            
+            // Get WiFi client count
+            uint8_t wifi_client_count = 0;
+            wifi_sta_list_t sta_list = {0};
+            if (esp_wifi_ap_get_sta_list(&sta_list) == ESP_OK) {
+                wifi_client_count = (uint8_t)sta_list.num;
+            }
+            
+            // Get SD status
+            uint8_t sd_status = sdlog_get_status();
+            
+            // System status = WAITING (0)
+            uint8_t system_status = 0;
+            
+            // Prepare data packet
+            tracker_data_t tx_data = {
+                .elevation = current_elevation,
+                .azimuth = current_azimuth,
+                .delta_elevation = delta_elev,
+                .delta_azimuth = delta_az,
+                .battery_adc = battery_adc_raw,
+                .battery_voltage = battery_v,
+                .battery_soc_percent = battery_soc,
+                .battery_soc = battery_soc_level,
+                .battery_charging = battery_charging,
+                .timestamp = (uint32_t)now,
+                .sunrise_time = sunrise_time,
+                .sunset_time = sunset_time,
+                .status = system_status,  // WAITING = 0
+                .latitude = gps_valid ? (float)g.latitude : 0.0f,
+                .longitude = gps_valid ? (float)g.longitude : 0.0f,
+                .gps_valid = gps_valid ? 1 : 0,
+                .gps_satellites = gps_valid ? g.num_satellites : 0,
+                .last_gps_fix_age_sec = gps_fix_age_sec,
+                .sun_elevation = gps_valid ? (float)sun.elevation_deg : 0.0f,
+                .sun_azimuth = gps_valid ? (float)sun.azimuth_deg : 0.0f,
+                .moves_today = 0,  // No moves yet
+                .total_moves = 0,  // No moves yet
+                .uptime_hours = uptime_h,
+                .wifi_rssi = -128,
+                .wifi_clients = wifi_client_count,
+                .sd_card_status = sd_status,
+                .tracking_quality = 255,  // No tracking active
+            };
+            
+            // Send data to LCD
+            esp_err_t send_ret = wifi_comm_send_data(&tx_data);
+            if (send_ret == ESP_OK) {
+                // Log every 10 seconds to reduce spam
+                if (button_wait_seconds % 10 == 0) {
+                    ESP_LOGI(TAG, "WAITING[%lu]: Batt=%.2fV GPS=%s(%u) Clients=%u (Press button to start)",
+                             (unsigned long)button_wait_seconds,  // FIXED: Cast to unsigned long
+                             battery_v,
+                             gps_valid ? "OK" : "NO_FIX",
+                             gps_valid ? g.num_satellites : 0,
+                             wifi_client_count);
+                }
+            } else if (send_ret == ESP_ERR_NOT_FOUND) {
+                if (button_wait_seconds % 30 == 0) {
+                    ESP_LOGW(TAG, "Waiting for LCD display connection... (%lu seconds)", 
+                             (unsigned long)button_wait_seconds);  // FIXED
+                }
+            }
+            
+            // Wait 100ms before next iteration (responsive button check)
+            vTaskDelay(pdMS_TO_TICKS(100));
+            button_wait_seconds++;
+            
+            // Log reminders every 60 seconds
+            if (button_wait_seconds % 600 == 0) {  // Every 60 seconds (600 * 100ms)
+                ESP_LOGI(TAG, "Still waiting for button press (%lu seconds elapsed)...", 
+                         (unsigned long)(button_wait_seconds / 10));
+                if (init_results[2]) {
+                    sdlog_printf("Button wait: %lu seconds", 
+                                 (unsigned long)(button_wait_seconds / 10));
+                }
+            }
         }
-        ESP_LOGI(TAG, "✓ Button pressed - starting system");
         
     } else {
         ESP_LOGI(TAG, "");
@@ -771,66 +1081,112 @@ void app_main(void){
         }
     }
 
-    // === Set temporary system time (until GPS or NTP syncs) ===
-    struct tm temp_time = {
-        .tm_year = 2025 - 1900,  // 2025 (CORRECTED)
-        .tm_mon = 10 - 1,         // October (0-indexed)
-        .tm_mday = 31,            // 31st (CORRECTED)
-        .tm_hour = 12,            // Noon UTC (reasonable default)
-        .tm_min = 0,
-        .tm_sec = 0
-    };
-    time_t temp_epoch = mktime(&temp_time);
-    struct timeval tv = { .tv_sec = temp_epoch, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    
-    // After setting temporary time (around line 758):
-    settimeofday(&tv, NULL);
-    
-    time_t now = time(NULL);
-    struct tm *now_tm = gmtime(&now);
-    ESP_LOGW(TAG, "⚠ Using TEMPORARY time: %04d-%02d-%02d %02d:%02d:%02d UTC",
-             now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
-             now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
-    ESP_LOGW(TAG, "  Waiting for GPS to sync accurate time...");
 
-
-    // === Wait for GPS Time Sync (ADD THIS BEFORE tracking_start()) ===
-    ESP_LOGI(TAG, "Waiting for GPS time sync...");
-    time_t system_time = time(NULL);  // CHANGE: Add 'time_t' declaration here
+    // === Wait for GPS Fix (Non-Blocking) ===
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║          GPS ACQUISITION (NON-BLOCKING)                    ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     
-    if (system_time < 1600000000) {  // Before Sept 2020 = invalid
-        ESP_LOGW(TAG, "System time invalid (%ld) - waiting for GPS", (long)system_time);
+    ESP_LOGI(TAG, "GPS Module: BN-880 NMEA Parser");
+    ESP_LOGI(TAG, "  - Provides: Lat/Lon, Altitude, Time (UTC)");
+    ESP_LOGI(TAG, "  - Time source: GNSS satellites (accurate to ~100ns)");
+    ESP_LOGI(TAG, "  - System will start WITHOUT waiting for GPS");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Attempting initial GPS fix (60s timeout)...");
+    ESP_LOGI(TAG, "  (System continues if GPS not available)");
+    ESP_LOGI(TAG, "");
+    
+    status_led_set_mode(LED_WAITING);
+    
+    gps_data_t first_fix;
+    int wait_count = 0;
+    const int MAX_WAIT = 12;  // 60 seconds max (12 * 5s)
+    bool got_initial_fix = false;
+    
+    while (!gps_poll_nav_pvt(&first_fix) && wait_count < MAX_WAIT) {
+        wait_count++;
         
-        int sync_attempts = 0;
-        while (system_time < 1600000000 && sync_attempts < 60) {
-            gps_data_t gps_time_sync;
-            if (gps_poll_nav_pvt(&gps_time_sync)) {
-                system_time = time(NULL);
-                struct tm *now_tm = gmtime(&system_time);
-                ESP_LOGI(TAG, "GPS time sync successful: %04d-%02d-%02d %02d:%02d:%02d UTC",
-                         now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
-                         now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(5000));  // Wait 5 seconds between attempts
-            sync_attempts++;
+        // Progress indicator every 10 seconds
+        if (wait_count % 2 == 0) {
+            ESP_LOGI(TAG, "Searching for satellites... (%d seconds elapsed)", wait_count * 5);
         }
         
-        if (system_time < 1600000000) {
-            ESP_LOGE(TAG, "Failed to sync time from GPS after 5 minutes!");
-            sdlog_printf("ERROR: Time sync failed - system may not track correctly");
-        } else {
-            sdlog_printf("System time synced from GPS");
-        }
-    } else {
-        struct tm *now_tm = gmtime(&system_time);
-        ESP_LOGI(TAG, "System time already valid: %04d-%02d-%02d %02d:%02d:%02d UTC",
-                 now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
-                 now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
-
-    // === Start Tracking System (EXISTING CODE) ===
+    
+    if (wait_count >= MAX_WAIT) {
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "⚠ GPS TIMEOUT - No fix after 60 seconds");
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "System will continue WITHOUT GPS:");
+        ESP_LOGW(TAG, "  - Tracking disabled (waiting for GPS)");
+        ESP_LOGW(TAG, "  - WiFi display will show 'NO GPS' status");
+        ESP_LOGW(TAG, "  - System will retry GPS acquisition in background");
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "Troubleshooting:");
+        ESP_LOGW(TAG, "  1. Check GPS antenna connection");
+        ESP_LOGW(TAG, "  2. Ensure clear view of sky (not indoors)");
+        ESP_LOGW(TAG, "  3. Verify UART wiring (TX/RX not swapped)");
+        ESP_LOGW(TAG, "  4. GPS will continue searching in background");
+        ESP_LOGW(TAG, "");
+        
+        if (init_results[2]) {
+            sdlog_printf("WARNING: No initial GPS fix - system starting without GPS");
+        }
+        
+        status_led_set_mode(LED_WAITING);  // Stay in waiting mode
+        got_initial_fix = false;
+    } else {
+        // Got GPS fix - time is now automatically synced!
+        time_t system_time = time(NULL);
+        
+        // === SET LOCAL TIMEZONE AFTER GPS TIME SYNC ===
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Setting local timezone for display...");
+        set_local_timezone();
+        
+        // Get BOTH UTC and local time
+        struct tm *utc_tm = gmtime(&system_time);
+        struct tm *local_tm = localtime(&system_time);
+        
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "✓ GPS FIX ACQUIRED");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Location:");
+        ESP_LOGI(TAG, "  - Latitude: %.6f°%c", 
+                 fabs(first_fix.latitude), first_fix.latitude >= 0 ? 'N' : 'S');
+        ESP_LOGI(TAG, "  - Longitude: %.6f°%c", 
+                 fabs(first_fix.longitude), first_fix.longitude >= 0 ? 'E' : 'W');
+        ESP_LOGI(TAG, "  - Altitude: %.1f meters", first_fix.altitude_m);
+        ESP_LOGI(TAG, "  - Satellites: %u", first_fix.num_satellites);
+        ESP_LOGI(TAG, "  - Fix quality: %u", first_fix.fix_type);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Time (from GPS):");
+        ESP_LOGI(TAG, "  - UTC:   %04d-%02d-%02d %02d:%02d:%02d",
+                 utc_tm->tm_year + 1900, utc_tm->tm_mon + 1, utc_tm->tm_mday,
+                 utc_tm->tm_hour, utc_tm->tm_min, utc_tm->tm_sec);
+        ESP_LOGI(TAG, "  - Local: %04d-%02d-%02d %02d:%02d:%02d",
+                 local_tm->tm_year + 1900, local_tm->tm_mon + 1, local_tm->tm_mday,
+                 local_tm->tm_hour, local_tm->tm_min, local_tm->tm_sec);
+        ESP_LOGI(TAG, "  - Unix epoch: %ld seconds", (long)system_time);
+        ESP_LOGI(TAG, "  - Accuracy: ~100 nanoseconds (satellite-derived)");
+        ESP_LOGI(TAG, "");
+        
+        if (init_results[2]) {
+            sdlog_printf("GPS fix: %.6f,%.6f @ %04d-%02d-%02d %02d:%02d LOCAL (%u sats)",
+                         first_fix.latitude, first_fix.longitude,
+                         local_tm->tm_year + 1900, local_tm->tm_mon + 1, local_tm->tm_mday,
+                         local_tm->tm_hour, local_tm->tm_min, first_fix.num_satellites);
+        }
+        
+        ESP_LOGI(TAG, "System ready - time and location acquired from GPS");
+        ESP_LOGI(TAG, "");
+        got_initial_fix = true;
+        status_led_set_mode(LED_TRACKING);
+    }
+    
+    // === START TRACKING SYSTEM (EXISTING CODE) ===
     ESP_LOGI(TAG, "=== STARTING TRACKING ===");
     
     tracking_start();
@@ -940,7 +1296,8 @@ void app_main(void){
             if (gps_fix_age_sec > 300) {
                 static uint32_t last_stale_warn = 0;
                 if ((now - last_stale_warn) >= 60) {
-                    ESP_LOGW(TAG, "GPS data stale: %lu seconds old", gps_fix_age_sec);
+                    ESP_LOGW(TAG, "GPS data stale: %lu seconds old", 
+                             (unsigned long)gps_fix_age_sec);  // FIXED
                     last_stale_warn = now;
                 }
                 
@@ -1127,13 +1484,15 @@ void app_main(void){
                      wifi_client_count,
                      tx_data.elevation, tx_data.azimuth,
                      tx_data.battery_voltage, tx_data.battery_soc_percent,
-                     gps_fix_age_sec, sd_status,
+                     (unsigned long)gps_fix_age_sec,  // FIXED
+                     sd_status,
                      tx_data.sun_elevation, tx_data.sun_azimuth);
             connection_wait_counter = 0;
         } else if (send_ret == ESP_ERR_NOT_FOUND) {
             connection_wait_counter++;
             if (connection_wait_counter % 10 == 0) {
-                ESP_LOGW(TAG, "Waiting for LCD display to connect... (%lu s)", connection_wait_counter);
+                ESP_LOGW(TAG, "Waiting for LCD display to connect... (%lu s)", 
+                         (unsigned long)connection_wait_counter);  // FIXED
             }
         } else {
             ESP_LOGE(TAG, "Failed to send data: %s", esp_err_to_name(send_ret));

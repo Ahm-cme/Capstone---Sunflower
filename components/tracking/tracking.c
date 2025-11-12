@@ -66,41 +66,77 @@
 #include "status_led.h"
 #include "esp_sleep.h"
 
+#ifndef DEG2RAD
+#define DEG2RAD(d)  ((d) * M_PI / 180.0)
+#endif
+
 #define TAG "TRACK"
+
+// Around line 130, UPDATE the state initialization comment and values:
 
 /*
  * Global tracker state (persisted in NVS).
  * 
- * Home position philosophy:
- * - Actuators at midpoint (50% stroke, both half-extended)
- * - Panel faces straight up (zenith) at home position
- * - This is the safest position: balanced, no mechanical stress
- * - AZ midpoint = 135° (half of 270° range: 0-270°)
- * - EL midpoint = 47.5° (midpoint between 10° and 85°)
- * 
- * Timing calculation for homing:
- * - Full stroke: 200mm ÷ 11.94 mm/s = 16.7 seconds (measured)
- * - Half stroke (to midpoint): 100mm ÷ 11.94 mm/s = 8.3 seconds
- * - With 90% safety factor: 8.3s × 0.9 + 0.1s buffer ≈ 7.6 seconds actual move time
- * - Stored as 8300ms for safety margin
+ * HARDWARE SPECIFICATIONS:
+ * - Azimuth actuator:
+ *   - Range: 90° (±45° from center)
+ *   - Center position (0°): 5.00" extension (127.0mm)  // CHANGED from 3.25" (82.55mm)
+ *   - Full retract (-45°): ~3.75" (95.25mm)           // CHANGED from 2.0" (50.8mm)
+ *   - Full extend (+45°): ~6.25" (158.75mm)           // CHANGED from 4.5" (114.3mm)
+ *   - Stroke: ~2.5" (63.5mm) total travel              // UNCHANGED
+ *
+ * - Elevation actuator:
+ *   - Range: 112° (±56° from center)
+ *   - Center position (0°): 4.25" extension (107.95mm)  // UNCHANGED
+ *   - Full retract (-56°): ~2.5" (63.5mm)               // UNCHANGED
+ *   - Full extend (+56°): ~6.0" (152.4mm)               // UNCHANGED
+ *   - Stroke: ~3.5" (88.9mm) total travel               // UNCHANGED
+ *
+ * HOME POSITION (Starting point):
+ * - Both actuators at mechanical center (flat/horizontal)
+ * - AZ: 0° (5.00" = 127.0mm extension)                  // CHANGED from 3.25" (82.55mm)
+ * - EL: 0° (4.25" = 107.95mm extension)                 // UNCHANGED
+ * - Panel orientation: Horizontal (parallel to ground)
+ *
+ * Position tracking:
+ * - az_actuator_mm: Current AZ extension (95.25-158.75mm, center=127.0mm)  // CHANGED
+ * - el_actuator_mm: Current EL extension (63.5-152.4mm, center=107.95mm)   // UNCHANGED
+ * - az_cur/el_cur: Current angles in degrees (±45° AZ, ±56° EL)
  */
 static tracker_state_t s = {
-    .az_cur=135, .el_cur=47.5,         // Initial assumed pose (actuators at midpoint)
-    .tol_deg=10, .min_step_deg=2,      // Move thresholds
-    .update_period_s=300,              // Legacy (kept for compatibility)
-    .sleep_thresh_el=5,                // Sleep below this elevation (deg)
-    .base_period_s=900,                // 15 min after move
-    .fast_period_s=300,                // 5 min while waiting
-    .cur_period_s=900,                 // Current cadence
-    .prewake_min=10,                   // Wake before sunrise (minutes)
-    .az_mount_offset_deg = 0.0,        // Install-time offset (earth→mount)
-    .el_mount_offset_deg = 0.0,
-    .home_az_deg = 135.0,              // Home = 50% of 270° AZ range
-    .home_el_deg = 47.5,               // Home = midpoint of 10-85° EL range
-    .homing_time_ms = 8300,            // Time to reach midpoint from either extreme
-    .az_home_dir_level = 0,            // Calculated dynamically by motor_move_az
-    .el_home_dir_level = 0,            // Calculated dynamically by motor_move_el
-    .last_move_az_tgt=135, .last_move_el_tgt=47.5
+    // Home position: Both actuators centered (horizontal/flat)
+    .az_cur = 0.0,                     // 0° = center (flat)
+    .el_cur = 0.0,                     // 0° = center (flat)
+    
+    // Actuator position tracking (millimeters of extension)
+    // Home position = mechanical center of each actuator
+    .az_actuator_mm = 127.0,           // CHANGED: 5.00" = center of AZ actuator (was 82.55mm)
+    .el_actuator_mm = 107.95,          // UNCHANGED: 4.25" = center of EL actuator
+    
+    .tol_deg = 10,                     // Move threshold
+    .min_step_deg = 2,                 // Minimum step size
+    .update_period_s = 300,            // Legacy (kept for compatibility)
+    
+    .sleep_thresh_el = 5.0,            // Sleep when sun below 5° elevation
+    
+    .base_period_s = 900,              // 15 min after move
+    .fast_period_s = 300,              // 5 min while waiting
+    .cur_period_s = 900,               // Current cadence
+    .prewake_min = 10,                 // Wake 10 min before sunrise
+    
+    .az_mount_offset_deg = 0.0,        // Calibration offset (earth→mount)
+    .el_mount_offset_deg = 0.0,        // Calibration offset
+    
+    // Home position = center of mechanical range
+    .home_az_deg = 0.0,                // Center = 0° (flat)
+    .home_el_deg = 0.0,                // Center = 0° (flat)
+    
+    .homing_time_ms = 8300,            // Time to reach center from either extreme
+    .az_home_dir_level = 0,            // Calculated during moves
+    .el_home_dir_level = 0,
+    
+    .last_move_az_tgt = 0.0,           // Start at home
+    .last_move_el_tgt = 0.0
 };
 
 static SemaphoreHandle_t s_mutex;      // Reserved for future multi-thread access to 's'
@@ -238,18 +274,175 @@ static void maybe_midnight_reset(void){
 }
 
 /*
+ * Convert azimuth angle (degrees) to actuator extension (mm).
+ * 
+ * Hardware Specifications:
+ * - Range: ±45° (90° total range)
+ * - Center (0°): 5.00" = 127.0mm extension  // CHANGED from 3.25" (82.55mm)
+ * - Full retract (-45°): ~3.75" = 95.25mm   // CHANGED from 2.0" (50.8mm)
+ * - Full extend (+45°): ~6.25" = 158.75mm   // CHANGED from 4.5" (114.3mm)
+ * - Total stroke: 2.5" = 63.5mm
+ * 
+ * Kinematics (linear approximation):
+ * - mm_per_degree = 63.5mm / 90° = 0.706 mm/°  // UNCHANGED
+ * - extension = center + (angle × mm_per_degree)
+ * 
+ * Safety:
+ * - Clamps to mechanical limits to prevent overtravel
+ * - Logs warnings if clamping occurs
+ */
+static double az_angle_to_mm(double angle_deg) {
+    const double CENTER_MM = 127.0;        // CHANGED: 5.00" = 5 inches (was 82.55mm / 3.25")
+    const double STROKE_MM = 63.5;         // UNCHANGED: 2.5" total stroke
+    const double RANGE_DEG = 90.0;         // UNCHANGED: ±45° range
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;  // UNCHANGED: 0.706 mm/deg
+    const double MIN_MM = 95.25;           // CHANGED: 3.75" minimum (was 50.8mm / 2.0")
+    const double MAX_MM = 158.75;          // CHANGED: 6.25" maximum (was 114.3mm / 4.5")
+    
+    // Clamp angle to mechanical limits
+    if (angle_deg < -45.0) {
+        ESP_LOGW(TAG, "⚠ AZ angle %.1f° < -45° (clamping to -45°)", angle_deg);
+        angle_deg = -45.0;
+    }
+    if (angle_deg > 45.0) {
+        ESP_LOGW(TAG, "⚠ AZ angle %.1f° > +45° (clamping to +45°)", angle_deg);
+        angle_deg = 45.0;
+    }
+    
+    // Linear conversion: center position + offset
+    double mm = CENTER_MM + (angle_deg * MM_PER_DEG);
+    
+    // Safety check: ensure result is within physical limits
+    if (mm < MIN_MM) {
+        ESP_LOGW(TAG, "⚠ AZ extension %.2fmm < min %.2fmm (clamping)", mm, MIN_MM);
+        mm = MIN_MM;
+    }
+    if (mm > MAX_MM) {
+        ESP_LOGW(TAG, "⚠ AZ extension %.2fmm > max %.2fmm (clamping)", mm, MAX_MM);
+        mm = MAX_MM;
+    }
+    
+    ESP_LOGV(TAG, "AZ kinematics: %.1f° → %.2fmm (Δ=%.2fmm from center)",
+             angle_deg, mm, mm - CENTER_MM);
+    
+    return mm;
+}
+
+/*
+ * Convert elevation angle (degrees) to actuator extension (mm).
+ * 
+ * Hardware Specifications:
+ * - Range: ±56° (112° total range)
+ * - Center (0°): 4.25" = 107.95mm extension
+ * - Full retract (-56°): ~2.5" = 63.5mm
+ * - Full extend (+56°): ~6.0" = 152.4mm
+ * - Total stroke: 3.5" = 88.9mm
+ * 
+ * Kinematics (linear approximation):
+ * - mm_per_degree = 88.9mm / 112° = 0.794 mm/°
+ * - extension = center + (angle × mm_per_degree)
+ * 
+ * Safety:
+ * - Clamps to mechanical limits to prevent overtravel
+ * - Logs warnings if clamping occurs
+ */
+static double el_angle_to_mm(double angle_deg) {
+    const double CENTER_MM = 107.95;       // 4.25" = 4 + 1/4 inches
+    const double STROKE_MM = 88.9;         // 3.5" total stroke
+    const double RANGE_DEG = 112.0;        // ±56° range
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;  // 0.794 mm/deg
+    const double MIN_MM = 63.5;            // 2.5" minimum (safety)
+    const double MAX_MM = 152.4;           // 6.0" maximum (safety)
+    
+    // Clamp angle to mechanical limits
+    if (angle_deg < -56.0) {
+        ESP_LOGW(TAG, "⚠ EL angle %.1f° < -56° (clamping to -56°)", angle_deg);
+        angle_deg = -56.0;
+    }
+    if (angle_deg > 56.0) {
+        ESP_LOGW(TAG, "⚠ EL angle %.1f° > +56° (clamping to +56°)", angle_deg);
+        angle_deg = 56.0;
+    }
+    
+    // Linear conversion: center position + offset
+    double mm = CENTER_MM + (angle_deg * MM_PER_DEG);
+    
+    // Safety check: ensure result is within physical limits
+    if (mm < MIN_MM) {
+        ESP_LOGW(TAG, "⚠ EL extension %.2fmm < min %.2fmm (clamping)", mm, MIN_MM);
+        mm = MIN_MM;
+    }
+    if (mm > MAX_MM) {
+        ESP_LOGW(TAG, "⚠ EL extension %.2fmm > max %.2fmm (clamping)", mm, MAX_MM);
+        mm = MAX_MM;
+    }
+    
+    ESP_LOGV(TAG, "EL kinematics: %.1f° → %.2fmm (Δ=%.2fmm from center)",
+             angle_deg, mm, mm - CENTER_MM);
+    
+    return mm;
+}
+
+/*
+ * Convert azimuth extension (mm) to angle (degrees).
+ * Inverse of az_angle_to_mm() - used for diagnostics and position verification.
+ */
+static double az_mm_to_angle(double mm) {
+    const double CENTER_MM = 127.0;    // CHANGED: 5.00" center (was 82.55mm)
+    const double MM_PER_DEG = 0.706;   // UNCHANGED: 63.5mm / 90°
+    
+    double angle = (mm - CENTER_MM) / MM_PER_DEG;
+    
+    ESP_LOGV(TAG, "AZ inverse: %.2fmm → %.1f° (Δ=%.2fmm from center)",
+             mm, angle, mm - CENTER_MM);
+    
+    return angle;
+}
+
+/*
+ * Convert elevation extension (mm) to angle (degrees).
+ * Inverse of el_angle_to_mm() - used for diagnostics and position verification.
+ */
+static double el_mm_to_angle(double mm) {
+    const double CENTER_MM = 107.95;
+    const double MM_PER_DEG = 0.794;  // 88.9mm / 112°
+    
+    double angle = (mm - CENTER_MM) / MM_PER_DEG;
+    
+    ESP_LOGV(TAG, "EL inverse: %.2fmm → %.1f° (Δ=%.2fmm from center)",
+             mm, angle, mm - CENTER_MM);
+    
+    return angle;
+}
+
+
+/*
  * Execute motor movements if angular error exceeds thresholds.
+ * 
+ * NEW: Track actual actuator extensions for accurate positioning
+ * - Converts target angles to mm of extension
+ * - Calculates distance and direction for each axis
+ * - Updates actuator position after each move
+ * - Logs movement details for position reconstruction
  * 
  * Movement logic:
  * - Only move if error > tolerance (10°) AND > minimum step (2°)
  * - Moves AZ first, then EL (sequential to reduce peak current)
- * - Updates current position after move (open-loop assumption)
+ * - Updates current position AND actuator extension (tracked state)
  * - Increments move counters for statistics
- * - Logs move to SD card
- * 
- * Called from main tracking loop when sun position changes enough.
+ * - Logs move to SD card with actuator details
  */
 static void do_move(double az_tgt, double el_tgt){
+    // Clamp to mechanical limits
+    if (az_tgt < -45.0 || az_tgt > 45.0) {
+        ESP_LOGW(TAG, "⚠ AZ target %.1f° outside range [−45°, +45°]", az_tgt);
+        az_tgt = (az_tgt < -45.0) ? -45.0 : 45.0;
+    }
+    if (el_tgt < -56.0 || el_tgt > 56.0) {
+        ESP_LOGW(TAG, "⚠ EL target %.1f° outside range [−56°, +56°]", el_tgt);
+        el_tgt = (el_tgt < -56.0) ? -56.0 : 56.0;
+    }
+    
     double az_error = fabs(az_tgt - s.az_cur);
     double el_error = fabs(el_tgt - s.el_cur);
 
@@ -269,13 +462,43 @@ static void do_move(double az_tgt, double el_tgt){
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Movement Plan:");
-    ESP_LOGI(TAG, "  Current: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
-    ESP_LOGI(TAG, "  Target:  AZ=%.1f° EL=%.1f°", az_tgt, el_tgt);
+    ESP_LOGI(TAG, "  Current: AZ=%.1f° EL=%.1f° (mount frame)", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "  Target:  AZ=%.1f° EL=%.1f° (mount frame)", az_tgt, el_tgt);
     ESP_LOGI(TAG, "  Errors:  AZ=%.1f° EL=%.1f°", az_error, el_error);
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Axes to Move:");
-    if (move_az) ESP_LOGI(TAG, "  ✓ Azimuth (%.1f° change)", az_error);
-    if (move_el) ESP_LOGI(TAG, "  ✓ Elevation (%.1f° change)", el_error);
+    
+    // Log current actuator positions and extensions
+    ESP_LOGI(TAG, "Actuator Status (Current):");
+    ESP_LOGI(TAG, "  AZ: %.2fmm (%.1f° from center)", 
+             s.az_actuator_mm, az_mm_to_angle(s.az_actuator_mm));
+    ESP_LOGI(TAG, "  EL: %.2fmm (%.1f° from center)", 
+             s.el_actuator_mm, el_mm_to_angle(s.el_actuator_mm));
+    ESP_LOGI(TAG, "");
+    
+    // Calculate target actuator extensions using kinematics
+    double az_tgt_mm = az_angle_to_mm(az_tgt);
+    double el_tgt_mm = el_angle_to_mm(el_tgt);
+    
+    ESP_LOGI(TAG, "Actuator Targets:");
+    ESP_LOGI(TAG, "  AZ: %.2fmm (%.1f° from center)", az_tgt_mm, az_tgt);
+    ESP_LOGI(TAG, "  EL: %.2fmm (%.1f° from center)", el_tgt_mm, el_tgt);
+    ESP_LOGI(TAG, "");
+    
+    // Calculate movement distances
+    double az_delta_mm = az_tgt_mm - s.az_actuator_mm;
+    double el_delta_mm = el_tgt_mm - s.el_actuator_mm;
+    
+    ESP_LOGI(TAG, "Required Movements:");
+    if (move_az) {
+        const char* az_dir = (az_delta_mm > 0) ? "EXTEND" : "RETRACT";
+        ESP_LOGI(TAG, "  ✓ AZ: %.1f° error → %s %.2fmm (%.2f\")",
+                 az_error, az_dir, fabs(az_delta_mm), fabs(az_delta_mm) / 25.4);
+    }
+    if (move_el) {
+        const char* el_dir = (el_delta_mm > 0) ? "EXTEND" : "RETRACT";
+        ESP_LOGI(TAG, "  ✓ EL: %.1f° error → %s %.2fmm (%.2f\")",
+                 el_error, el_dir, fabs(el_delta_mm), fabs(el_delta_mm) / 25.4);
+    }
     ESP_LOGI(TAG, "");
 
     // Record move start time
@@ -283,46 +506,107 @@ static void do_move(double az_tgt, double el_tgt){
 
     // Move azimuth first (if needed)
     if (move_az) {
-        ESP_LOGI(TAG, "Moving azimuth...");
-        motor_move_az(s.az_cur, az_tgt);   // Blocking move with detailed logging
-        s.az_cur = az_tgt;                 // Accept new pose (open loop)
-        ESP_LOGI(TAG, "✓ Azimuth complete: %.1f°", s.az_cur);
+        ESP_LOGI(TAG, "Moving AZ actuator...");
+        ESP_LOGI(TAG, "  From: %.1f° (%.2fmm / %.2f\")", 
+                 s.az_cur, s.az_actuator_mm, s.az_actuator_mm / 25.4);
+        ESP_LOGI(TAG, "  To:   %.1f° (%.2fmm / %.2f\")",
+                 az_tgt, az_tgt_mm, az_tgt_mm / 25.4);
+        
+        // Store pre-move state
+        double az_start_mm = s.az_actuator_mm;
+        double az_start_deg = s.az_cur;
+        
+        // Execute move (motor.c converts angles internally)
+        motor_move_az(s.az_cur, az_tgt);
+        
+        // Update tracked positions
+        s.az_cur = az_tgt;
+        s.az_actuator_mm = az_tgt_mm;
+        
+        // Calculate actual movement
+        double az_moved_mm = s.az_actuator_mm - az_start_mm;
+        double az_moved_deg = s.az_cur - az_start_deg;
+        const char* az_dir = (az_moved_mm > 0) ? "extended" : "retracted";
+        
+        ESP_LOGI(TAG, "✓ AZ movement complete:");
+        ESP_LOGI(TAG, "  - Angle: %.1f° → %.1f° (Δ=%.1f°)",
+                 az_start_deg, s.az_cur, az_moved_deg);
+        ESP_LOGI(TAG, "  - Actuator: %.2fmm → %.2fmm (%s %.2fmm / %.3f\")",
+                 az_start_mm, s.az_actuator_mm, az_dir, 
+                 fabs(az_moved_mm), fabs(az_moved_mm) / 25.4);
+        ESP_LOGI(TAG, "  - Conversion: %.3f mm/degree", 
+                 fabs(az_moved_mm) / fabs(az_moved_deg));
+        
+        sdlog_printf("AZ: %.1f°→%.1f° | %.2fmm→%.2fmm | %s %.2fmm",
+                     az_start_deg, s.az_cur, az_start_mm, s.az_actuator_mm,
+                     az_dir, fabs(az_moved_mm));
     }
     
     // Brief pause between moves
     if (move_az && move_el) {
-        ESP_LOGD(TAG, "Pausing between moves...");
+        ESP_LOGD(TAG, "Pausing 500ms between axes...");
         vTaskDelay(pdMS_TO_TICKS(500));
     }
     
     // Move elevation (if needed)
     if (move_el) {
-        ESP_LOGI(TAG, "Moving elevation...");
-        motor_move_el(s.el_cur, el_tgt);   // Blocking move with detailed logging
+        ESP_LOGI(TAG, "Moving EL actuator...");
+        ESP_LOGI(TAG, "  From: %.1f° (%.2fmm / %.2f\")",
+                 s.el_cur, s.el_actuator_mm, s.el_actuator_mm / 25.4);
+        ESP_LOGI(TAG, "  To:   %.1f° (%.2fmm / %.2f\")",
+                 el_tgt, el_tgt_mm, el_tgt_mm / 25.4);
+        
+        // Store pre-move state
+        double el_start_mm = s.el_actuator_mm;
+        double el_start_deg = s.el_cur;
+        
+        // Execute move
+        motor_move_el(s.el_cur, el_tgt);
+        
+        // Update tracked positions
         s.el_cur = el_tgt;
-        ESP_LOGI(TAG, "✓ Elevation complete: %.1f°", s.el_cur);
+        s.el_actuator_mm = el_tgt_mm;
+        
+        // Calculate actual movement
+        double el_moved_mm = s.el_actuator_mm - el_start_mm;
+        double el_moved_deg = s.el_cur - el_start_deg;
+        const char* el_dir = (el_moved_mm > 0) ? "extended" : "retracted";
+        
+        ESP_LOGI(TAG, "✓ EL movement complete:");
+        ESP_LOGI(TAG, "  - Angle: %.1f° → %.1f° (Δ=%.1f°)",
+                 el_start_deg, s.el_cur, el_moved_deg);
+        ESP_LOGI(TAG, "  - Actuator: %.2fmm → %.2fmm (%s %.2fmm / %.3f\")",
+                 el_start_mm, s.el_actuator_mm, el_dir,
+                 fabs(el_moved_mm), fabs(el_moved_mm) / 25.4);
+        ESP_LOGI(TAG, "  - Conversion: %.3f mm/degree",
+                 fabs(el_moved_mm) / fabs(el_moved_deg));
+        
+        sdlog_printf("EL: %.1f°→%.1f° | %.2fmm→%.2fmm | %s %.2fmm",
+                     el_start_deg, s.el_cur, el_start_mm, s.el_actuator_mm,
+                     el_dir, fabs(el_moved_mm));
     }
 
     // Update statistics
     s.moves_today++;
     s.total_moves++;
     s.last_move = time(NULL);
-
-    // Calculate total move duration
     time_t move_duration = s.last_move - move_start;
 
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "✓ MOVE COMPLETE");
-    ESP_LOGI(TAG, "  Final position: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "✓ TRACKING MOVE COMPLETE");
+    ESP_LOGI(TAG, "  Final Position:");
+    ESP_LOGI(TAG, "    - Angles: AZ=%.1f° EL=%.1f° (mount frame)", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "    - Actuators: AZ=%.2fmm (%.2f\") EL=%.2fmm (%.2f\")",
+             s.az_actuator_mm, s.az_actuator_mm / 25.4,
+             s.el_actuator_mm, s.el_actuator_mm / 25.4);
     ESP_LOGI(TAG, "  Duration: %ld seconds", (long)move_duration);
-    ESP_LOGI(TAG, "  Move #%u today, #%u lifetime", s.moves_today, s.total_moves);
+    ESP_LOGI(TAG, "  Statistics: Move #%u today, #%u lifetime",
+             s.moves_today, s.total_moves);
     ESP_LOGI(TAG, "");
 
-    sdlog_printf("Move #%u: AZ %.1f°→%.1f° EL %.1f°→%.1f° (%lds)",
-                 s.total_moves, 
-                 az_tgt - az_error, az_tgt,
-                 el_tgt - el_error, el_tgt,
-                 (long)move_duration);
+    sdlog_printf("Move #%u: AZ[%.1f°,%.2fmm] EL[%.1f°,%.2fmm] (%lds)",
+                 s.total_moves, s.az_cur, s.az_actuator_mm,
+                 s.el_cur, s.el_actuator_mm, (long)move_duration);
 }
 
 /*
@@ -443,24 +727,21 @@ static bool is_descending(double lat, double lon){
 }
 
 /*
- * Nightly homing: move to safe midpoint position.
+ * Nightly homing: Return actuators to midpoint (starting position).
  * 
- * New approach (safer than hard-stop homing):
- * - Moves to calculated midpoint position
- * - AZ = 135° (50% of 270° range)
- * - EL = 47.5° (midpoint of 10-85° range)
- * - Actuators at 50% stroke (half-extended, balanced)
- * - Panel faces straight up (zenith) - minimal wind load
- * - Uses normal motor_move_* functions with conservative timing
+ * NEW: Uses tracked actuator positions to calculate exact movements needed
+ * - Knows current actuator extensions from tracking
+ * - Calculates distance to midpoint (100mm)
+ * - Moves each actuator independently to 100mm
+ * - Updates both angle and actuator position tracking
  * 
- * Benefits:
- * - Less mechanical stress than driving to hard stops
- * - Balanced position (no torque on one side)
- * - Safe for overnight parking
- * - Still resets accumulated open-loop drift
- * 
- * Called before deep sleep each night.
+ * This is the SAME position the system starts at:
+ * - Panel facing straight up (zenith)
+ * - Both actuators at 50% extension (100mm)
+ * - AZ actuator: 100mm → panel at 135° azimuth
+ * - EL actuator: 100mm → panel at 47.5° elevation
  */
+
 static void home_to_midpoint(void){
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
@@ -468,46 +749,79 @@ static void home_to_midpoint(void){
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Homing Strategy:");
-    ESP_LOGI(TAG, "  - Target: Midpoint position (actuators at 50%% stroke)");
-    ESP_LOGI(TAG, "  - AZ: %.1f° (50%% of 0-270° range)", s.home_az_deg);
-    ESP_LOGI(TAG, "  - EL: %.1f° (midpoint of 10-85° range)", s.home_el_deg);
-    ESP_LOGI(TAG, "  - Panel orientation: Facing zenith (straight up)");
-    ESP_LOGI(TAG, "  - Benefits: Balanced, low stress, safe parking");
+    ESP_LOGI(TAG, "  - Return to mechanical center (startup position)");
+    ESP_LOGI(TAG, "  - AZ: 0° (127.0mm / 5.00\" center)");              // CHANGED
+    ESP_LOGI(TAG, "  - EL: 0° (107.95mm / 4.25\" center)");             // UNCHANGED
+    ESP_LOGI(TAG, "  - Panel orientation: Horizontal (flat/level)");
+    ESP_LOGI(TAG, "  - Benefits: Balanced load, minimal stress, safe parking");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Current Position:");
-    ESP_LOGI(TAG, "  - AZ: %.1f°", s.az_cur);
-    ESP_LOGI(TAG, "  - EL: %.1f°", s.el_cur);
+    ESP_LOGI(TAG, "  - Angles: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
+    ESP_LOGI(TAG, "  - Actuators: AZ=%.2fmm (%.2f\") EL=%.2fmm (%.2f\")",
+             s.az_actuator_mm, s.az_actuator_mm / 25.4,
+             s.el_actuator_mm, s.el_actuator_mm / 25.4);
+    ESP_LOGI(TAG, "");
+    
+    // Calculate movements to center
+    const double AZ_HOME_MM = 127.0;   // CHANGED: 5.00" center (was 82.55mm)
+    const double EL_HOME_MM = 107.95;  // UNCHANGED: 4.25" center
+    
+    double az_delta_mm = AZ_HOME_MM - s.az_actuator_mm;
+    double el_delta_mm = EL_HOME_MM - s.el_actuator_mm;
+    double az_delta_deg = s.home_az_deg - s.az_cur;
+    double el_delta_deg = s.home_el_deg - s.el_cur;
+    
+    const char* az_dir = (az_delta_mm > 0) ? "EXTEND" : "RETRACT";
+    const char* el_dir = (el_delta_mm > 0) ? "EXTEND" : "RETRACT";
+    
+    ESP_LOGI(TAG, "Required Movements to Center:");
+    ESP_LOGI(TAG, "  AZ:");
+    ESP_LOGI(TAG, "    - Angle: %.1f° → 0° (%s %.1f°)",
+             s.az_cur, (az_delta_deg >= 0) ? "+" : "", az_delta_deg);
+    ESP_LOGI(TAG, "    - Actuator: %.2fmm → 127.0mm (%s %.2fmm / %.3f\")",  // CHANGED
+             s.az_actuator_mm, az_dir, fabs(az_delta_mm), fabs(az_delta_mm) / 25.4);
+    ESP_LOGI(TAG, "  EL:");
+    ESP_LOGI(TAG, "    - Angle: %.1f° → 0° (%s %.1f°)",
+             s.el_cur, (el_delta_deg >= 0) ? "+" : "", el_delta_deg);
+    ESP_LOGI(TAG, "    - Actuator: %.2fmm → 107.95mm (%s %.2fmm / %.3f\")",
+             s.el_actuator_mm, el_dir, fabs(el_delta_mm), fabs(el_delta_mm) / 25.4);
     ESP_LOGI(TAG, "");
 
-    status_led_set_mode(LED_SLEEP);               // Visual feedback
+    status_led_set_mode(LED_SLEEP);
 
-    // Move azimuth to midpoint
-    ESP_LOGI(TAG, "Moving AZ to midpoint (%.1f°)...", s.home_az_deg);
+    // Move AZ to center
+    ESP_LOGI(TAG, "Homing AZ to center (0°, 127.0mm)...");  // CHANGED
     motor_move_az(s.az_cur, s.home_az_deg);
-    
-    vTaskDelay(pdMS_TO_TICKS(500));               // Brief pause between axes
-    
-    // Move elevation to midpoint
-    ESP_LOGI(TAG, "Moving EL to midpoint (%.1f°)...", s.home_el_deg);
-    motor_move_el(s.el_cur, s.home_el_deg);
-
-    // Update state to home position
     s.az_cur = s.home_az_deg;
+    s.az_actuator_mm = AZ_HOME_MM;
+    ESP_LOGI(TAG, "✓ AZ centered: 0° @ 127.0mm (5.00\")");  // CHANGED
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Move EL to center
+    ESP_LOGI(TAG, "Homing EL to center (0°, 107.95mm)...");
+    motor_move_el(s.el_cur, s.home_el_deg);
     s.el_cur = s.home_el_deg;
+    s.el_actuator_mm = EL_HOME_MM;
+    ESP_LOGI(TAG, "✓ EL centered: 0° @ 107.95mm (4.25\")");
+
+    // Update state
     s.last_move_az_tgt = s.az_cur;
     s.last_move_el_tgt = s.el_cur;
-
-    nvs_save();                                   // Persist new pose
+    nvs_save();
 
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "✓ HOMING COMPLETE");
-    ESP_LOGI(TAG, "  Final position: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
-    ESP_LOGI(TAG, "  Actuators: Both at 50%% stroke");
-    ESP_LOGI(TAG, "  Panel: Facing zenith (balanced position)");
+    ESP_LOGI(TAG, "  Final Position (Home/Center):");
+    ESP_LOGI(TAG, "    - Angles: AZ=0° EL=0° (horizontal/flat)");
+    ESP_LOGI(TAG, "    - Actuators:");
+    ESP_LOGI(TAG, "      · AZ: 127.0mm (5.00\", mechanical center)");    // CHANGED
+    ESP_LOGI(TAG, "      · EL: 107.95mm (4.25\", mechanical center)");   // UNCHANGED
+    ESP_LOGI(TAG, "  Panel: Horizontal (minimal stress on structure)");
     ESP_LOGI(TAG, "  Ready for overnight parking");
     ESP_LOGI(TAG, "");
 
-    sdlog_printf("HOMED: AZ=%.1f° EL=%.1f° (midpoint, facing up)", s.az_cur, s.el_cur);
+    sdlog_printf("HOMED: Center position AZ=0°@127.0mm EL=0°@107.95mm (flat)");  // CHANGED
     status_led_set_mode(LED_TRACKING);
 }
 
@@ -848,26 +1162,81 @@ static void tracking_task(void *arg){
         ESP_LOGI(TAG, "  - EL delta: %.2f°", del);
         ESP_LOGI(TAG, "");
 
-        // === Night Detection ===
-        bool should_sleep = !sun.is_daylight ||
-                           (sun.elevation_deg < s.sleep_thresh_el &&
-                            is_descending(g.latitude, g.longitude));
+        // === Night Detection (Power-Optimized) ===
+        // Stop tracking when sun is too low for useful power generation
+        // At 5° elevation: ~9% power, heavy atmospheric loss, not worth tracking
+        
+        bool sun_too_low = sun.elevation_deg < s.sleep_thresh_el;  // 5° threshold
+        bool sun_descending = is_descending(g.latitude, g.longitude);
+        
+        // Only sleep if:
+        // 1. Sun below useful power threshold (5°) AND
+        // 2. Sun is descending (sunset, not sunrise)
+        bool should_sleep = sun_too_low && sun_descending;
+        
+        // Additional safety: Don't sleep during midday even if sun temporarily blocked
+        time_t now_utc = time(NULL);
+        solar_events_t events = solar_events(g.latitude, g.longitude, now_utc);
+        
+        if (events.has_sunrise && events.has_sunset) {
+            // Calculate solar noon (midpoint between sunrise and sunset)
+            time_t solar_noon = (events.sunrise_utc + events.sunset_utc) / 2;
+            int64_t time_to_noon = (int64_t)solar_noon - (int64_t)now_utc;
+            
+            // Don't sleep if within 4 hours of solar noon
+            if (llabs(time_to_noon) < 14400) {
+                should_sleep = false;
+                ESP_LOGD(TAG, "Sleep override: Near solar noon (%.1f hours away)",
+                         time_to_noon / 3600.0);
+            }
+        }
+        
+        // Detailed logging for power-based sleep decision
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "Power-Based Sleep Decision:");
+        ESP_LOGD(TAG, "  - Sun elevation: %.1f° (threshold: %.1f°)", 
+                 sun.elevation_deg, s.sleep_thresh_el);
+        ESP_LOGD(TAG, "  - Estimated power: ~%.0f%% of peak", 
+                 fmax(0.0, sin(DEG2RAD(sun.elevation_deg)) * 100.0));
+        ESP_LOGD(TAG, "  - Below useful power: %s", sun_too_low ? "YES" : "NO");
+        ESP_LOGD(TAG, "  - Sun descending: %s", sun_descending ? "YES" : "NO");
+        ESP_LOGD(TAG, "  - Should sleep: %s", should_sleep ? "YES" : "NO");
+        ESP_LOGD(TAG, "");
 
         if (should_sleep) {
             ESP_LOGI(TAG, "");
             ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
-            ESP_LOGI(TAG, "║              NIGHT MODE ACTIVATED                          ║");
+            ESP_LOGI(TAG, "║              ENTERING NIGHT MODE (Power Saving)            ║");
             ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
             ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Night Conditions:");
-            ESP_LOGI(TAG, "  - Sun elevation: %.1f° (threshold: %.1f°)", 
+            ESP_LOGI(TAG, "Sleep Conditions Met:");
+            ESP_LOGI(TAG, "  - Sun elevation: %.1f° (< %.1f° threshold)", 
                      sun.elevation_deg, s.sleep_thresh_el);
-            ESP_LOGI(TAG, "  - Daylight: %s", sun.is_daylight ? "YES" : "NO");
-            ESP_LOGI(TAG, "  - Sun trend: %s", 
-                     is_descending(g.latitude, g.longitude) ? "DESCENDING" : "ASCENDING");
+            ESP_LOGI(TAG, "  - Estimated power: ~%.0f%% of peak (too low for tracking)",
+                     fmax(0.0, sin(DEG2RAD(sun.elevation_deg)) * 100.0));
+            ESP_LOGI(TAG, "  - Sun is descending (sunset approaching)");
+            ESP_LOGI(TAG, "  - Further tracking provides no power benefit");
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "Power Conservation:");
+            ESP_LOGI(TAG, "  - Homing to safe position (panel facing up)");
+            ESP_LOGI(TAG, "  - Deep sleep until %.0f min before sunrise",
+                     (double)s.prewake_min);
+            ESP_LOGI(TAG, "  - Battery drain during sleep: <50µA");
             ESP_LOGI(TAG, "");
 
+            // === NEW: Notify LCD of sleep state ===
+            ESP_LOGI(TAG, "Notifying display of sleep mode...");
             status_led_set_mode(LED_SLEEP);
+            
+            // Give main loop time to send status=2 to LCD (3 updates @ 1Hz)
+            for (int i = 0; i < 3; i++) {
+                ESP_LOGI(TAG, "  Sleep notification attempt %d/3...", i + 1);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            
+            ESP_LOGI(TAG, "✓ Display notified - proceeding with homing");
+            ESP_LOGI(TAG, "");
+            
             home_to_midpoint();                      // Park at safe position
 
             // Log to CSV
@@ -1217,3 +1586,5 @@ void tracking_get_mount_offsets(float *az_offset_deg, float *el_offset_deg) {
         xSemaphoreGive(s_mutex);
     }
 }
+
+

@@ -303,28 +303,77 @@ static bool parse_gga(const char *sentence, gps_data_t *g) {
     return (fix_quality > 0);
 }
 
-// Parse $GPRMC sentence
+// Parse $GPRMC sentence - MATCHES ARDUINO BEHAVIOR
 static bool parse_rmc(const char *sentence, gps_data_t *g) {
     char status, lat_dir, lon_dir;
     double lat_raw, lon_raw, speed_knots, track_deg;
+    int utc_time, date;
     
+    // BN-880 format: $GPRMC,hhmmss.ss,A,ddmm.mmmm,N,dddmm.mmmm,W,speed,track,ddmmyy,mag_var,E*CS
     int parsed = sscanf(sentence,
-        "$G%*cRMC,%*f,%c,%lf,%c,%lf,%c,%lf,%lf",
-        &status, &lat_raw, &lat_dir, &lon_raw, &lon_dir,
-        &speed_knots, &track_deg);
+        "$G%*cRMC,%d,%c,%lf,%c,%lf,%c,%lf,%lf,%d",
+        &utc_time, &status, &lat_raw, &lat_dir, &lon_raw, &lon_dir,
+        &speed_knots, &track_deg, &date);
     
-    if (parsed < 7 || status != 'A') {
-        ESP_LOGD(TAG, "RMC: %s (parsed %d, status '%c')", 
-                 (status == 'A') ? "invalid data" : "no fix", parsed, status);
+    if (parsed < 9 || status != 'A') {
+        ESP_LOGD(TAG, "RMC: no fix (status '%c')", status);
         return false;
     }
     
+    // Parse position/speed/heading
     g->latitude = nmea_to_degrees(lat_raw, lat_dir);
     g->longitude = nmea_to_degrees(lon_raw, lon_dir);
-    g->ground_speed_mps = speed_knots * 0.514444f;
+    g->ground_speed_mps = speed_knots * 0.514444f;  // knots to m/s
     g->heading_deg = (float)track_deg;
     
-    ESP_LOGD(TAG, "RMC: speed=%.1fm/s heading=%.1f°", g->ground_speed_mps, g->heading_deg);
+    // === PARSE GPS DATE/TIME (GPS ALREADY GIVES US EVERYTHING!) ===
+    // Time: hhmmss format
+    int hours = utc_time / 10000;
+    int minutes = (utc_time / 100) % 100;
+    int seconds = utc_time % 100;
+    
+    // Date: ddmmyy format  
+    int day = date / 10000;
+    int month = (date / 100) % 100;
+    int year = 2000 + (date % 100);
+    
+    ESP_LOGD(TAG, "RMC: %04d-%02d-%02d %02d:%02d:%02d UTC, speed=%.1fm/s, heading=%.1f°", 
+             year, month, day, hours, minutes, seconds,
+             g->ground_speed_mps, g->heading_deg);
+    
+    // === SET SYSTEM CLOCK TO GPS TIME (UTC) ===
+    // Build tm struct for UTC time
+    struct tm timeinfo = {
+        .tm_year = year - 1900,   // years since 1900
+        .tm_mon = month - 1,      // 0-11
+        .tm_mday = day,
+        .tm_hour = hours,
+        .tm_min = minutes,
+        .tm_sec = seconds,
+        .tm_isdst = 0             // UTC has no DST
+    };
+    
+    // Convert to Unix timestamp (UTC)
+    // NOTE: mktime() assumes local time by default, so we force UTC timezone
+    setenv("TZ", "UTC0", 1);
+    tzset();
+    time_t gps_time = mktime(&timeinfo);
+    
+    if (gps_time > 1700000000) {  // Sanity check: after 2023
+        time_t current_time = time(NULL);
+        int drift_seconds = abs((int)(gps_time - current_time));
+        
+        // Only update if drift is significant (>2 seconds)
+        if (drift_seconds > 2) {
+            struct timeval tv = { .tv_sec = gps_time, .tv_usec = 0 };
+            settimeofday(&tv, NULL);
+            
+            ESP_LOGI(TAG, "✓ System clock synced to GPS: %04d-%02d-%02d %02d:%02d:%02d UTC (drift: %ds)",
+                     year, month, day, hours, minutes, seconds, drift_seconds);
+        }
+    } else {
+        ESP_LOGW(TAG, "GPS time looks invalid: %ld (ignoring)", (long)gps_time);
+    }
     
     return true;
 }
@@ -467,6 +516,59 @@ bool gps_test_communication(uint32_t timeout_ms) {
     return false;
 }
 
+// ...existing code...
+
+// Add after gps_init() function:
+
+/*
+ * Debug function: dump raw NMEA sentences for 10 seconds
+ * Call this after gps_init() to verify GPS is transmitting
+ */
+void gps_debug_dump_nmea(void) {
+    if (!s_gps_initialized) {
+        ESP_LOGE(TAG, "GPS not initialized");
+        return;
+    }
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== GPS RAW NMEA DUMP (10 seconds) ===");
+    ESP_LOGI(TAG, "Expecting sentences at 1 Hz (9600 baud):");
+    ESP_LOGI(TAG, "  $GPGGA - Position fix");
+    ESP_LOGI(TAG, "  $GPRMC - Recommended minimum");
+    ESP_LOGI(TAG, "  $GPGSA - Satellite status");
+    ESP_LOGI(TAG, "  $GPGSV - Satellites in view");
+    ESP_LOGI(TAG, "");
+    
+    uint32_t start = xTaskGetTickCount();
+    int sentence_count = 0;
+    char line[NMEA_MAX_LINE];
+    int line_pos = 0;
+    
+    while ((xTaskGetTickCount() - start) < pdMS_TO_TICKS(10000)) {
+        uint8_t byte;
+        int len = uart_read_bytes(s_cfg.uart_port, &byte, 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0) {
+            if (byte == '\n') {
+                line[line_pos] = '\0';
+                if (line_pos > 0 && line[0] == '$') {
+                    sentence_count++;
+                    bool valid = nmea_verify(line);
+                    ESP_LOGI(TAG, "%s [%s]", line, valid ? "OK" : "BAD CS");
+                }
+                line_pos = 0;
+            } else if (line_pos < NMEA_MAX_LINE - 1) {
+                line[line_pos++] = byte;
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== DUMP COMPLETE ===");
+    ESP_LOGI(TAG, "Total sentences: %d (expected ~40-50 @ 1Hz)", sentence_count);
+    ESP_LOGI(TAG, "");
+}
+
 bool gps_poll_nav_pvt(gps_data_t *out) {
     if (!s_gps_initialized) {
         ESP_LOGW(TAG, "GPS not initialized");
@@ -479,28 +581,41 @@ bool gps_poll_nav_pvt(gps_data_t *out) {
     bool got_rmc = false;
     gps_data_t temp = {0};
     
-    uint32_t start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    uint32_t start_ticks = xTaskGetTickCount();
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // INCREASED to 5 seconds
     
-    while ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_ms) < 2000) {
+    ESP_LOGD(TAG, "Polling GPS (5s timeout)...");
+    
+    while ((xTaskGetTickCount() - start_ticks) < timeout_ticks) {
         uint8_t byte;
         int len = uart_read_bytes(s_cfg.uart_port, &byte, 1, pdMS_TO_TICKS(100));
         
         if (len <= 0) continue;
         
+        // Echo raw NMEA for debugging (disable after testing)
+        // Serial.write(byte);  // Uncomment to see raw GPS output
+        
         if (byte == '\n') {
             line[line_pos] = '\0';
             
-            if (line_pos > 0 && line[0] == '$') {
+            if (line_pos > 6 && line[0] == '$') {
+                ESP_LOGD(TAG, "RX: %s", line);  // Log every sentence for debugging
+                
                 if (!nmea_verify(line)) {
-                    ESP_LOGD(TAG, "Checksum fail: %s", line);
+                    ESP_LOGD(TAG, "  ✗ Checksum fail");
                 } else {
                     if (strstr(line, "GGA")) {
+                        ESP_LOGD(TAG, "  → Parsing GGA");
                         if (parse_gga(line, &temp)) {
                             got_gga = true;
+                            ESP_LOGD(TAG, "  ✓ GGA parsed: %.6f,%.6f", temp.latitude, temp.longitude);
                         }
                     } else if (strstr(line, "RMC")) {
+                        ESP_LOGD(TAG, "  → Parsing RMC");
                         if (parse_rmc(line, &temp)) {
                             got_rmc = true;
+                            ESP_LOGD(TAG, "  ✓ RMC parsed: speed=%.1f heading=%.1f", 
+                                     temp.ground_speed_mps, temp.heading_deg);
                         }
                     }
                     
@@ -528,7 +643,7 @@ bool gps_poll_nav_pvt(gps_data_t *out) {
         }
     }
     
-    ESP_LOGD(TAG, "GPS poll timeout (GGA=%d RMC=%d)", got_gga, got_rmc);
+    ESP_LOGW(TAG, "GPS poll timeout after 5s (GGA=%d RMC=%d)", got_gga, got_rmc);
     return false;
 }
 

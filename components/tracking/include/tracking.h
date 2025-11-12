@@ -60,6 +60,10 @@ typedef struct {
     double az_cur, el_cur;     // Last commanded/assumed pose (mount frame)
     double az_tgt, el_tgt;     // Next targets (computed from sun position)
 
+    // NEW: Actuator position tracking (0-200mm)
+    double az_actuator_mm;     // Current AZ actuator extension
+    double el_actuator_mm;     // Current EL actuator extension
+
     // Motion thresholds/limits
     double tol_deg;            // Error required to move (e.g., 10°)
     double min_step_deg;       // Minimum commanded step (e.g., 2°)
