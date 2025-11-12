@@ -769,10 +769,15 @@ void app_main(void){
             sdlog_printf("Waiting for button press (transmitting status)");
         }
         
-        // === NON-BLOCKING BUTTON WAIT WITH DATA TRANSMISSION ===
+        // === NON-BLOCKING BUTTON WAIT - ADD THESE VARIABLE DECLARATIONS ===
         ESP_LOGI(TAG, "Starting button wait (no background transmission)...");
         ESP_LOGI(TAG, "Press START button to begin tracking");
         ESP_LOGI(TAG, "");
+        
+        // ADD THESE VARIABLES:
+        bool button_pressed = false;
+        bool waiting_for_double_press = false;
+        uint32_t last_press_time = 0;
         
         while (!button_pressed) {
             // === CHECK FOR BUTTON EVENTS ONLY ===
