@@ -140,6 +140,23 @@ static double nmea_to_degrees(double raw, char hemisphere) {
     return result;
 }
 
+// Better tokenizer that handles empty fields correctly
+static char* next_token(char **str, char delim) {
+    if (!*str || **str == '\0') return NULL;
+    
+    char *start = *str;
+    char *end = strchr(start, delim);
+    
+    if (end) {
+        *end = '\0';
+        *str = end + 1;
+    } else {
+        *str = start + strlen(start);
+    }
+    
+    return start;
+}
+
 /* ────────────────────────── HMC5883 I2C Helpers ──────────────────────── */
 
 // Write single byte to HMC5883 register
@@ -303,78 +320,139 @@ static bool parse_gga(const char *sentence, gps_data_t *g) {
     return (fix_quality > 0);
 }
 
-// Parse $GPRMC sentence - MATCHES ARDUINO BEHAVIOR
+// Parse $GPRMC sentence - IMPROVED WITH DATE/TIME SYNC
 static bool parse_rmc(const char *sentence, gps_data_t *g) {
-    char status, lat_dir, lon_dir;
-    double lat_raw, lon_raw, speed_knots, track_deg;
-    int utc_time, date;
+    // Make a mutable copy for tokenization
+    char buffer[NMEA_MAX_LINE];
+    strncpy(buffer, sentence, NMEA_MAX_LINE - 1);
+    buffer[NMEA_MAX_LINE - 1] = '\0';
     
-    // BN-880 format: $GPRMC,hhmmss.ss,A,ddmm.mmmm,N,dddmm.mmmm,W,speed,track,ddmmyy,mag_var,E*CS
-    int parsed = sscanf(sentence,
-        "$G%*cRMC,%d,%c,%lf,%c,%lf,%c,%lf,%lf,%d",
-        &utc_time, &status, &lat_raw, &lat_dir, &lon_raw, &lon_dir,
-        &speed_knots, &track_deg, &date);
+    char *ptr = buffer;
+    char *token;
+    int field = 0;
+    double lat_raw = 0, lon_raw = 0;
+    char lat_dir = 0, lon_dir = 0;
+    char status = 'V';  // V=invalid, A=active
+    int utc_time = 0;
+    int date = 0;
     
-    if (parsed < 9 || status != 'A') {
+    // Skip sentence ID ($GNRMC or $GPRMC)
+    token = next_token(&ptr, ',');
+    
+    while ((token = next_token(&ptr, ',')) != NULL && field < 12) {
+        switch (field) {
+            case 0: // Time (hhmmss.ss)
+                if (strlen(token) >= 6) {
+                    utc_time = atoi(token);
+                    ESP_LOGV(TAG, "RMC time: %06d", utc_time);
+                }
+                break;
+                
+            case 1: // Status (A=active, V=void)
+                status = token[0];
+                ESP_LOGV(TAG, "RMC status: %c", status);
+                break;
+                
+            case 2: // Latitude (ddmm.mmmm)
+                if (strlen(token) > 0) lat_raw = atof(token);
+                break;
+                
+            case 3: // Lat direction (N/S)
+                if (strlen(token) > 0) lat_dir = token[0];
+                break;
+                
+            case 4: // Longitude (dddmm.mmmm)
+                if (strlen(token) > 0) lon_raw = atof(token);
+                break;
+                
+            case 5: // Lon direction (E/W)
+                if (strlen(token) > 0) lon_dir = token[0];
+                
+                // Update position after getting all coordinate fields
+                if (status == 'A' && lat_raw && lon_raw && lat_dir && lon_dir) {
+                    g->latitude = nmea_to_degrees(lat_raw, lat_dir);
+                    g->longitude = nmea_to_degrees(lon_raw, lon_dir);
+                    ESP_LOGV(TAG, "RMC position: %.6f, %.6f", g->latitude, g->longitude);
+                }
+                break;
+                
+            case 6: // Speed (knots)
+                if (strlen(token) > 0) {
+                    g->ground_speed_mps = atof(token) * 0.514444f;  // knots to m/s
+                    ESP_LOGV(TAG, "RMC speed: %.1f m/s", g->ground_speed_mps);
+                }
+                break;
+                
+            case 7: // Course (degrees)
+                if (strlen(token) > 0) {
+                    g->heading_deg = (float)atof(token);
+                    ESP_LOGV(TAG, "RMC course: %.1f°", g->heading_deg);
+                }
+                break;
+                
+            case 8: // Date (ddmmyy) *** KEY FIELD FOR TIME SYNC ***
+                if (strlen(token) >= 6) {
+                    date = atoi(token);
+                    int day = date / 10000;
+                    int month = (date / 100) % 100;
+                    int year = 2000 + (date % 100);
+                    
+                    int hours = utc_time / 10000;
+                    int minutes = (utc_time / 100) % 100;
+                    int seconds = utc_time % 100;
+                    
+                    ESP_LOGI(TAG, "RMC date/time: %04d-%02d-%02d %02d:%02d:%02d UTC", 
+                             year, month, day, hours, minutes, seconds);
+                    
+                    // === SYNC SYSTEM CLOCK TO GPS TIME ===
+                    struct tm timeinfo = {
+                        .tm_year = year - 1900,
+                        .tm_mon = month - 1,
+                        .tm_mday = day,
+                        .tm_hour = hours,
+                        .tm_min = minutes,
+                        .tm_sec = seconds,
+                        .tm_isdst = 0
+                    };
+                    
+                    setenv("TZ", "UTC0", 1);
+                    tzset();
+                    time_t gps_time = mktime(&timeinfo);
+                    
+                    if (gps_time > 1700000000) {  // Sanity check: after 2023
+                        time_t current_time = time(NULL);
+                        int drift_seconds = abs((int)(gps_time - current_time));
+                        
+                        // Only update if drift is significant (>2 seconds)
+                        if (drift_seconds > 2) {
+                            struct timeval tv = { .tv_sec = gps_time, .tv_usec = 0 };
+                            settimeofday(&tv, NULL);
+                            
+                            ESP_LOGI(TAG, "✓ System clock synced to GPS: %04d-%02d-%02d %02d:%02d:%02d UTC (drift: %ds)",
+                                     year, month, day, hours, minutes, seconds, drift_seconds);
+                        } else {
+                            ESP_LOGD(TAG, "System clock drift minimal: %ds (no sync needed)", drift_seconds);
+                        }
+                        
+                        // Update timestamp in GPS data
+                        g->timestamp = gps_time;
+                    } else {
+                        ESP_LOGW(TAG, "GPS time looks invalid: %ld (ignoring)", (long)gps_time);
+                    }
+                }
+                break;
+        }
+        
+        field++;
+    }
+    
+    // Valid RMC requires active status
+    if (status != 'A') {
         ESP_LOGD(TAG, "RMC: no fix (status '%c')", status);
         return false;
     }
     
-    // Parse position/speed/heading
-    g->latitude = nmea_to_degrees(lat_raw, lat_dir);
-    g->longitude = nmea_to_degrees(lon_raw, lon_dir);
-    g->ground_speed_mps = speed_knots * 0.514444f;  // knots to m/s
-    g->heading_deg = (float)track_deg;
-    
-    // === PARSE GPS DATE/TIME (GPS ALREADY GIVES US EVERYTHING!) ===
-    // Time: hhmmss format
-    int hours = utc_time / 10000;
-    int minutes = (utc_time / 100) % 100;
-    int seconds = utc_time % 100;
-    
-    // Date: ddmmyy format  
-    int day = date / 10000;
-    int month = (date / 100) % 100;
-    int year = 2000 + (date % 100);
-    
-    ESP_LOGD(TAG, "RMC: %04d-%02d-%02d %02d:%02d:%02d UTC, speed=%.1fm/s, heading=%.1f°", 
-             year, month, day, hours, minutes, seconds,
-             g->ground_speed_mps, g->heading_deg);
-    
-    // === SET SYSTEM CLOCK TO GPS TIME (UTC) ===
-    // Build tm struct for UTC time
-    struct tm timeinfo = {
-        .tm_year = year - 1900,   // years since 1900
-        .tm_mon = month - 1,      // 0-11
-        .tm_mday = day,
-        .tm_hour = hours,
-        .tm_min = minutes,
-        .tm_sec = seconds,
-        .tm_isdst = 0             // UTC has no DST
-    };
-    
-    // Convert to Unix timestamp (UTC)
-    // NOTE: mktime() assumes local time by default, so we force UTC timezone
-    setenv("TZ", "UTC0", 1);
-    tzset();
-    time_t gps_time = mktime(&timeinfo);
-    
-    if (gps_time > 1700000000) {  // Sanity check: after 2023
-        time_t current_time = time(NULL);
-        int drift_seconds = abs((int)(gps_time - current_time));
-        
-        // Only update if drift is significant (>2 seconds)
-        if (drift_seconds > 2) {
-            struct timeval tv = { .tv_sec = gps_time, .tv_usec = 0 };
-            settimeofday(&tv, NULL);
-            
-            ESP_LOGI(TAG, "✓ System clock synced to GPS: %04d-%02d-%02d %02d:%02d:%02d UTC (drift: %ds)",
-                     year, month, day, hours, minutes, seconds, drift_seconds);
-        }
-    } else {
-        ESP_LOGW(TAG, "GPS time looks invalid: %ld (ignoring)", (long)gps_time);
-    }
-    
+    ESP_LOGD(TAG, "RMC: valid fix with time sync");
     return true;
 }
 
@@ -515,8 +593,6 @@ bool gps_test_communication(uint32_t timeout_ms) {
     
     return false;
 }
-
-// ...existing code...
 
 // Add after gps_init() function:
 

@@ -1256,9 +1256,18 @@ void app_main(void){
     time_t boot_time = time(NULL);
     
     while (1) {
-        // Get current time
+        // Get current time (BOTH UTC and local)
         time_t now = time(NULL);
         uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
+        
+        // === CHANGED: Convert to local time for transmission ===
+        struct tm *local_tm = localtime(&now);
+        time_t local_timestamp = mktime(local_tm);  // Local time as Unix timestamp
+        
+        ESP_LOGV(TAG, "Time for transmission: Local=%04d-%02d-%02d %02d:%02d:%02d (epoch=%ld)",
+                 local_tm->tm_year + 1900, local_tm->tm_mon + 1, local_tm->tm_mday,
+                 local_tm->tm_hour, local_tm->tm_min, local_tm->tm_sec,
+                 (long)local_timestamp);
         
         // Get current tracking position from tracking module
         float current_azimuth = 0.0f;
@@ -1456,9 +1465,9 @@ void app_main(void){
             .battery_soc_percent = battery_soc,
             .battery_soc = battery_soc_level,
             .battery_charging = battery_charging,
-            .timestamp = (uint32_t)now,
-            .sunrise_time = sunrise_time,
-            .sunset_time = sunset_time,
+            .timestamp = (uint32_t)local_timestamp,  // CHANGED: Local time instead of UTC
+            .sunrise_time = sunrise_time,            // These stay UTC (calculations use UTC)
+            .sunset_time = sunset_time,              // These stay UTC (calculations use UTC)
             .status = system_status,
             .latitude = gps_valid ? (float)g.latitude : 0.0f,
             .longitude = gps_valid ? (float)g.longitude : 0.0f,
