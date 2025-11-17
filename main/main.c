@@ -105,10 +105,10 @@
 #define I2C_SCL_PIN    26     // I2C clock line
 
 // Motor control pins
-#define MOTOR_AZ_PWM   18     // Azimuth motor speed control
-#define MOTOR_AZ_DIR   19     // Azimuth motor direction
-#define MOTOR_EL_PWM   32     // Elevation motor speed control
-#define MOTOR_EL_DIR   33     // Elevation motor direction
+#define MOTOR_AZ_PWM   32     // Azimuth motor speed control
+#define MOTOR_AZ_DIR   33     // Azimuth motor direction
+#define MOTOR_EL_PWM   18     // Elevation motor speed control
+#define MOTOR_EL_DIR   19     // Elevation motor direction
 
 // SD card pins (ESP32-CAM standard)
 #define SD_MOSI        15     // SD data in
@@ -1020,6 +1020,10 @@ void app_main(void){
     ESP_LOGI(TAG, "✓ Tracking active");
     if (init_results[2]) {
         sdlog_printf("Tracking started");
+        
+        // === Initialize CSV file with header ===
+        sdlog_write_csv_header_if_new("/sdcard/SUNFLOW.CSV");
+        ESP_LOGI(TAG, "✓ CSV logging initialized");
     }
 
     // === Start Calibration Monitor ===
@@ -1080,6 +1084,15 @@ void app_main(void){
         float current_elevation = 0.0f;
         tracking_get_current_angles(&current_azimuth, &current_elevation);
         
+        // Get target angles
+        float target_azimuth = 0.0f;
+        float target_elevation = 0.0f;
+        tracking_get_target_angles(&target_azimuth, &target_elevation);
+        
+        // Calculate deltas
+        float delta_az = target_azimuth - current_azimuth;
+        float delta_elev = target_elevation - current_elevation;
+        
         // Get GPS data
         gps_data_t g = {0};
         bool gps_valid = gps_poll_nav_pvt(&g) || gps_get_last(&g);
@@ -1087,11 +1100,18 @@ void app_main(void){
         
         // Get battery data
         battery_data_t battery;
+        uint16_t battery_adc_raw = 0;
         float battery_v = 0.0f;
         float battery_soc = 0.0f;
+        uint8_t battery_soc_level = 0;
+        uint8_t battery_charging = 0;
+        
         if (battery_read(&battery) == ESP_OK) {
+            battery_adc_raw = battery.adc_raw;
             battery_v = battery.voltage;
             battery_soc = battery.soc_percent;
+            battery_soc_level = (uint8_t)battery.soc_level;
+            battery_charging = battery.is_charging ? 1 : 0;
         }
         
         // Get sun position
@@ -1100,20 +1120,148 @@ void app_main(void){
             sun = solar_compute(g.latitude, g.longitude, now);
         }
         
-        // Log status every 10 seconds
+        // Get sunrise/sunset times (convert to local time)
+        uint32_t sunrise_time = 0;
+        uint32_t sunset_time = 0;
+        
+        if (gps_valid) {
+            solar_events_t events = solar_events(g.latitude, g.longitude, now);
+            
+            if (events.has_sunrise) {
+                time_t sunrise_utc = events.sunrise_utc;
+                struct tm *sunrise_local_tm = localtime(&sunrise_utc);
+                sunrise_time = (uint32_t)mktime(sunrise_local_tm);
+            }
+            
+            if (events.has_sunset) {
+                time_t sunset_utc = events.sunset_utc;
+                struct tm *sunset_local_tm = localtime(&sunset_utc);
+                sunset_time = (uint32_t)mktime(sunset_local_tm);
+            }
+        }
+        
+        // Get move statistics
+        uint32_t moves_today = 0;
+        uint32_t total_moves = 0;
+        tracking_get_move_stats(&moves_today, &total_moves);
+        
+        // Calculate uptime
+        uint16_t uptime_h = (uint16_t)((now - boot_time) / 3600);
+        
+        // Calculate tracking quality (angular error from sun)
+        uint8_t tracking_quality = 0;
+        if (gps_valid && sun.elevation_deg > 5.0) {
+            float az_error = fabs(current_azimuth - sun.azimuth_deg);
+            float el_error = fabs(current_elevation - sun.elevation_deg);
+            tracking_quality = (uint8_t)sqrt(az_error*az_error + el_error*el_error);
+        }
+        
+        // Get SD card status
+        uint8_t sd_status = sdlog_get_status();
+        
+        // System status (simplified)
+        uint8_t system_status = 1;  // 1=tracking (you can expand this)
+        
+        // === ADD: Write CSV row every 60 seconds ===
+        static uint32_t last_csv_write = 0;
+        if (init_results[2] && (now - last_csv_write) >= 60) {
+            // Convert UTC to local time for CSV timestamp
+            struct tm *local_tm = localtime(&now);
+            time_t local_timestamp = mktime(local_tm);
+            
+            // Get compass heading
+            float compass_heading = 180.0f;  // Default
+            gps_get_compass_heading_true(&compass_heading);
+            
+            // Get mount offsets
+            float az_offset = 0.0f, el_offset = 0.0f;
+            tracking_get_mount_offsets(&az_offset, &el_offset);
+            
+            sdlog_write_csv("/sdcard/SUNFLOW.CSV",
+                "%lu,%.6f,%.6f,%u,%u,%lu,"           // timestamp, lat, lon, gps_valid, sats, fix_age
+                "%.1f,%.1f,%.1f,%.1f,"               // sun_el, sun_az, panel_el, panel_az
+                "%.1f,%.1f,%u,"                      // delta_el, delta_az, tracking_quality
+                "%.1f,%.1f,"                         // compass_heading, mount_base_heading (NEW)
+                "%.2f,%.0f,%u,%u,%u,"                // battery_v, soc%, soc_level, charging, adc
+                "%lu,%lu,%u,"                        // moves_today, total_moves, uptime_h
+                "%u,%u,%d,%u,"                       // status, wifi_clients, wifi_rssi, sd_status
+                "%lu,%lu,",                          // sunrise, sunset
+                (unsigned long)local_timestamp,      // LOCAL time (converted from UTC)
+                gps_valid ? g.latitude : 0.0,
+                gps_valid ? g.longitude : 0.0,
+                gps_valid ? 1 : 0,
+                gps_valid ? g.num_satellites : 0,
+                (unsigned long)gps_fix_age_sec,
+                sun.elevation_deg,
+                sun.azimuth_deg,
+                current_elevation,
+                current_azimuth,
+                delta_elev,
+                delta_az,
+                tracking_quality,
+                compass_heading,        // NEW
+                180.0f,                 // NEW: mount base heading (fixed at 180°)
+                battery_v,
+                battery_soc,
+                battery_soc_level,
+                battery_charging,
+                battery_adc_raw,
+                (unsigned long)moves_today,
+                (unsigned long)total_moves,
+                uptime_h,
+                system_status,
+                0,  // wifi_clients (disabled)
+                0,  // wifi_rssi (disabled)
+                sd_status,
+                (unsigned long)sunrise_time,
+                (unsigned long)sunset_time
+            );
+            
+            ESP_LOGD(TAG, "CSV row written: %.2fV %.0f%% ADC=%u",
+                     battery_v, battery_soc, battery_adc_raw);
+            
+            last_csv_write = now;
+        }
+        
+        // Log status every 10 seconds (existing console log)
         static uint32_t last_log = 0;
         if ((now - last_log) >= 10) {
-            ESP_LOGI(TAG, "TRACK: Panel[%.1f°,%.1f°] Sun[%.1f°,%.1f°] Batt=%.2fV(%.0f%%) GPS=%lus",
-                     current_elevation, current_azimuth,
-                     sun.elevation_deg, sun.azimuth_deg,
-                     battery_v, battery_soc,
-                     (unsigned long)gps_fix_age_sec);
+            // Get compass heading for logging
+            float compass_heading = 0.0f;
+            bool compass_valid = gps_get_compass_heading_true(&compass_heading);
             
+            // Enhanced log with compass heading
+            if (compass_valid) {
+                ESP_LOGI(TAG, "TRACK: Panel[%.1f°,%.1f°] Sun[%.1f°,%.1f°] Compass=%.1f° Batt=%.2fV(%.0f%%) GPS=%lus",
+                         current_elevation, current_azimuth,
+                         sun.elevation_deg, sun.azimuth_deg,
+                         compass_heading,
+                         battery_v, battery_soc,
+                         (unsigned long)gps_fix_age_sec);
+            } else {
+                ESP_LOGI(TAG, "TRACK: Panel[%.1f°,%.1f°] Sun[%.1f°,%.1f°] Compass=N/A Batt=%.2fV(%.0f%%) GPS=%lus",
+                         current_elevation, current_azimuth,
+                         sun.elevation_deg, sun.azimuth_deg,
+                         battery_v, battery_soc,
+                         (unsigned long)gps_fix_age_sec);
+            }
+            
+            // SD log with compass
             if (init_results[2]) {
-                sdlog_printf("Track: El=%.1f Az=%.1f Sun[%.1f,%.1f] Batt=%.2fV GPS=%lus",
-                             current_elevation, current_azimuth,
-                             sun.elevation_deg, sun.azimuth_deg,
-                             battery_v, (unsigned long)gps_fix_age_sec);
+                if (compass_valid) {
+                    sdlog_printf("Track: El=%.1f Az=%.1f Sun[%.1f,%.1f] Compass=%.1f° Batt=%.2fV(%.0f%%) ADC=%u GPS=%lus",
+                                 current_elevation, current_azimuth,
+                                 sun.elevation_deg, sun.azimuth_deg,
+                                 compass_heading,
+                                 battery_v, battery_soc, battery_adc_raw,
+                                 (unsigned long)gps_fix_age_sec);
+                } else {
+                    sdlog_printf("Track: El=%.1f Az=%.1f Sun[%.1f,%.1f] Compass=N/A Batt=%.2fV(%.0f%%) ADC=%u GPS=%lus",
+                                 current_elevation, current_azimuth,
+                                 sun.elevation_deg, sun.azimuth_deg,
+                                 battery_v, battery_soc, battery_adc_raw,
+                                 (unsigned long)gps_fix_age_sec);
+                }
             }
             
             last_log = now;

@@ -97,6 +97,10 @@ typedef struct {
     unsigned moves_today;      // Resets at UTC midnight
     unsigned total_moves;      // Lifetime counter
     time_t   last_move;        // Timestamp of last move
+
+    // NEW: Mount orientation
+    double mount_base_heading_deg;   // System back direction in earth frame (180° = south)
+    double compass_heading_deg;      // Current compass reading (for logging)
 } tracker_state_t;
 
 /*
@@ -212,6 +216,29 @@ void tracking_auto_calibrate_with_compass(void);
 void tracking_get_current_angles(float *az_deg, float *el_deg);
 
 /*
+    Get target sun angles (where we're trying to point).
+    
+    Returns:
+    - az_deg: Target azimuth in earth frame (0-360°)
+    - el_deg: Target elevation in earth frame (typically 0-90°)
+    
+    Used by:
+    - Main loop for WiFi transmission to LCD display
+    - System check to show current target position
+    - Diagnostics and debugging
+    
+    Thread-safe: can be called from any task.
+    
+    Example:
+    ```c
+    float az, el;
+    tracking_get_target_angles(&az, &el);
+    printf("Target: %.1f° az, %.1f° el\n", az, el);
+    ```
+*/
+void tracking_get_target_angles(float *az_deg, float *el_deg);
+
+/*
     Get move statistics for telemetry display.
     
     Returns:
@@ -237,3 +264,24 @@ void tracking_get_current_angles(float *az_deg, float *el_deg);
     ```
 */
 void tracking_get_move_stats(uint32_t *moves_today, uint32_t *total_moves);
+
+/*
+    Get mount calibration offsets.
+    
+    Returns:
+    - az_offset_deg: Azimuth offset in degrees
+    - el_offset_deg: Elevation offset in degrees
+    
+    Offsets are learned during calibration and persist in NVS.
+    Relationship: mount_angle = earth_angle - offset
+    
+    Thread-safe: can be called from any task.
+    
+    Example:
+    ```c
+    float az_offset, el_offset;
+    tracking_get_mount_offsets(&az_offset, &el_offset);
+    printf("Offsets: %.1f° az, %.1f° el\n", az_offset, el_offset);
+    ```
+*/
+void tracking_get_mount_offsets(float *az_offset_deg, float *el_offset_deg);

@@ -446,6 +446,7 @@ void sdlog_write_csv_header_if_new(const char *path){
     fprintf(f, "timestamp,latitude,longitude,gps_valid,gps_sats,gps_fix_age_sec,");
     fprintf(f, "sun_elevation,sun_azimuth,panel_elevation,panel_azimuth,");
     fprintf(f, "delta_elevation,delta_azimuth,tracking_quality,");
+    fprintf(f, "compass_heading,mount_base_heading,"); 
     fprintf(f, "battery_voltage,battery_soc_percent,battery_soc_level,battery_charging,battery_adc,");
     fprintf(f, "moves_today,total_moves,uptime_hours,");
     fprintf(f, "status,wifi_clients,wifi_rssi,sd_status,");

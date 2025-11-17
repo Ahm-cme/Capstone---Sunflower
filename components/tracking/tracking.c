@@ -136,7 +136,11 @@ static tracker_state_t s = {
     .el_home_dir_level = 0,
     
     .last_move_az_tgt = 0.0,           // Start at home
-    .last_move_el_tgt = 0.0
+    .last_move_el_tgt = 0.0,
+
+    // NEW: Mount orientation (set once at startup from compass)
+    .mount_base_heading_deg = 180.0,   // System front faces NORTH, back faces SOUTH (180°)
+    .compass_heading_deg = 180.0,      // Current compass reading (for logging)
 };
 
 static SemaphoreHandle_t s_mutex;      // Reserved for future multi-thread access to 's'
@@ -700,11 +704,6 @@ static double wrap360(double d){
     return d;
 }
 
-static double wrap180(double d){
-    while (d > 180.0) d -= 360.0;
-    while (d < -180.0) d += 360.0;
-    return d;
-}
 
 /*
  * Determine if the sun is descending (helps avoid premature sleep).
@@ -1126,15 +1125,124 @@ static void tracking_task(void *arg){
         // === Sun Position Calculation ===
         time_t now = time(NULL);
         sun_pos_t sun = solar_compute(g.latitude, g.longitude, now);
-        
-        // Convert earth frame → mount frame using offsets
-        s.az_tgt = wrap360(sun.azimuth_deg - s.az_mount_offset_deg);
-        s.el_tgt = sun.elevation_deg - s.el_mount_offset_deg;
 
-        // Calculate change since last move
-        double daz = fabs(wrap180(s.az_tgt - s.last_move_az_tgt));
-        double del = fabs(s.el_tgt - s.last_move_el_tgt);
-        double dang = fmax(daz, del);
+        // Get compass heading for mount orientation
+        float compass_heading_deg;
+        bool compass_valid = gps_get_compass_heading_true(&compass_heading_deg);
+
+        if (compass_valid) {
+            s.compass_heading_deg = compass_heading_deg;
+            ESP_LOGD(TAG, "Compass: %.1f° (system back facing)", compass_heading_deg);
+        } else {
+            ESP_LOGW(TAG, "⚠ Compass not available - using default 180°");
+            s.compass_heading_deg = 180.0;  // Default: back faces south
+        }
+
+        // ============================================================
+        // CRITICAL: Transform earth frame → mount frame
+        // ============================================================
+        // Sun position in earth frame: sun.azimuth_deg (0°=N, 90°=E, 180°=S, 270°=W)
+        // Mount base heading: s.mount_base_heading_deg (180° = back faces south)
+        // 
+        // Your mount frame:
+        //   AZ = 0° (center):  Panel horizontal, back faces mount_base_heading
+        //   AZ = +45° (max):   Panel rotated 45° clockwise (when viewed from above)
+        //   AZ = -45° (min):   Panel rotated 45° counter-clockwise
+        //
+        // Transform: mount_az = (sun_az - mount_base_heading) normalized to [-45, +45]
+        // ============================================================
+
+        // Calculate mount-frame azimuth (relative to system's BACK direction)
+        double mount_az_raw = sun.azimuth_deg - s.mount_base_heading_deg;
+
+        // Normalize to [-180, +180]
+        while (mount_az_raw > 180.0) mount_az_raw -= 360.0;
+        while (mount_az_raw < -180.0) mount_az_raw += 360.0;
+
+        // CRITICAL FIX: Determine if sun is behind or in front of tracker
+        bool sun_is_behind = (fabs(mount_az_raw) > 90.0);
+
+        // Apply mount offset (calibration)
+        mount_az_raw -= s.az_mount_offset_deg;
+
+        // Clamp to mechanical limits [-45, +45]
+        if (mount_az_raw > 45.0) {
+            ESP_LOGW(TAG, "⚠ Sun azimuth %.1f° beyond +45° limit (sun too far east)", mount_az_raw);
+            mount_az_raw = 45.0;
+        }
+        if (mount_az_raw < -45.0) {
+            ESP_LOGW(TAG, "⚠ Sun azimuth %.1f° beyond -45° limit (sun too far west)", mount_az_raw);
+            mount_az_raw = -45.0;
+        }
+
+        s.az_tgt = mount_az_raw;
+
+        // === ELEVATION WITH POLARITY CORRECTION ===
+        // When sun is behind tracker (|mount_az| > 90°):
+        //   - Panel tilts DOWN/BACK (negative EL) to face backward
+        //   - EL = -sun_elevation → RETRACT actuator (tilt back toward sun)
+        // When sun is in front (|mount_az| < 90°):
+        //   - Panel tilts UP/FORWARD (positive EL) to face forward
+        //   - EL = +sun_elevation → EXTEND actuator (tilt toward sun)
+
+        double mount_el_raw;
+        if (sun_is_behind) {
+            // Sun behind → tilt DOWN/BACK (negative = retract actuator)
+            mount_el_raw = -sun.elevation_deg - s.el_mount_offset_deg;
+            ESP_LOGD(TAG, "Sun behind tracker: EL=%.1f° (RETRACT actuator, tilt DOWN/BACK)", mount_el_raw);
+        } else {
+            // Sun in front → tilt UP/FORWARD (positive = extend actuator)
+            mount_el_raw = +sun.elevation_deg - s.el_mount_offset_deg;
+            ESP_LOGD(TAG, "Sun in front: EL=+%.1f° (EXTEND actuator, tilt UP/FORWARD)", mount_el_raw);
+        }
+
+        // Clamp to mechanical limits
+        if (mount_el_raw > 56.0) {
+            ESP_LOGW(TAG, "⚠ Sun elevation %.1f° beyond +56° limit", mount_el_raw);
+            mount_el_raw = 56.0;
+        }
+        if (mount_el_raw < -56.0) {
+            ESP_LOGW(TAG, "⚠ Sun elevation %.1f° beyond -56° limit", mount_el_raw);
+            mount_el_raw = -56.0;
+        }
+
+        s.el_tgt = mount_el_raw;
+
+        // Enhanced logging to show polarity decision
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGI(TAG, "║          COORDINATE FRAME TRANSFORMATION                   ║");
+        ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Sun Position (Earth Frame):");
+        ESP_LOGI(TAG, "  - Azimuth: %.1f° (0°=N, 90°=E, 180°=S, 270°=W)", sun.azimuth_deg);
+        ESP_LOGI(TAG, "  - Elevation: %.1f°", sun.elevation_deg);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Mount Orientation:");
+        ESP_LOGI(TAG, "  - Base heading: %.1f° (system back faces this direction)", s.mount_base_heading_deg);
+        ESP_LOGI(TAG, "  - Compass reading: %.1f° (current back direction)", s.compass_heading_deg);
+        ESP_LOGI(TAG, "  - Sun position relative to tracker: %s", sun_is_behind ? "BEHIND" : "IN FRONT");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Target Position (Mount Frame):");
+        ESP_LOGI(TAG, "  - Azimuth: %.1f° (±45° range, 0° = back faces base heading)", s.az_tgt);
+        ESP_LOGI(TAG, "  - Elevation: %.1f° (%s to face sun at %.1f°)", 
+                 s.el_tgt, 
+                 sun_is_behind ? "TILT UP" : "TILT DOWN",
+                 sun.elevation_deg);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Applied Offsets (Calibration):");
+        ESP_LOGI(TAG, "  - AZ: %.2f°", s.az_mount_offset_deg);
+        ESP_LOGI(TAG, "  - EL: %.2f°", s.el_mount_offset_deg);
+        ESP_LOGI(TAG, "");
+
+        // === Calculate Tracking Errors ===
+        // Delta since last move (for movement threshold check)
+        double daz = s.az_tgt - s.last_move_az_tgt;
+        double del = s.el_tgt - s.last_move_el_tgt;
+        double dang = sqrt(daz * daz + del * del);  // Euclidean distance
+        
+        ESP_LOGV(TAG, "Tracking deltas: dAZ=%.2f° dEL=%.2f° dTotal=%.2f°",
+                 daz, del, dang);
 
         // === Status Logging ===
         ESP_LOGI(TAG, "");
@@ -1155,6 +1263,10 @@ static void tracking_task(void *arg){
         ESP_LOGI(TAG, "Target (Mount Frame):");
         ESP_LOGI(TAG, "  - Azimuth: %.1f° (offset: %.2f°)", s.az_tgt, s.az_mount_offset_deg);
         ESP_LOGI(TAG, "  - Elevation: %.1f° (offset: %.2f°)", s.el_tgt, s.el_mount_offset_deg);
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "Current Position (Mount Frame):");
+        ESP_LOGI(TAG, "  - Azimuth: %.1f°", s.az_cur);
+        ESP_LOGI(TAG, "  - Elevation: %.1f°", s.el_cur);
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "Tracking Error:");
         ESP_LOGI(TAG, "  - Change since last move: %.2f° (threshold: %.1f°)", dang, s.tol_deg);
@@ -1279,14 +1391,17 @@ static void tracking_task(void *arg){
             if (sleep_duration > 86400) {
                 ESP_LOGW(TAG, "Sleep too long (%.1f h) - limiting to 12h", 
                          sleep_duration / 3600.0);
-                wake_ts = now + 43200;
+                wake_ts = now +  43200;
             }
+
+ }
 
             enter_deep_sleep_until(wake_ts);        // Does not return
         }
 
         // === Movement Decision ===
         const char *csv_note;
+
 
         if (dang >= s.tol_deg){
             ESP_LOGI(TAG, "Movement threshold exceeded: %.2f° ≥ %.1f°", dang, s.tol_deg);

@@ -272,75 +272,53 @@ esp_err_t motor_init(const motor_cfg_t *cfg){
     Uses conservative timing to prevent overshoot.
 */
 void motor_move_az(double current_deg, double target_deg){
-    if (!s_initialized) {
-        ESP_LOGE(TAG, "Motor system not initialized - cannot move AZ");
-        return;
-    }
-    
     ESP_LOGI(TAG, "AZ move requested: %.2f° → %.2f°", current_deg, target_deg);
-
-    // Apply safety limits to target angle
-    double clamped_target = target_deg;
-    if (target_deg > s_cfg.max_az_deg) {
-        clamped_target = s_cfg.max_az_deg;
-        ESP_LOGW(TAG, "⚠ AZ target %.2f° exceeds max %.2f°, clamped", target_deg, s_cfg.max_az_deg);
-    }
-    if (target_deg < 0.0) {
-        clamped_target = 0.0;
-        ESP_LOGW(TAG, "⚠ AZ target %.2f° below min 0°, clamped", target_deg);
-    }
-
-    // Calculate move delta for statistics
-    double move_delta = fabs(clamped_target - current_deg);
     
-    // Skip tiny moves (< 0.1°) to reduce wear
-    if (move_delta < 0.1) {
-        ESP_LOGD(TAG, "AZ move delta %.3f° too small, skipping", move_delta);
+    // FIXED: AZ range is -45° to +45° (90° total range, centered at 0°)
+    if (target_deg > 45.0) {
+        ESP_LOGW(TAG, "⚠ AZ target %.2f° above max +45°, clamped", target_deg);
+        target_deg = 45.0;
+    }
+    if (target_deg < -45.0) {
+        ESP_LOGW(TAG, "⚠ AZ target %.2f° below min -45°, clamped", target_deg);
+        target_deg = -45.0;
+    }
+    
+    // FIXED: Properly handle negative angles
+    // -45° = fully retracted (95.25mm)
+    //   0° = center (127.00mm)
+    // +45° = fully extended (158.75mm)
+    double center_mm = 127.0;  // 5.00" - center position
+    double range_mm = 31.75;   // 1.25" - movement from center to edge
+    
+    double cur_mm = center_mm + (current_deg / 45.0) * range_mm;
+    double tgt_mm = center_mm + (target_deg / 45.0) * range_mm;
+    
+    // FIXED: Invert direction logic (0=extend, 1=retract for MD20A driver)
+    int direction = (tgt_mm > cur_mm) ? 0 : 1;  // SWAPPED: 0=extend, 1=retract
+    double distance_mm = fabs(tgt_mm - cur_mm);
+    
+    if (distance_mm < 0.1) {
+        ESP_LOGD(TAG, "AZ move too small (%.2fmm), skipping", distance_mm);
         return;
     }
-
-    // Convert angles to actuator stroke positions
-    double current_mm = angle_to_mm(current_deg, s_cfg.max_az_deg);
-    double target_mm = angle_to_mm(clamped_target, s_cfg.max_az_deg);
     
-    // Determine direction: extend if target > current, retract otherwise
-    int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";
+    uint32_t time_ms = move_time_ms(cur_mm, tgt_mm);
     
-    // Set direction pin before starting PWM
-    gpio_set_level(s_cfg.az_dir_pin, dir_level);
-    ESP_LOGD(TAG, "AZ direction: %s (GPIO%d = %d)", dir_name, s_cfg.az_dir_pin, dir_level);
-
-    // Calculate conservative move time
-    uint32_t move_ms = move_time_ms(current_mm, target_mm);
+    ESP_LOGI(TAG, "AZ: %.1f°→%.1f° | %.2fmm→%.2fmm | %s %.2fmm (DIR=%d)",
+             current_deg, target_deg, cur_mm, tgt_mm,
+             direction ? "retract" : "extend", distance_mm, direction);
     
-    // Log the complete move plan
-    ESP_LOGI(TAG, "AZ executing:");
-    ESP_LOGI(TAG, "  Position: %.2f° → %.2f° (Δ=%.2f°)", current_deg, clamped_target, move_delta);
-    ESP_LOGI(TAG, "  Stroke: %.1f mm → %.1f mm (Δ=%.1f mm)", current_mm, target_mm, fabs(target_mm - current_mm));
-    ESP_LOGI(TAG, "  Direction: %s", dir_name);
-    ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
-
-    // Record start time for statistics
-    uint32_t start_tick = xTaskGetTickCount();
-    
-    // Execute the move at full speed with conservative timing
-    start_pwm(AZ_CH, 8191);                     // 100% duty
-    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
-    stop_pwm(AZ_CH);                            // Stop PWM, actuator coasts
-    
-    // Calculate actual duration
-    uint32_t actual_ms = (xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS;
+    // Execute move
+    start_pwm(AZ_CH, 8191);
+    gpio_set_level(s_cfg.az_dir_pin, direction);
+    vTaskDelay(pdMS_TO_TICKS(time_ms));
+    stop_pwm(AZ_CH);
     
     // Update statistics
-    s_stats.last_az_move_deg = move_delta;
-    s_stats.last_az_duration_ms = actual_ms;
+    s_stats.last_az_move_deg = target_deg;
+    s_stats.last_az_duration_ms = time_ms;
     s_stats.total_moves++;
-    
-    ESP_LOGI(TAG, "✓ AZ move complete:");
-    ESP_LOGI(TAG, "  Final position: ~%.1f°", clamped_target);
-    ESP_LOGI(TAG, "  Actual duration: %" PRIu32 " ms", actual_ms);
-    ESP_LOGI(TAG, "  Total moves: %" PRIu32, s_stats.total_moves);
 }
 
 /*
@@ -349,75 +327,53 @@ void motor_move_az(double current_deg, double target_deg){
     Uses conservative timing to prevent overshoot.
 */
 void motor_move_el(double current_deg, double target_deg){
-    if (!s_initialized) {
-        ESP_LOGE(TAG, "Motor system not initialized - cannot move EL");
-        return;
-    }
-    
     ESP_LOGI(TAG, "EL move requested: %.2f° → %.2f°", current_deg, target_deg);
-
-    // Apply elevation-specific safety limits
-    double clamped_target = target_deg;
-    if (target_deg > s_cfg.max_el_deg) {
-        clamped_target = s_cfg.max_el_deg;
-        ESP_LOGW(TAG, "⚠ EL target %.2f° exceeds max %.2f°, clamped", target_deg, s_cfg.max_el_deg);
-    }
-    if (target_deg < s_cfg.min_el_deg) {
-        clamped_target = s_cfg.min_el_deg;
-        ESP_LOGW(TAG, "⚠ EL target %.2f° below min %.2f°, clamped", target_deg, s_cfg.min_el_deg);
-    }
-
-    // Calculate move delta
-    double move_delta = fabs(clamped_target - current_deg);
     
-    // Skip tiny moves
-    if (move_delta < 0.1) {
-        ESP_LOGD(TAG, "EL move delta %.3f° too small, skipping", move_delta);
+    // FIXED: EL range is -56° to +56° (112° total range, centered at 0°)
+    if (target_deg > 56.0) {
+        ESP_LOGW(TAG, "⚠ EL target %.2f° above max +56°, clamped", target_deg);
+        target_deg = 56.0;
+    }
+    if (target_deg < -56.0) {
+        ESP_LOGW(TAG, "⚠ EL target %.2f° below min -56°, clamped", target_deg);
+        target_deg = -56.0;
+    }
+    
+    // FIXED: Properly handle negative angles
+    // -56° = fully retracted (64.58mm)
+    //   0° = center (107.95mm)
+    // +56° = fully extended (151.32mm)
+    double center_mm = 107.95;  // 4.25" - center position
+    double range_mm = 43.37;    // 1.71" - movement from center to edge
+    
+    double cur_mm = center_mm + (current_deg / 56.0) * range_mm;
+    double tgt_mm = center_mm + (target_deg / 56.0) * range_mm;
+    
+    // FIXED: Invert direction logic (0=extend, 1=retract for MD20A driver)
+    int direction = (tgt_mm > cur_mm) ? 0 : 1;  // SWAPPED: 0=extend, 1=retract
+    double distance_mm = fabs(tgt_mm - cur_mm);
+    
+    if (distance_mm < 0.1) {
+        ESP_LOGD(TAG, "EL move too small (%.2fmm), skipping", distance_mm);
         return;
     }
-
-    // Convert angles to actuator stroke positions
-    // Note: EL uses max_el_deg for scaling, not the full 0-max range like AZ
-    double current_mm = angle_to_mm(current_deg, s_cfg.max_el_deg);
-    double target_mm = angle_to_mm(clamped_target, s_cfg.max_el_deg);
     
-    // Determine direction
-    int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";
+    uint32_t time_ms = move_time_ms(cur_mm, tgt_mm);
     
-    // Set direction before starting motion
-    gpio_set_level(s_cfg.el_dir_pin, dir_level);
-    ESP_LOGD(TAG, "EL direction: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
-
-    // Calculate conservative timing
-    uint32_t move_ms = move_time_ms(current_mm, target_mm);
+    ESP_LOGI(TAG, "EL: %.1f°→%.1f° | %.2fmm→%.2fmm | %s %.2fmm (DIR=%d)",
+             current_deg, target_deg, cur_mm, tgt_mm,
+             direction ? "retract" : "extend", distance_mm, direction);
     
-    ESP_LOGI(TAG, "EL executing:");
-    ESP_LOGI(TAG, "  Position: %.2f° → %.2f° (Δ=%.2f°)", current_deg, clamped_target, move_delta);
-    ESP_LOGI(TAG, "  Stroke: %.1f mm → %.1f mm (Δ=%.1f mm)", current_mm, target_mm, fabs(target_mm - current_mm));
-    ESP_LOGI(TAG, "  Direction: %s", dir_name);
-    ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
-
-    // Record start time
-    uint32_t start_tick = xTaskGetTickCount();
-    
-    // Execute the move
-    start_pwm(EL_CH, 8191);                     // 100% duty
-    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
-    stop_pwm(EL_CH);                            // Stop
-    
-    // Calculate actual duration
-    uint32_t actual_ms = (xTaskGetTickCount() - start_tick) * portTICK_PERIOD_MS;
+    // Execute move
+    start_pwm(EL_CH, 8191);
+    gpio_set_level(s_cfg.el_dir_pin, direction);
+    vTaskDelay(pdMS_TO_TICKS(time_ms));
+    stop_pwm(EL_CH);
     
     // Update statistics
-    s_stats.last_el_move_deg = move_delta;
-    s_stats.last_el_duration_ms = actual_ms;
+    s_stats.last_el_move_deg = target_deg;
+    s_stats.last_el_duration_ms = time_ms;
     s_stats.total_moves++;
-    
-    ESP_LOGI(TAG, "✓ EL move complete:");
-    ESP_LOGI(TAG, "  Final position: ~%.1f°", clamped_target);
-    ESP_LOGI(TAG, "  Actual duration: %" PRIu32 " ms", actual_ms);
-    ESP_LOGI(TAG, "  Total moves: %" PRIu32, s_stats.total_moves);
 }
 
 /*
