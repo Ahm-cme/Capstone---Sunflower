@@ -155,37 +155,40 @@ void tracking_start(void);
 void tracking_calibrate_mount_offset_now(void);
 
 /*
-    Auto-calibrate azimuth offset using compass.
-    
-    Procedure:
-    1. Ensure compass is calibrated (double-press button first)
-    2. Call this function (or press button in future auto-mode)
-    3. System uses compass + GPS + sun position to compute az offset
-    4. Elevation offset left at 0 (requires manual calibration)
-    
-    Preconditions:
-    - Compass calibrated (gps_calibrate_compass() completed)
-    - Valid GPS fix
-    - Sun elevation > 15° (accurate sun azimuth needed)
-    
-    Advantages:
-    - No manual alignment required
-    - Can be done anytime sun is visible
-    - Useful for field deployment
-    
-    Limitations:
-    - Only calibrates azimuth (elevation still needs manual)
-    - Requires compass calibration first
-    - Less accurate than manual calibration
-    
-    Algorithm:
-    - Reads magnetic heading from HMC5883L compass
-    - Applies magnetic declination (GPS provides this)
-    - Compares true heading to calculated sun azimuth
-    - Computes offset to align tracking with compass/sun
-    
-    Stores az_mount_offset in NVS flash.
-*/
+ * Auto-calibrate BOTH azimuth and elevation offsets using compass.
+ * 
+ * NEW: Calculates elevation offset automatically!
+ * 
+ * Procedure:
+ *  1. Ensure compass is calibrated (double-press button first)
+ *  2. Position panel LEVEL (horizontal, both actuators at center)
+ *  3. Call this function (or press button in future auto-mode)
+ *  4. System uses compass + GPS + sun position to compute BOTH offsets
+ * 
+ * Preconditions:
+ *  - Compass calibrated (gps_calibrate_compass() completed)
+ *  - Valid GPS fix
+ *  - Sun elevation > 15° (accurate sun azimuth needed)
+ *  - Panel should be LEVEL (0° elevation) for best results
+ * 
+ * Advantages:
+ *  - No manual alignment required
+ *  - Can be done anytime sun is visible
+ *  - Useful for field deployment
+ *  - Automatically calculates BOTH az and el offsets
+ * 
+ * Algorithm:
+ *  - Reads magnetic heading from HMC5883L compass
+ *  - Applies magnetic declination (GPS provides this)
+ *  - Compares true heading to calculated sun azimuth
+ *  - Assumes panel is level → calculates el offset
+ *  - Computes offsets to align tracking with compass/sun
+ * 
+ * Results:
+ *  - Stores az_mount_offset in NVS flash
+ *  - Stores el_mount_offset in NVS flash
+ *  - Future tracking uses: target = sun_position - offsets
+ */
 void tracking_auto_calibrate_with_compass(void);
 
 /*

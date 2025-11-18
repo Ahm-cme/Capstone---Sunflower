@@ -142,44 +142,91 @@
  * Calibration data is saved to NVS flash and persists across reboots.
  */
 static void calib_task(void *arg){
+    DEBUG_TRACE();
     ESP_LOGI(TAG, "Calibration monitor running");
     ESP_LOGI(TAG, "Hold START button for 3 seconds to calibrate");
     
+    uint32_t loop_count = 0;
+    
     for(;;){
+        loop_count++;
+        
+        // Log every 60 seconds to show task is alive
+        if (loop_count % 300 == 0) {
+            ESP_LOGD(TAG, "Calibration monitor: alive (iteration %lu)", (unsigned long)loop_count);
+        }
+        
         // Check if button is pressed
         if (button_wait_for_press(100)) {
             uint32_t press_start = xTaskGetTickCount();
             uint32_t hold_time = 0;
+            
+            ESP_LOGD(TAG, "Button press detected at tick %lu", (unsigned long)press_start);
             
             // Keep checking while button is held down
             while (button_is_pressed()) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 hold_time = (xTaskGetTickCount() - press_start) * portTICK_PERIOD_MS;
                 
+                // Log progress every 500ms
+                if (hold_time % 500 == 0 && hold_time > 0) {
+                    ESP_LOGD(TAG, "Button held: %lu ms / 3000 ms", (unsigned long)hold_time);
+                }
+                
                 // If held for 3+ seconds, start calibration
                 if (hold_time >= 3000) {
-                    ESP_LOGI(TAG, "Button held 3s - starting calibration");
+                    ESP_LOGI(TAG, "✓ Button held 3s - starting calibration");
+                    ESP_LOGD(TAG, "  Final hold time: %lu ms", (unsigned long)hold_time);
                     
                     // Blink LED fast during calibration
+                    ESP_LOGD(TAG, "Setting LED mode: LED_STARTUP");
                     status_led_set_mode(LED_STARTUP);
                     
                     // Log to SD card
+                    ESP_LOGD(TAG, "Writing calibration start to SD log");
                     sdlog_printf("Starting mount calibration");
                     
+                    // Get angles BEFORE calibration
+                    float before_az, before_el;
+                    tracking_get_current_angles(&before_az, &before_el);
+                    ESP_LOGI(TAG, "Current position BEFORE calibration: Az=%.1f° El=%.1f°", 
+                             before_az, before_el);
+                    
                     // Do the actual calibration
+                    ESP_LOGD(TAG, "Calling tracking_calibrate_mount_offset_now()...");
                     tracking_calibrate_mount_offset_now();
+                    ESP_LOGD(TAG, "Calibration function returned");
+                    
+                    // Get offsets AFTER calibration
+                    float after_az_offset, after_el_offset;
+                    tracking_get_mount_offsets(&after_az_offset, &after_el_offset);
+                    ESP_LOGI(TAG, "Mount offsets AFTER calibration: Az=%.1f° El=%.1f°",
+                             after_az_offset, after_el_offset);
                     
                     // Back to normal LED pattern
+                    ESP_LOGD(TAG, "Setting LED mode: LED_TRACKING");
                     status_led_set_mode(LED_TRACKING);
                     
-                    ESP_LOGI(TAG, "Calibration done");
+                    ESP_LOGI(TAG, "✓ Calibration complete");
                     
                     // Wait for button release
+                    ESP_LOGD(TAG, "Waiting for button release...");
+                    uint32_t release_wait = 0;
                     while (button_is_pressed()) {
                         vTaskDelay(pdMS_TO_TICKS(50));
+                        release_wait += 50;
+                        if (release_wait % 500 == 0) {
+                            ESP_LOGV(TAG, "Still waiting for release (%lu ms)", (unsigned long)release_wait);
+                        }
                     }
+                    ESP_LOGD(TAG, "Button released after %lu ms", (unsigned long)release_wait);
                     break;
                 }
+            }
+            
+            // Button was released before 3 seconds
+            if (hold_time < 3000) {
+                ESP_LOGD(TAG, "Button released too early (%lu ms < 3000 ms)", (unsigned long)hold_time);
             }
         }
         
@@ -204,31 +251,58 @@ static void calib_task(void *arg){
  * This improves azimuth tracking accuracy using the GPS module's compass.
  */
 static void compass_calib_task(void *arg){
+    DEBUG_TRACE();
     ESP_LOGI(TAG, "Compass calibration monitor running");
     ESP_LOGI(TAG, "Double-press START to calibrate compass");
     
     uint32_t last_press = 0;
+    uint32_t loop_count = 0;
     
     for(;;){
+        loop_count++;
+        
+        // Log every 60 seconds
+        if (loop_count % 300 == 0) {
+            ESP_LOGD(TAG, "Compass monitor: alive (iteration %lu)", (unsigned long)loop_count);
+        }
+        
         if (button_wait_for_press(100)) {
             uint32_t now = xTaskGetTickCount();
             uint32_t time_since_last = (now - last_press) * portTICK_PERIOD_MS;
             
+            ESP_LOGD(TAG, "Button press detected (last press %lu ms ago)", (unsigned long)time_since_last);
+            
             // Check if this is a double-press (< 1 second apart)
-            if (time_since_last < 1000) {
-                ESP_LOGI(TAG, "Double-press detected - calibrating compass");
+            if (time_since_last < 1000 && last_press > 0) {
+                ESP_LOGI(TAG, "✓ Double-press detected (%lu ms apart) - calibrating compass", 
+                         (unsigned long)time_since_last);
+                
+                ESP_LOGD(TAG, "Writing compass calibration start to SD log");
                 sdlog_printf("Starting compass calibration");
                 
                 // Fast blink = calibration mode
+                ESP_LOGD(TAG, "Setting LED mode: LED_STARTUP");
                 status_led_set_mode(LED_STARTUP);
                 
+                // Check compass status BEFORE calibration
+                bool was_calibrated = gps_is_compass_calibrated();
+                ESP_LOGD(TAG, "Compass calibrated before: %s", was_calibrated ? "YES" : "NO");
+                
+                ESP_LOGI(TAG, "Starting compass calibration (rotate panel slowly)...");
                 bool success = gps_calibrate_compass();
                 
                 if (success) {
-                    ESP_LOGI(TAG, "Compass calibration successful");
+                    ESP_LOGI(TAG, "✓ Compass calibration successful");
                     sdlog_printf("Compass calibration: OK");
                     
+                    // Test compass reading after calibration
+                    float heading;
+                    if (gps_get_compass_heading(&heading)) {
+                        ESP_LOGI(TAG, "  Compass reading after calibration: %.1f°", heading);
+                    }
+                    
                     // Blink LED 3 times to show success
+                    ESP_LOGD(TAG, "Success indication: 3 blinks");
                     for (int i = 0; i < 3; i++) {
                         status_led_set_mode(LED_ERROR);
                         vTaskDelay(pdMS_TO_TICKS(200));
@@ -236,16 +310,30 @@ static void compass_calib_task(void *arg){
                         vTaskDelay(pdMS_TO_TICKS(200));
                     }
                 } else {
-                    ESP_LOGW(TAG, "Compass calibration failed");
+                    ESP_LOGW(TAG, "✗ Compass calibration failed");
                     sdlog_printf("Compass calibration: FAILED");
+                    
+                    ESP_LOGD(TAG, "Setting LED mode: LED_ERROR (3s)");
                     status_led_set_mode(LED_ERROR);
                     vTaskDelay(pdMS_TO_TICKS(3000));
                 }
                 
+                ESP_LOGD(TAG, "Restoring LED mode: LED_TRACKING");
                 status_led_set_mode(LED_TRACKING);
                 last_press = 0;
             } else {
                 last_press = now;
+                ESP_LOGD(TAG, "First press recorded (waiting for second press within 1s)");
+            }
+        }
+        
+        // Reset double-press timer after 1 second
+        if (last_press > 0) {
+            uint32_t now = xTaskGetTickCount();
+            uint32_t elapsed = (now - last_press) * portTICK_PERIOD_MS;
+            if (elapsed >= 1000) {
+                ESP_LOGV(TAG, "Double-press timeout (%lu ms), resetting", (unsigned long)elapsed);
+                last_press = 0;
             }
         }
         
@@ -276,46 +364,72 @@ static void compass_calib_task(void *arg){
  *  INFO: Optional features (compass calibration)
  */
 static bool perform_system_check(bool init_results[9]) {
+    DEBUG_TRACE();
+    
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║          SYSTEM INITIALIZATION & HEALTH CHECK              ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     
+    ESP_LOGD(TAG, "Checking %d subsystems...", 9);
+    
     bool system_healthy = true;
     int critical_failures = 0;
     int warnings = 0;
     
     // === 1. Status LED Check ===
+    ESP_LOGD(TAG, "[1/9] Status LED check starting...");
     ESP_LOGI(TAG, "[1/9] Checking Status LED...");
     if (init_results[0]) {
         ESP_LOGI(TAG, "  ✓ Status LED: OK");
         ESP_LOGI(TAG, "    - GPIO: %d", STATUS_LED_GPIO);
         ESP_LOGI(TAG, "    - Mode: LED_STARTUP (fast blink)");
+        ESP_LOGD(TAG, "    LED subsystem fully operational");
     } else {
         ESP_LOGW(TAG, "  ⚠ Status LED: FAILED (continuing without visual feedback)");
+        ESP_LOGD(TAG, "    Check GPIO%d configuration", STATUS_LED_GPIO);
         warnings++;
     }
     
-    // === 2. NVS Flash Check ===
+    // === 2. NVS Flash Check (ADD DETAILED DIAGNOSTICS) ===
+    ESP_LOGD(TAG, "[2/9] NVS Flash check starting...");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "[2/9] Checking NVS Flash Storage...");
     if (init_results[1]) {
         // Read some test data to verify flash is working
         nvs_handle_t test_handle;
         esp_err_t ret = nvs_open("tracker", NVS_READONLY, &test_handle);
+        
+        ESP_LOGD(TAG, "NVS open result: %s (%d)", esp_err_to_name(ret), ret);
+        
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "  ✓ NVS Flash: OK (read/write verified)");
+            
+            // Try to read some saved values
+            float saved_az = 0.0f;
+            uint32_t saved_moves = 0;
+            
+            if (nvs_get_float(test_handle, "az_cur", &saved_az) == ESP_OK) {
+                ESP_LOGD(TAG, "    Found saved position: Az=%.1f°", saved_az);
+            }
+            
+            if (nvs_get_u32(test_handle, "total_moves", &saved_moves) == ESP_OK) {
+                ESP_LOGD(TAG, "    Found saved move count: %lu", (unsigned long)saved_moves);
+            }
+            
             nvs_close(test_handle);
         } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGI(TAG, "  ✓ NVS Flash: OK (first boot, no saved data)");
+            ESP_LOGD(TAG, "    Namespace 'tracker' not found - will be created on first save");
         } else {
-            ESP_LOGE(TAG, "  ✗ NVS Flash: READ ERROR");
+            ESP_LOGE(TAG, "  ✗ NVS Flash: READ ERROR (%s)", esp_err_to_name(ret));
             critical_failures++;
             system_healthy = false;
         }
     } else {
         ESP_LOGE(TAG, "  ✗ NVS Flash: INITIALIZATION FAILED");
+        ESP_LOGD(TAG, "    This will prevent state persistence across reboots");
         critical_failures++;
         system_healthy = false;
     }
@@ -561,6 +675,11 @@ static bool perform_system_check(bool init_results[9]) {
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
     
+    ESP_LOGD(TAG, "System health summary:");
+    ESP_LOGD(TAG, "  - Critical failures: %d", critical_failures);
+    ESP_LOGD(TAG, "  - Warnings: %d", warnings);
+    ESP_LOGD(TAG, "  - Overall status: %s", system_healthy ? "HEALTHY" : "UNHEALTHY");
+    
     if (system_healthy) {
         ESP_LOGI(TAG, "  ✓ SYSTEM READY");
         if (warnings > 0) {
@@ -578,15 +697,13 @@ static bool perform_system_check(bool init_results[9]) {
         ESP_LOGE(TAG, "  ✗ SYSTEM NOT READY");
         ESP_LOGE(TAG, "  %d CRITICAL FAILURE%s", 
                  critical_failures, critical_failures == 1 ? "" : "S");
-        if (warnings > 0) {
-            ESP_LOGW(TAG, "  %d warning%s", warnings, warnings == 1 ? "" : "s");
-        }
-        ESP_LOGE(TAG, "");
-        ESP_LOGE(TAG, "  Fix critical issues before operation:");
-        if (!init_results[1]) ESP_LOGE(TAG, "   - NVS Flash storage");
-        if (!init_results[3]) ESP_LOGE(TAG, "   - GPS module connection");
-        if (!init_results[4]) ESP_LOGE(TAG, "   - Motor driver initialization");
-        if (!init_results[5]) ESP_LOGE(TAG, "   - Button interface");
+        
+        // List specific failures
+        ESP_LOGD(TAG, "Failed subsystems:");
+        if (!init_results[1]) ESP_LOGD(TAG, "  [1] NVS Flash");
+        if (!init_results[3]) ESP_LOGD(TAG, "  [3] GPS Module");
+        if (!init_results[4]) ESP_LOGD(TAG, "  [4] Motor Drivers");
+        if (!init_results[5]) ESP_LOGD(TAG, "  [5] Button Interface");
         
         if (init_results[2]) {
             sdlog_printf("System check: FAIL (%d critical, %d warnings)", 
@@ -646,17 +763,32 @@ static void set_local_timezone(void) {
 }
 
 void app_main(void){
+    DEBUG_TRACE();
+    
     ESP_LOGI(TAG, "=== SUNFLOWER TRACKER STARTING ===");
     ESP_LOGI(TAG, "Build date: %s %s", __DATE__, __TIME__);
     ESP_LOGI(TAG, "ESP-IDF version: %s", esp_get_idf_version());
     
-    // Check why we woke up (power on vs timer wake)
+    // Log memory info
+    ESP_LOGD(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    ESP_LOGD(TAG, "Min free heap: %lu bytes", (unsigned long)esp_get_minimum_free_heap_size());
+    
+    // Check why we woke up
     esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     const char* wake_reason = "UNKNOWN";
     switch(wake_cause){
-        case ESP_SLEEP_WAKEUP_TIMER:    wake_reason = "TIMER"; break;
-        case ESP_SLEEP_WAKEUP_EXT0:     wake_reason = "BUTTON"; break;
-        default:                        wake_reason = "POWER_ON"; break;
+        case ESP_SLEEP_WAKEUP_TIMER:    
+            wake_reason = "TIMER"; 
+            ESP_LOGD(TAG, "Woke from deep sleep (timer expired)");
+            break;
+        case ESP_SLEEP_WAKEUP_EXT0:     
+            wake_reason = "BUTTON"; 
+            ESP_LOGD(TAG, "Woke from deep sleep (button pressed)");
+            break;
+        default:                        
+            wake_reason = "POWER_ON"; 
+            ESP_LOGD(TAG, "Cold boot (power cycled or reset)");
+            break;
     }
     ESP_LOGI(TAG, "Wake reason: %s", wake_reason);
     ESP_LOGI(TAG, "");
@@ -959,7 +1091,14 @@ void app_main(void){
             gps_data_t g = {0};
             bool gps_fresh = gps_poll_nav_pvt(&g);
             bool gps_valid = gps_fresh || gps_get_last(&g);
-            uint32_t gps_fix_age_sec = gps_valid ? (uint32_t)(now - g.timestamp) : 9999;
+            uint32_t gps_fix_age_sec = 9999;
+            if (gps_valid) {
+                if (now >= g.timestamp) {
+                    gps_fix_age_sec = (uint32_t)(now - g.timestamp);
+                } else {
+                    gps_fix_age_sec = 9999;  // Timestamp in future
+                }
+            }
             
             // Get battery data
             battery_data_t battery;
@@ -988,8 +1127,37 @@ void app_main(void){
             uint32_t sunset_time = 0;
             if (gps_valid) {
                 solar_events_t events = solar_events(g.latitude, g.longitude, now);
-                if (events.has_sunrise) sunrise_time = (uint32_t)events.sunrise_utc;
-                if (events.has_sunset)  sunset_time  = (uint32_t)events.sunset_utc;
+                
+                if (events.has_sunrise) {
+                    // Convert UTC to local time for display consistency
+                    struct tm *sunrise_local = localtime(&events.sunrise_utc);
+                    sunrise_time = (uint32_t)mktime(sunrise_local);
+                    
+                    ESP_LOGV(TAG, "Sunrise: UTC=%ld → Local=%lu", 
+                             (long)events.sunrise_utc, (unsigned long)sunrise_time);
+                }
+                
+                if (events.has_sunset) {
+                    // Convert UTC to local time for display consistency
+                    struct tm *sunset_local = localtime(&events.sunset_utc);
+                    sunset_time = (uint32_t)mktime(sunset_local);
+                    
+                    ESP_LOGV(TAG, "Sunset: UTC=%ld → Local=%lu", 
+                             (long)events.sunset_utc, (unsigned long)sunset_time);
+                }
+                
+                // Log once per hour for debugging
+                static uint32_t last_solar_log = 0;
+                if ((now - last_solar_log) >= 3600) {
+                    if (events.has_sunrise && events.has_sunset) {
+                        struct tm *sr = localtime(&events.sunrise_utc);
+                        struct tm *ss = localtime(&events.sunset_utc);
+                        
+                        ESP_LOGI(TAG, "Solar times (local): Sunrise %02d:%02d, Sunset %02d:%02d",
+                                 sr->tm_hour, sr->tm_min, ss->tm_hour, ss->tm_min);
+                    }
+                    last_solar_log = now;
+                }
             }
             
             // Get WiFi client count
@@ -1298,8 +1466,15 @@ void app_main(void){
         uint32_t gps_fix_age_sec = 0;
         
         if (gps_valid) {
-            // Calculate how long since last valid fix
-            gps_fix_age_sec = (uint32_t)(now - g.timestamp);
+            // Calculate how long since last valid fix (protect against underflow)
+            if (now >= g.timestamp) {
+                gps_fix_age_sec = (uint32_t)(now - g.timestamp);
+            } else {
+                // Timestamp in future? GPS time sync issue - treat as stale
+                gps_fix_age_sec = 9999;
+                ESP_LOGW(TAG, "GPS timestamp in future (now=%ld, gps=%ld) - clock sync issue?",
+                         (long)now, (long)g.timestamp);
+            }
             
             // Warn if GPS data is stale (>5 minutes)
             if (gps_fix_age_sec > 300) {
@@ -1328,30 +1503,42 @@ void app_main(void){
             }
         }
         
-        // Calculate sunrise/sunset times for today
+        // Calculate sunrise/sunset times for today (CONVERT TO LOCAL TIME)
         uint32_t sunrise_time = 0;
         uint32_t sunset_time = 0;
         
         if (gps_valid) {
             solar_events_t events = solar_events(g.latitude, g.longitude, now);
-            if (events.has_sunrise) sunrise_time = (uint32_t)events.sunrise_utc;
-            if (events.has_sunset)  sunset_time  = (uint32_t)events.sunset_utc;
             
-            // Log sunrise/sunset once per day at startup or midnight
-            static uint32_t last_event_log = 0;
-            if ((now - last_event_log) >= 86400 || last_event_log == 0) {
-                struct tm *sunrise_tm = localtime(&events.sunrise_utc);
-                struct tm *sunset_tm = localtime(&events.sunset_utc);
+            if (events.has_sunrise) {
+                // Convert UTC to local time for display consistency
+                struct tm *sunrise_local = localtime(&events.sunrise_utc);
+                sunrise_time = (uint32_t)mktime(sunrise_local);
                 
-                ESP_LOGI(TAG, "Solar times: Sunrise %02d:%02d, Sunset %02d:%02d",
-                         sunrise_tm->tm_hour, sunrise_tm->tm_min,
-                         sunset_tm->tm_hour, sunset_tm->tm_min);
-                         
-                sdlog_printf("Today: sunrise %02d:%02d, sunset %02d:%02d",
-                             sunrise_tm->tm_hour, sunrise_tm->tm_min,
-                             sunset_tm->tm_hour, sunset_tm->tm_min);
-                             
-                last_event_log = now;
+                ESP_LOGV(TAG, "Sunrise: UTC=%ld → Local=%lu", 
+                         (long)events.sunrise_utc, (unsigned long)sunrise_time);
+            }
+            
+            if (events.has_sunset) {
+                // Convert UTC to local time for display consistency
+                struct tm *sunset_local = localtime(&events.sunset_utc);
+                sunset_time = (uint32_t)mktime(sunset_local);
+                
+                ESP_LOGV(TAG, "Sunset: UTC=%ld → Local=%lu", 
+                         (long)events.sunset_utc, (unsigned long)sunset_time);
+            }
+            
+            // Log once per hour for debugging
+            static uint32_t last_solar_log = 0;
+            if ((now - last_solar_log) >= 3600) {
+                if (events.has_sunrise && events.has_sunset) {
+                    struct tm *sr = localtime(&events.sunrise_utc);
+                    struct tm *ss = localtime(&events.sunset_utc);
+                    
+                    ESP_LOGI(TAG, "Solar times (local): Sunrise %02d:%02d, Sunset %02d:%02d",
+                             sr->tm_hour, sr->tm_min, ss->tm_hour, ss->tm_min);
+                }
+                last_solar_log = now;
             }
         }
         
@@ -1380,11 +1567,29 @@ void app_main(void){
         
         // Get sun position
         sun_pos_t sun = solar_compute(
-            gps_valid ? g.latitude : 0.0, 
-            gps_valid ? g.longitude : 0.0, 
+            gps_valid ? g.latitude : 0.0,
+            gps_valid ? g.longitude : 0.0,
             now
         );
-        
+
+        // Get compass heading (for logging)
+        float compass_heading_true = 0.0f;
+        bool compass_valid = false;
+        if (gps_is_compass_calibrated()) {
+            compass_valid = gps_get_compass_heading_true(&compass_heading_true);
+        }
+
+        // Log compass periodically (every 60 seconds)
+        static uint32_t last_compass_log = 0;
+        if (compass_valid && (now - last_compass_log) >= 60) {
+            float declination = gps_get_magnetic_declination();
+            ESP_LOGI(TAG, "Compass: True heading=%.1f° (Decl=%.1f°)",
+                     compass_heading_true, declination);
+            sdlog_printf("Compass: True=%.1f° Decl=%.1f°",
+                         compass_heading_true, declination);
+            last_compass_log = now;
+        }
+
         // Calculate tracking error (how far off we are from sun)
         float az_error = fabs(current_azimuth - sun.azimuth_deg);
         float el_error = fabs(current_elevation - sun.elevation_deg);
@@ -1465,9 +1670,9 @@ void app_main(void){
             .battery_soc_percent = battery_soc,
             .battery_soc = battery_soc_level,
             .battery_charging = battery_charging,
-            .timestamp = (uint32_t)local_timestamp,  // CHANGED: Local time instead of UTC
-            .sunrise_time = sunrise_time,            // These stay UTC (calculations use UTC)
-            .sunset_time = sunset_time,              // These stay UTC (calculations use UTC)
+            .timestamp = (uint32_t)local_timestamp,  // Local time (client displays directly)
+            .sunrise_time = sunrise_time,            // Local time (converted from UTC at lines 1369-1370)
+            .sunset_time = sunset_time,              // Local time (converted from UTC at lines 1378-1379)
             .status = system_status,
             .latitude = gps_valid ? (float)g.latitude : 0.0f,
             .longitude = gps_valid ? (float)g.longitude : 0.0f,
@@ -1485,29 +1690,46 @@ void app_main(void){
             .tracking_quality = tracking_quality,
         };
         
-        // Send data over WiFi to LCD display
+        // Send data over WiFi
         esp_err_t send_ret = wifi_comm_send_data(&tx_data);
+        
+        ESP_LOGV(TAG, "wifi_comm_send_data() returned: %s", esp_err_to_name(send_ret));
+        
         if (send_ret == ESP_OK) {
-            // Enhanced log with new data
             ESP_LOGI(TAG, "LCD[%u]: El=%.1f° Az=%.1f° Batt=%.2fV(%.0f%%) GPS=%lus SD=%u Sun[%.1f°,%.1f°]",
                      wifi_client_count,
                      tx_data.elevation, tx_data.azimuth,
                      tx_data.battery_voltage, tx_data.battery_soc_percent,
-                     (unsigned long)gps_fix_age_sec,  // FIXED
+                     (unsigned long)gps_fix_age_sec,
                      sd_status,
                      tx_data.sun_elevation, tx_data.sun_azimuth);
+            
+            ESP_LOGD(TAG, "  Packet size: %d bytes", sizeof(tracker_data_t));
+            ESP_LOGD(TAG, "  Deltas: Δaz=%.2f° Δel=%.2f°", delta_az, delta_elev);
+            ESP_LOGD(TAG, "  Tracking quality: %u° error", tracking_quality);
+            ESP_LOGD(TAG, "  Moves: %lu today, %lu total", 
+                     (unsigned long)moves_today, (unsigned long)total_moves);
+            
             connection_wait_counter = 0;
         } else if (send_ret == ESP_ERR_NOT_FOUND) {
             connection_wait_counter++;
+            
+            if (connection_wait_counter == 1) {
+                ESP_LOGW(TAG, "No LCD display connected (waiting for client)");
+            }
+            
             if (connection_wait_counter % 10 == 0) {
                 ESP_LOGW(TAG, "Waiting for LCD display to connect... (%lu s)", 
-                         (unsigned long)connection_wait_counter);  // FIXED
+                         (unsigned long)connection_wait_counter);
+                ESP_LOGD(TAG, "  WiFi AP active: SSID=SunflowerTracker");
+                ESP_LOGD(TAG, "  Clients connected: %u", wifi_client_count);
             }
         } else {
             ESP_LOGE(TAG, "Failed to send data: %s", esp_err_to_name(send_ret));
+            ESP_LOGD(TAG, "  Error code: 0x%x", send_ret);
         }
         
-        // Update once per second (1 Hz transmission rate)
+        // Update once per second
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

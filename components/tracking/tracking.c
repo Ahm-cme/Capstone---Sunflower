@@ -72,6 +72,9 @@
 
 #define TAG "TRACK"
 
+// Add a fixed compass→mount-front correction (sensor mounted reversed: front=N, compass reads S)
+#define MOUNT_COMPASS_OFFSET_DEG  180.0f
+
 // Around line 130, UPDATE the state initialization comment and values:
 
 /*
@@ -158,216 +161,295 @@ static SemaphoreHandle_t s_mutex;      // Reserved for future multi-thread acces
  * Flash wear: ~100k write cycles, so periodic saves are safe.
  */
 static void nvs_save(void){
+    DEBUG_TRACE();
+    
+    ESP_LOGD(TAG, "Preparing to save state to NVS...");
+    ESP_LOGD(TAG, "  Data to save:");
+    ESP_LOGD(TAG, "    - Position: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
+    ESP_LOGD(TAG, "    - Actuators: AZ=%.2fmm EL=%.2fmm", s.az_actuator_mm, s.el_actuator_mm);
+    ESP_LOGD(TAG, "    - Offsets: AZ=%.2f° EL=%.2f°", s.az_mount_offset_deg, s.el_mount_offset_deg);
+    ESP_LOGD(TAG, "    - Stats: %u moves today, %u total", s.moves_today, s.total_moves);
+    
     nvs_handle_t h;
     esp_err_t ret = nvs_open("tracker", NVS_READWRITE, &h);
+    
+    ESP_LOGV(TAG, "nvs_open() returned: %s (%d)", esp_err_to_name(ret), ret);
+    
     if (ret == ESP_OK){
+        // Calculate total state size for verification
+        size_t state_size = sizeof(tracker_state_t);
+        ESP_LOGV(TAG, "State structure size: %zu bytes", state_size);
+        
         esp_err_t write_ret = nvs_set_blob(h, "state", &s, sizeof(s));
+        ESP_LOGV(TAG, "nvs_set_blob() returned: %s (%d)", esp_err_to_name(write_ret), write_ret);
+        
         if (write_ret == ESP_OK){
-            nvs_commit(h);
-            ESP_LOGD(TAG, "✓ State saved: az=%.1f° el=%.1f° moves=%u",
-                     s.az_cur, s.el_cur, s.total_moves);
+            esp_err_t commit_ret = nvs_commit(h);
+            ESP_LOGV(TAG, "nvs_commit() returned: %s (%d)", esp_err_to_name(commit_ret), commit_ret);
+            
+            if (commit_ret == ESP_OK) {
+                ESP_LOGD(TAG, "✓ State saved: az=%.1f° el=%.1f° moves=%u",
+                         s.az_cur, s.el_cur, s.total_moves);
+                ESP_LOGV(TAG, "  Flash write complete - data persistent across reboots");
+            } else {
+                ESP_LOGW(TAG, "⚠ NVS commit failed: %s", esp_err_to_name(commit_ret));
+            }
         } else {
             ESP_LOGW(TAG, "⚠ NVS save failed: %s", esp_err_to_name(write_ret));
+            ESP_LOGD(TAG, "  Check flash wear level and available space");
         }
         nvs_close(h);
+        ESP_LOGV(TAG, "NVS handle closed");
     } else {
         ESP_LOGW(TAG, "⚠ NVS open failed: %s", esp_err_to_name(ret));
+        ESP_LOGD(TAG, "  This prevents state persistence - position will reset on reboot");
     }
 }
 
 /*
- * Load tracker state from NVS flash.
- * 
- * If no saved state exists (first boot), uses defaults.
- * 
- * Loaded data:
- * - Last known position
- * - Calibration offsets
- * - Lifetime move counter
- * 
- * Called once at tracking_start().
+ * Load tracker state from NVS flash (ENHANCED DEBUGGING).
  */
 static void nvs_load(void){
+    DEBUG_TRACE();
+    
+    ESP_LOGD(TAG, "Attempting to load saved state from NVS...");
+    
     nvs_handle_t h;
     esp_err_t ret = nvs_open("tracker", NVS_READONLY, &h);
+    
+    ESP_LOGV(TAG, "nvs_open() returned: %s (%d)", esp_err_to_name(ret), ret);
+    
     if (ret == ESP_OK){
         size_t required_size = sizeof(s);
+        ESP_LOGV(TAG, "Expected state size: %zu bytes", required_size);
+        
         ret = nvs_get_blob(h, "state", &s, &required_size);
+        ESP_LOGV(TAG, "nvs_get_blob() returned: %s (%d)", esp_err_to_name(ret), ret);
+        ESP_LOGV(TAG, "Actual state size: %zu bytes", required_size);
+        
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
-            ESP_LOGI(TAG, "║          TRACKER STATE LOADED FROM NVS                     ║");
-            ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Last Known Position:");
-            ESP_LOGI(TAG, "  - Azimuth: %.1f° (mount frame)", s.az_cur);
-            ESP_LOGI(TAG, "  - Elevation: %.1f° (mount frame)", s.el_cur);
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Mount Offsets (Calibration):");
-            ESP_LOGI(TAG, "  - AZ offset: %.2f° (earth → mount)", s.az_mount_offset_deg);
-            ESP_LOGI(TAG, "  - EL offset: %.2f° (earth → mount)", s.el_mount_offset_deg);
-            if (fabs(s.az_mount_offset_deg) < 0.1 && fabs(s.el_mount_offset_deg) < 0.1) {
-                ESP_LOGW(TAG, "  ⚠ No calibration data - run calibration for accuracy");
+            // Validate loaded data for sanity
+            bool data_valid = true;
+            
+            // Check angle ranges
+            if (s.az_cur < -180.0 || s.az_cur > 180.0) {
+                ESP_LOGW(TAG, "⚠ Loaded AZ angle out of range: %.1f°", s.az_cur);
+                data_valid = false;
             }
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Move Statistics:");
-            ESP_LOGI(TAG, "  - Today: %u moves", s.moves_today);
-            ESP_LOGI(TAG, "  - Lifetime: %u moves", s.total_moves);
-            ESP_LOGI(TAG, "");
-        } else {
+            if (s.el_cur < -90.0 || s.el_cur > 90.0) {
+                ESP_LOGW(TAG, "⚠ Loaded EL angle out of range: %.1f°", s.el_cur);
+                data_valid = false;
+            }
+            
+            // Check actuator extensions
+            if (s.az_actuator_mm < 50.0 || s.az_actuator_mm > 200.0) {
+                ESP_LOGW(TAG, "⚠ Loaded AZ actuator out of range: %.2fmm", s.az_actuator_mm);
+                data_valid = false;
+            }
+            if (s.el_actuator_mm < 50.0 || s.el_actuator_mm > 200.0) {
+                ESP_LOGW(TAG, "⚠ Loaded EL actuator out of range: %.2fmm", s.el_actuator_mm);
+                data_valid = false;
+            }
+            
+            if (!data_valid) {
+                ESP_LOGE(TAG, "✗ Loaded data failed validation - using defaults");
+                ESP_LOGD(TAG, "  This may indicate NVS corruption or incompatible firmware");
+                // Reset to defaults (keep existing initialization)
+            } else {
+                ESP_LOGI(TAG, "");
+                ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+                ESP_LOGI(TAG, "║          TRACKER STATE LOADED FROM NVS                     ║");
+                ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+                ESP_LOGI(TAG, "");
+                ESP_LOGI(TAG, "Last Known Position:");
+                ESP_LOGI(TAG, "  - Azimuth: %.1f° (mount frame)", s.az_cur);
+                ESP_LOGI(TAG, "  - Elevation: %.1f° (mount frame)", s.el_cur);
+                ESP_LOGD(TAG, "    · AZ actuator: %.2fmm (%.3f\")", s.az_actuator_mm, s.az_actuator_mm/25.4);
+                ESP_LOGD(TAG, "    · EL actuator: %.2fmm (%.3f\")", s.el_actuator_mm, s.el_actuator_mm/25.4);
+                ESP_LOGI(TAG, "");
+                ESP_LOGI(TAG, "Mount Offsets (Calibration):");
+                ESP_LOGI(TAG, "  - AZ offset: %.2f° (earth → mount)", s.az_mount_offset_deg);
+                ESP_LOGI(TAG, "  - EL offset: %.2f° (earth → mount)", s.el_mount_offset_deg);
+                
+                if (fabs(s.az_mount_offset_deg) < 0.1 && fabs(s.el_mount_offset_deg) < 0.1) {
+                    ESP_LOGW(TAG, "  ⚠ No calibration data - run calibration for accuracy");
+                    ESP_LOGD(TAG, "    - Manual: Point at sun, hold button 3s");
+                    ESP_LOGD(TAG, "    - Auto: Double-press button (compass-based)");
+                } else {
+                    ESP_LOGD(TAG, "  ✓ Calibration data present");
+                    ESP_LOGV(TAG, "    - Transform: mount = earth - offset");
+                    ESP_LOGV(TAG, "    - Example: earth(180°) - offset(%.1f°) = mount(%.1f°)",
+                             s.az_mount_offset_deg, 180.0 - s.az_mount_offset_deg);
+                }
+                
+                ESP_LOGI(TAG, "");
+                ESP_LOGI(TAG, "Move Statistics:");
+                ESP_LOGI(TAG, "  - Today: %u moves", s.moves_today);
+                ESP_LOGI(TAG, "  - Lifetime: %u moves", s.total_moves);
+                
+                if (s.total_moves > 0) {
+                    ESP_LOGD(TAG, "    · Average moves/day: %.1f (estimated)", 
+                             (float)s.total_moves / fmax(1.0, s.moves_today));
+                }
+                
+                ESP_LOGI(TAG, "");
+                
+                // Log threshold configuration
+                ESP_LOGD(TAG, "Configuration:");
+                ESP_LOGD(TAG, "  - Move threshold: %.1f°", s.tol_deg);
+                ESP_LOGD(TAG, "  - Min step: %.1f°", s.min_step_deg);
+                ESP_LOGD(TAG, "  - Cadence: fast=%ds, slow=%ds", s.fast_period_s, s.base_period_s);
+                ESP_LOGD(TAG, "  - Sleep threshold: %.1f° elevation", s.sleep_thresh_el);
+            }
+        } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
             ESP_LOGI(TAG, "");
             ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
             ESP_LOGI(TAG, "║          FIRST BOOT - USING DEFAULT STATE                  ║");
             ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
             ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Default Position (Midpoint):");
-            ESP_LOGI(TAG, "  - Azimuth: %.1f° (50%% of range)", s.az_cur);
-            ESP_LOGI(TAG, "  - Elevation: %.1f° (midpoint)", s.el_cur);
+            ESP_LOGI(TAG, "Default Position (Center/Home):");
+            ESP_LOGI(TAG, "  - Azimuth: %.1f° (mechanical center)", s.az_cur);
+            ESP_LOGI(TAG, "  - Elevation: %.1f° (mechanical center)", s.el_cur);
+            ESP_LOGD(TAG, "    · AZ actuator: %.2fmm (5.00\", center)", s.az_actuator_mm);
+            ESP_LOGD(TAG, "    · EL actuator: %.2fmm (4.25\", center)", s.el_actuator_mm);
             ESP_LOGI(TAG, "");
             ESP_LOGI(TAG, "⚠ Calibration Required:");
             ESP_LOGI(TAG, "  1. Point panel at sun manually");
             ESP_LOGI(TAG, "  2. Hold button for 3 seconds");
             ESP_LOGI(TAG, "  3. System will learn mount offsets");
+            ESP_LOGI(TAG, "  OR");
+            ESP_LOGI(TAG, "  1. Double-press button");
+            ESP_LOGI(TAG, "  2. Rotate tracker slowly (compass calibration)");
+            ESP_LOGI(TAG, "  3. Auto-calibration will use compass heading");
             ESP_LOGI(TAG, "");
+        } else {
+            ESP_LOGE(TAG, "✗ NVS read error: %s", esp_err_to_name(ret));
+            ESP_LOGD(TAG, "  Using default state - system will operate but may lose position");
         }
         nvs_close(h);
+        ESP_LOGV(TAG, "NVS handle closed");
     } else {
         ESP_LOGI(TAG, "No saved state found (first boot) - using defaults");
+        ESP_LOGD(TAG, "  NVS open error: %s", esp_err_to_name(ret));
     }
 }
 
 /*
- * Reset daily move counter at UTC midnight.
- * 
- * Called every loop iteration; cheap check (only resets once per day).
- * Logs yesterday's move count before resetting.
- */
-static void maybe_midnight_reset(void){
-    time_t now = time(NULL);
-    struct tm *lt = localtime(&now);
-    
-    static bool reset_done_today = false;
-    
-    if (lt && lt->tm_hour == 0 && lt->tm_min == 0 && !reset_done_today) {
-        if (s.moves_today > 0) {
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
-            ESP_LOGI(TAG, "║              DAILY RESET (Midnight)                        ║");
-            ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
-            ESP_LOGI(TAG, "");
-            ESP_LOGI(TAG, "Yesterday's Statistics:");
-            ESP_LOGI(TAG, "  - Moves: %u", s.moves_today);
-            ESP_LOGI(TAG, "  - Lifetime total: %u", s.total_moves);
-            ESP_LOGI(TAG, "");
-            sdlog_printf("Daily reset: %u moves yesterday (lifetime: %u)", 
-                         s.moves_today, s.total_moves);
-        }
-        s.moves_today = 0;
-        reset_done_today = true;
-        ESP_LOGI(TAG, "✓ Daily counter reset to 0");
-    }
-    
-    // Reset the flag after midnight hour passes
-    if (lt && lt->tm_hour != 0) {
-        reset_done_today = false;
-    }
-}
-
-/*
- * Convert azimuth angle (degrees) to actuator extension (mm).
- * 
- * Hardware Specifications:
- * - Range: ±45° (90° total range)
- * - Center (0°): 5.00" = 127.0mm extension  // CHANGED from 3.25" (82.55mm)
- * - Full retract (-45°): ~3.75" = 95.25mm   // CHANGED from 2.0" (50.8mm)
- * - Full extend (+45°): ~6.25" = 158.75mm   // CHANGED from 4.5" (114.3mm)
- * - Total stroke: 2.5" = 63.5mm
- * 
- * Kinematics (linear approximation):
- * - mm_per_degree = 63.5mm / 90° = 0.706 mm/°  // UNCHANGED
- * - extension = center + (angle × mm_per_degree)
- * 
- * Safety:
- * - Clamps to mechanical limits to prevent overtravel
- * - Logs warnings if clamping occurs
+ * Convert azimuth angle to actuator extension (ENHANCED DEBUGGING).
  */
 static double az_angle_to_mm(double angle_deg) {
-    const double CENTER_MM = 127.0;        // CHANGED: 5.00" = 5 inches (was 82.55mm / 3.25")
-    const double STROKE_MM = 63.5;         // UNCHANGED: 2.5" total stroke
-    const double RANGE_DEG = 90.0;         // UNCHANGED: ±45° range
-    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;  // UNCHANGED: 0.706 mm/deg
-    const double MIN_MM = 95.25;           // CHANGED: 3.75" minimum (was 50.8mm / 2.0")
-    const double MAX_MM = 158.75;          // CHANGED: 6.25" maximum (was 114.3mm / 4.5")
+    DEBUG_TRACE();
+    ESP_LOGV(TAG, "AZ angle input: %.2f°", angle_deg);
+    
+    const double CENTER_MM = 127.0;
+    const double STROKE_MM = 63.5;
+    const double RANGE_DEG = 90.0;
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;
+    const double MIN_MM = 95.25;
+    const double MAX_MM = 158.75;
+    
+    ESP_LOGV(TAG, "AZ kinematics constants:");
+    ESP_LOGV(TAG, "  - Center: %.2fmm (5.00\")", CENTER_MM);
+    ESP_LOGV(TAG, "  - Stroke: %.2fmm (2.50\")", STROKE_MM);
+    ESP_LOGV(TAG, "  - Range: %.1f° (±45°)", RANGE_DEG);
+    ESP_LOGV(TAG, "  - Conversion: %.3f mm/deg", MM_PER_DEG);
+    
+    double original_angle = angle_deg;
+    bool clamped = false;
     
     // Clamp angle to mechanical limits
     if (angle_deg < -45.0) {
         ESP_LOGW(TAG, "⚠ AZ angle %.1f° < -45° (clamping to -45°)", angle_deg);
+        ESP_LOGD(TAG, "  This indicates target is outside mechanical range");
         angle_deg = -45.0;
+        clamped = true;
     }
     if (angle_deg > 45.0) {
         ESP_LOGW(TAG, "⚠ AZ angle %.1f° > +45° (clamping to +45°)", angle_deg);
+        ESP_LOGD(TAG, "  This indicates target is outside mechanical range");
         angle_deg = 45.0;
+        clamped = true;
     }
     
-    // Linear conversion: center position + offset
+    // Linear conversion
     double mm = CENTER_MM + (angle_deg * MM_PER_DEG);
     
-    // Safety check: ensure result is within physical limits
+    ESP_LOGV(TAG, "AZ calculation:");
+    ESP_LOGV(TAG, "  - Input angle: %.2f° (clamped: %s)", angle_deg, clamped ? "YES" : "NO");
+    ESP_LOGV(TAG, "  - Offset from center: %.2f°", angle_deg);
+    ESP_LOGV(TAG, "  - Extension delta: %.2fmm (%.2f° × %.3f mm/deg)", 
+             angle_deg * MM_PER_DEG, angle_deg, MM_PER_DEG);
+    ESP_LOGV(TAG, "  - Final extension: %.2fmm (%.3f\")", mm, mm / 25.4);
+    
+    // Safety check
     if (mm < MIN_MM) {
         ESP_LOGW(TAG, "⚠ AZ extension %.2fmm < min %.2fmm (clamping)", mm, MIN_MM);
+        ESP_LOGD(TAG, "  Calculated: center(%.2f) + angle(%.2f) × rate(%.3f) = %.2f",
+                 CENTER_MM, angle_deg, MM_PER_DEG, mm);
         mm = MIN_MM;
     }
     if (mm > MAX_MM) {
         ESP_LOGW(TAG, "⚠ AZ extension %.2fmm > max %.2fmm (clamping)", mm, MAX_MM);
+        ESP_LOGD(TAG, "  Calculated: center(%.2f) + angle(%.2f) × rate(%.3f) = %.2f",
+                 CENTER_MM, angle_deg, MM_PER_DEG, mm);
         mm = MAX_MM;
     }
     
-    ESP_LOGV(TAG, "AZ kinematics: %.1f° → %.2fmm (Δ=%.2fmm from center)",
-             angle_deg, mm, mm - CENTER_MM);
+    if (clamped || mm < MIN_MM || mm > MAX_MM) {
+        ESP_LOGW(TAG, "  → Final: %.1f° → %.2fmm (CLAMPED from %.1f°)", 
+                 angle_deg, mm, original_angle);
+    } else {
+        ESP_LOGV(TAG, "  → Final: %.1f° → %.2fmm (%.3f\", Δ=%.2fmm from center)",
+                 angle_deg, mm, mm / 25.4, mm - CENTER_MM);
+    }
     
     return mm;
 }
 
 /*
- * Convert elevation angle (degrees) to actuator extension (mm).
- * 
- * Hardware Specifications:
- * - Range: ±56° (112° total range)
- * - Center (0°): 4.25" = 107.95mm extension
- * - Full retract (-56°): ~2.5" = 63.5mm
- * - Full extend (+56°): ~6.0" = 152.4mm
- * - Total stroke: 3.5" = 88.9mm
- * 
- * Kinematics (linear approximation):
- * - mm_per_degree = 88.9mm / 112° = 0.794 mm/°
- * - extension = center + (angle × mm_per_degree)
- * 
- * Safety:
- * - Clamps to mechanical limits to prevent overtravel
- * - Logs warnings if clamping occurs
+ * Convert elevation angle to actuator extension (ENHANCED DEBUGGING).
  */
 static double el_angle_to_mm(double angle_deg) {
-    const double CENTER_MM = 107.95;       // 4.25" = 4 + 1/4 inches
-    const double STROKE_MM = 88.9;         // 3.5" total stroke
-    const double RANGE_DEG = 112.0;        // ±56° range
-    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;  // 0.794 mm/deg
-    const double MIN_MM = 63.5;            // 2.5" minimum (safety)
-    const double MAX_MM = 152.4;           // 6.0" maximum (safety)
+    DEBUG_TRACE();
+    ESP_LOGV(TAG, "EL angle input: %.2f°", angle_deg);
     
-    // Clamp angle to mechanical limits
+    const double CENTER_MM = 107.95;
+    const double STROKE_MM = 88.9;
+    const double RANGE_DEG = 112.0;
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;
+    const double MIN_MM = 63.5;
+    const double MAX_MM = 152.4;
+    
+    ESP_LOGV(TAG, "EL kinematics constants:");
+    ESP_LOGV(TAG, "  - Center: %.2fmm (4.25\")", CENTER_MM);
+    ESP_LOGV(TAG, "  - Stroke: %.2fmm (3.50\")", STROKE_MM);
+    ESP_LOGV(TAG, "  - Range: %.1f° (±56°)", RANGE_DEG);
+    ESP_LOGV(TAG, "  - Conversion: %.3f mm/deg", MM_PER_DEG);
+    
+    double original_angle = angle_deg;
+    bool clamped = false;
+    
+    // Clamp angle
     if (angle_deg < -56.0) {
         ESP_LOGW(TAG, "⚠ EL angle %.1f° < -56° (clamping to -56°)", angle_deg);
         angle_deg = -56.0;
+        clamped = true;
     }
     if (angle_deg > 56.0) {
         ESP_LOGW(TAG, "⚠ EL angle %.1f° > +56° (clamping to +56°)", angle_deg);
         angle_deg = 56.0;
+        clamped = true;
     }
     
-    // Linear conversion: center position + offset
+    // Linear conversion
     double mm = CENTER_MM + (angle_deg * MM_PER_DEG);
     
-    // Safety check: ensure result is within physical limits
+    ESP_LOGV(TAG, "EL calculation:");
+    ESP_LOGV(TAG, "  - Input angle: %.2f° (clamped: %s)", angle_deg, clamped ? "YES" : "NO");
+    ESP_LOGV(TAG, "  - Extension delta: %.2fmm", angle_deg * MM_PER_DEG);
+    ESP_LOGV(TAG, "  - Final extension: %.2fmm (%.3f\")", mm, mm / 25.4);
+    
+    // Safety check
     if (mm < MIN_MM) {
         ESP_LOGW(TAG, "⚠ EL extension %.2fmm < min %.2fmm (clamping)", mm, MIN_MM);
         mm = MIN_MM;
@@ -377,44 +459,16 @@ static double el_angle_to_mm(double angle_deg) {
         mm = MAX_MM;
     }
     
-    ESP_LOGV(TAG, "EL kinematics: %.1f° → %.2fmm (Δ=%.2fmm from center)",
-             angle_deg, mm, mm - CENTER_MM);
+    if (clamped || mm < MIN_MM || mm > MAX_MM) {
+        ESP_LOGW(TAG, "  → Final: %.1f° → %.2fmm (CLAMPED from %.1f°)", 
+                 angle_deg, mm, original_angle);
+    } else {
+        ESP_LOGV(TAG, "  → Final: %.1f° → %.2fmm (%.3f\", Δ=%.2fmm from center)",
+                 angle_deg, mm, mm / 25.4, mm - CENTER_MM);
+    }
     
     return mm;
 }
-
-/*
- * Convert azimuth extension (mm) to angle (degrees).
- * Inverse of az_angle_to_mm() - used for diagnostics and position verification.
- */
-static double az_mm_to_angle(double mm) {
-    const double CENTER_MM = 127.0;    // CHANGED: 5.00" center (was 82.55mm)
-    const double MM_PER_DEG = 0.706;   // UNCHANGED: 63.5mm / 90°
-    
-    double angle = (mm - CENTER_MM) / MM_PER_DEG;
-    
-    ESP_LOGV(TAG, "AZ inverse: %.2fmm → %.1f° (Δ=%.2fmm from center)",
-             mm, angle, mm - CENTER_MM);
-    
-    return angle;
-}
-
-/*
- * Convert elevation extension (mm) to angle (degrees).
- * Inverse of el_angle_to_mm() - used for diagnostics and position verification.
- */
-static double el_mm_to_angle(double mm) {
-    const double CENTER_MM = 107.95;
-    const double MM_PER_DEG = 0.794;  // 88.9mm / 112°
-    
-    double angle = (mm - CENTER_MM) / MM_PER_DEG;
-    
-    ESP_LOGV(TAG, "EL inverse: %.2fmm → %.1f° (Δ=%.2fmm from center)",
-             mm, angle, mm - CENTER_MM);
-    
-    return angle;
-}
-
 
 /*
  * Execute motor movements if angular error exceeds thresholds.
@@ -449,10 +503,14 @@ static void do_move(double az_tgt, double el_tgt){
     bool move_az = (az_error > s.tol_deg) && (az_error > s.min_step_deg);
     bool move_el = (el_error > s.tol_deg) && (el_error > s.min_step_deg);
 
+    ESP_LOGI(TAG, "Movement decision:");
+    ESP_LOGI(TAG, "  AZ: error=%.1f° tol=%.1f° min_step=%.1f° → %s",
+             az_error, s.tol_deg, s.min_step_deg, move_az ? "MOVE" : "SKIP");
+    ESP_LOGI(TAG, "  EL: error=%.1f° tol=%.1f° min_step=%.1f° → %s",
+             el_error, s.tol_deg, s.min_step_deg, move_el ? "MOVE" : "SKIP");
+
     if (!move_az && !move_el) {
-        ESP_LOGD(TAG, "Within tolerance - no move needed");
-        ESP_LOGV(TAG, "  AZ error: %.1f° (tol: %.1f°)", az_error, s.tol_deg);
-        ESP_LOGV(TAG, "  EL error: %.1f° (tol: %.1f°)", el_error, s.tol_deg);
+        ESP_LOGI(TAG, "✓ Within tolerance - no move needed");
         return;
     }
 
@@ -841,9 +899,6 @@ static void home_to_midpoint(void){
  * - Offset = sun_angle - panel_angle
  * - Store offset in NVS
  * 
- * Future tracking:
- * - mount_target = earth_sun_angle - stored_offset
- * - Automatically compensates for mount orientation
  */
 void tracking_calibrate_mount_offset_now(void){
     ESP_LOGI(TAG, "");
@@ -919,30 +974,35 @@ void tracking_calibrate_mount_offset_now(void){
 }
 
 /*
- * Auto-calibration using compass (azimuth only).
+ * Auto-calibration using compass (FULL auto-calibration: azimuth + elevation).
+ * 
+ * NEW ALGORITHM:
+ * - Uses compass to determine panel's current TRUE orientation in space
+ * - Calculates sun position (azimuth + elevation)
+ * - Computes BOTH az and el offsets automatically
+ * - No manual pointing needed!
  * 
  * Requirements:
  * - Compass must be calibrated first (gps_calibrate_compass())
  * - Valid GPS fix
  * - Sun elevation > 15° (accurate sun azimuth needed)
+ * - Panel should be in a known reference position (horizontal/level recommended)
  * 
- * Algorithm:
- * - Reads true heading from compass (magnetic + declination)
- * - Calculates sun azimuth from GPS/time
- * - Computes offset: compass_heading - sun_azimuth
- * - Stores az_offset in NVS
- * - Elevation offset remains 0 (manual calibration still needed)
- * 
- * Less accurate than manual but useful for field deployment.
+ * How it works:
+ * 1. Reads compass heading → panel azimuth orientation
+ * 2. Assumes panel is level (0° elevation) at calibration time
+ * 3. Calculates: az_offset = panel_heading - sun_azimuth
+ * 4. Calculates: el_offset = 0° - sun_elevation (since panel is level)
+ * 5. Future tracking: target = sun_position - offsets
  */
 void tracking_auto_calibrate_with_compass(void) {
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
-    ESP_LOGI(TAG, "║          AUTO CALIBRATION (Compass)                        ║");
+    ESP_LOGI(TAG, "║          AUTO CALIBRATION (Compass + Elevation)            ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
 
-    // Check compass calibration
+    // Verify compass is calibrated
     if (!gps_is_compass_calibrated()) {
         ESP_LOGW(TAG, "✗ Compass not calibrated");
         ESP_LOGW(TAG, "  - Double-press button to calibrate compass first");
@@ -951,7 +1011,7 @@ void tracking_auto_calibrate_with_compass(void) {
         return;
     }
 
-    // Get GPS data
+    // Get GPS fix
     gps_data_t gps;
     if (!gps_get_last(&gps) || !gps.valid) {
         ESP_LOGW(TAG, "✗ No valid GPS fix");
@@ -960,16 +1020,16 @@ void tracking_auto_calibrate_with_compass(void) {
         return;
     }
 
-    // Calculate sun position
+    // Calculate current sun position
     time_t now = time(NULL);
     sun_pos_t sun = solar_compute(gps.latitude, gps.longitude, now);
 
-    ESP_LOGI(TAG, "Sun Position:");
+    ESP_LOGI(TAG, "Sun Position (Earth Frame):");
     ESP_LOGI(TAG, "  - Azimuth: %.2f°", sun.azimuth_deg);
     ESP_LOGI(TAG, "  - Elevation: %.2f°", sun.elevation_deg);
     ESP_LOGI(TAG, "");
 
-    // Check sun elevation (need >15° for accurate azimuth)
+    // Verify sun is high enough for accurate azimuth
     if (sun.elevation_deg < 15.0) {
         ESP_LOGW(TAG, "✗ Sun too low: %.1f° (need >15°)", sun.elevation_deg);
         ESP_LOGW(TAG, "  - Wait until sun is higher in sky");
@@ -978,93 +1038,125 @@ void tracking_auto_calibrate_with_compass(void) {
         return;
     }
 
-    // Get TRUE compass heading (declination-corrected)
+    // Read compass heading (TRUE north, declination-corrected)
     float compass_heading_true;
     if (!gps_get_compass_heading_true(&compass_heading_true)) {
         ESP_LOGE(TAG, "✗ Failed to read compass");
         ESP_LOGE(TAG, "  - Check compass connection");
         ESP_LOGE(TAG, "  - Recalibrate compass if needed");
-        ESP_LOGE(TAG, "");
+        ESP_LOGI(TAG, "");
         return;
     }
 
     float declination = gps_get_magnetic_declination();
     
-    ESP_LOGI(TAG, "Compass Reading:");
+    ESP_LOGI(TAG, "Panel Orientation (from Compass):");
     ESP_LOGI(TAG, "  - True heading: %.2f°", compass_heading_true);
     ESP_LOGI(TAG, "  - Magnetic declination: %.1f°", declination);
+    ESP_LOGI(TAG, "  - Current position: AZ=%.1f° EL=%.1f° (assumed level)", 
+             s.az_cur, s.el_cur);
     ESP_LOGI(TAG, "");
 
-    // Calculate mount offset using TRUE headings
+    // === CALCULATE AZIMUTH OFFSET ===
+    // Formula: offset = panel_orientation - sun_azimuth
+    // Example: Panel facing 45° (NE), Sun at 180° (S)
+    //          offset = 45° - 180° = -135° (normalized to ±180°)
     double az_offset = compass_heading_true - sun.azimuth_deg;
+    
+    // Normalize to ±180° range
     while (az_offset > 180.0) az_offset -= 360.0;
     while (az_offset < -180.0) az_offset += 360.0;
 
+    // === CALCULATE ELEVATION OFFSET ===
+    // Assumption: Panel is currently LEVEL (horizontal, 0° in mount frame)
+    // Formula: el_offset = current_panel_el - sun_elevation
+    // Example: Panel level (0°), Sun at 45° elevation
+    //          offset = 0° - 45° = -45°
+    //          Future: target_el = sun_el - (-45°) = sun_el + 45°
+    double el_offset = s.el_cur - sun.elevation_deg;
+
+    // Save old values for comparison
     double old_az_offset = s.az_mount_offset_deg;
-    s.az_mount_offset_deg = az_offset;
-    s.el_mount_offset_deg = 0.0;  // Elevation requires manual calibration
+    double old_el_offset = s.el_mount_offset_deg;
     
+    // Update offsets
+    s.az_mount_offset_deg = az_offset;
+    s.el_mount_offset_deg = el_offset;
+    
+    // Persist to NVS flash
     nvs_save();
 
-    ESP_LOGI(TAG, "✓ AUTO-CALIBRATION COMPLETE");
+    // === LOG CALIBRATION RESULTS ===
+    ESP_LOGI(TAG, "✓ FULL AUTO-CALIBRATION COMPLETE");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Results:");
-    ESP_LOGI(TAG, "  - AZ offset: %.2f° → %.2f° (Δ=%.2f°)", 
-             old_az_offset, s.az_mount_offset_deg, 
-             s.az_mount_offset_deg - old_az_offset);
-    ESP_LOGI(TAG, "  - EL offset: 0.0° (manual calibration recommended)");
+    ESP_LOGI(TAG, "Calibration Algorithm:");
+    ESP_LOGI(TAG, "  - AZ offset = compass_heading - sun_azimuth");
+    ESP_LOGI(TAG, "  - EL offset = panel_elevation - sun_elevation");
+    ESP_LOGI(TAG, "  - Assumption: Panel is LEVEL (0°) during calibration");
     ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "Note:");
-    ESP_LOGI(TAG, "  - Azimuth tracking should now be accurate");
-    ESP_LOGI(TAG, "  - For best elevation accuracy, do manual calibration");
+    ESP_LOGI(TAG, "Azimuth Results:");
+    ESP_LOGI(TAG, "  - Old offset: %.2f°", old_az_offset);
+    ESP_LOGI(TAG, "  - New offset: %.2f°", s.az_mount_offset_deg);
+    ESP_LOGI(TAG, "  - Change: %.2f°", s.az_mount_offset_deg - old_az_offset);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Elevation Results:");
+    ESP_LOGI(TAG, "  - Old offset: %.2f°", old_el_offset);
+    ESP_LOGI(TAG, "  - New offset: %.2f°", s.el_mount_offset_deg);
+    ESP_LOGI(TAG, "  - Change: %.2f°", s.el_mount_offset_deg - old_el_offset);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Future Tracking Behavior:");
+    ESP_LOGI(TAG, "  - BOTH axes will now track automatically");
+    ESP_LOGI(TAG, "  - Target AZ = sun_az - (%.2f°) = sun_az %+.2f°", 
+             s.az_mount_offset_deg, -s.az_mount_offset_deg);
+    ESP_LOGI(TAG, "  - Target EL = sun_el - (%.2f°) = sun_el %+.2f°",
+             s.el_mount_offset_deg, -s.el_mount_offset_deg);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Important Notes:");
+    ESP_LOGI(TAG, "  - Best accuracy when panel is LEVEL during calibration");
+    ESP_LOGI(TAG, "  - For fine-tuning, use manual calibration:");
     ESP_LOGI(TAG, "    (point panel at sun, hold button 3 seconds)");
+    ESP_LOGI(TAG, "  - Recalibrate if tracking accuracy degrades");
     ESP_LOGI(TAG, "");
 
-    sdlog_printf("Auto-calibration: AZ offset=%.2f° (compass+GPS, decl=%.1f°)", 
-                 s.az_mount_offset_deg, declination);
+    // Log to SD card
+    sdlog_printf("Full auto-cal: AZ=%.2f° EL=%.2f° (compass+GPS, decl=%.1f°)", 
+                 s.az_mount_offset_deg, s.el_mount_offset_deg, declination);
 }
 
 /*
- * Main tracking task loop.
+ * Main tracking task loop (ENHANCED DEBUGGING).
  * 
- * Runs continuously until deep sleep.
- * 
- * Loop outline:
- * 1. Get GPS position/time (fresh if possible)
- * 2. Calculate sun position (earth frame)
- * 3. Apply mount offsets (convert to mount frame)
- * 4. Check if movement threshold exceeded
- * 5. Move motors if needed
- * 6. Log telemetry to SD card
- * 7. Adjust loop cadence (fast when waiting, slow after move)
- * 8. Check for night condition
- * 9. If night: home → deep sleep → wake before sunrise
- * 10. Wait for next loop iteration
- * 
- * Variable cadence:
- * - 5 min (300s) when waiting for threshold
- * - 15 min (900s) after moving
- * - Reduces power consumption and motor wear
+ * This is where all the magic happens - heavily instrumented for debugging.
  */
 static void tracking_task(void *arg){
+    DEBUG_TRACE();
+    
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
     ESP_LOGI(TAG, "║          TRACKING SYSTEM OPERATIONAL                       ║");
     ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
     ESP_LOGI(TAG, "");
+    
+    ESP_LOGD(TAG, "Task started: priority=%d, stack=%d bytes",
+             uxTaskPriorityGet(NULL), 4096);
+    ESP_LOGD(TAG, "Free heap before load: %lu bytes", 
+             (unsigned long)esp_get_free_heap_size());
 
-    nvs_load();                                     // Load persisted state
+    nvs_load();
 
-    const char *csv = "/sdcard/soltrac.csv";
-    sdlog_write_csv_header_if_new(csv);             // Ensure CSV header exists
+    ESP_LOGD(TAG, "Free heap after load: %lu bytes",
+             (unsigned long)esp_get_free_heap_size());
+
+    const char *csv = "/sdcard/SUNFLOW.CSV";
+    sdlog_write_csv_header_if_new(csv);
     sdlog_printf("=== TRACKING STARTED ===");
     sdlog_printf("Initial position: AZ=%.1f° EL=%.1f°", s.az_cur, s.el_cur);
 
-    s.last_move_az_tgt = s.az_cur;                  // Initialize deltas
+    s.last_move_az_tgt = s.az_cur;
     s.last_move_el_tgt = s.el_cur;
 
     ESP_LOGI(TAG, "Configuration:");
-    ESP_LOGI(TAG, "  - Home position: AZ=%.1f° EL=%.1f° (midpoint)", 
+    ESP_LOGI(TAG, "  - Home position: AZ=%.1f° EL=%.1f° (center)", 
              s.home_az_deg, s.home_el_deg);
     ESP_LOGI(TAG, "  - Movement threshold: %.1f°", s.tol_deg);
     ESP_LOGI(TAG, "  - Minimum step: %.1f°", s.min_step_deg);
@@ -1072,69 +1164,223 @@ static void tracking_task(void *arg){
              s.fast_period_s, s.base_period_s);
     ESP_LOGI(TAG, "  - Sleep threshold: %.1f° elevation", s.sleep_thresh_el);
     ESP_LOGI(TAG, "  - Pre-wake: %d minutes before sunrise", s.prewake_min);
+    ESP_LOGD(TAG, "  - CSV log: %s", csv);
     ESP_LOGI(TAG, "");
 
-    // Optional auto-calibration on first boot
+    // Auto-calibration logic with detailed diagnostics
     if (gps_is_compass_calibrated()) {
+        ESP_LOGD(TAG, "Compass detected and calibrated");
+        
         if (fabs(s.az_mount_offset_deg) < 0.1 && fabs(s.el_mount_offset_deg) < 0.1) {
             ESP_LOGI(TAG, "No calibration data found - attempting auto-calibration...");
+            ESP_LOGD(TAG, "  Current offsets: AZ=%.3f° EL=%.3f° (both near zero)",
+                     s.az_mount_offset_deg, s.el_mount_offset_deg);
             ESP_LOGI(TAG, "");
 
             status_led_set_mode(LED_WAITING);
             gps_data_t gps;
             int wait_count = 0;
             
+            ESP_LOGD(TAG, "Waiting for GPS fix (timeout: 60s)...");
+            
             while (!gps_poll_nav_pvt(&gps) && wait_count < 60) {
                 ESP_LOGI(TAG, "Waiting for GPS fix... (%d/60)", ++wait_count);
+                ESP_LOGV(TAG, "  GPS poll attempt %d", wait_count);
                 vTaskDelay(pdMS_TO_TICKS(5000));
             }
 
             if (wait_count < 60) {
+                ESP_LOGI(TAG, "✓ GPS fix acquired after %ds", wait_count * 5);
+                ESP_LOGD(TAG, "  Location: %.6f°N %.6f°W", gps.latitude, gps.longitude);
+                ESP_LOGD(TAG, "  Satellites: %u, Fix type: %u", 
+                         gps.num_satellites, gps.fix_type);
+                
                 tracking_auto_calibrate_with_compass();
             } else {
                 ESP_LOGW(TAG, "GPS timeout - using default offsets");
                 ESP_LOGW(TAG, "Manual calibration recommended for accuracy");
+                ESP_LOGD(TAG, "  Attempted %d times over %d seconds", wait_count, wait_count * 5);
             }
             ESP_LOGI(TAG, "");
+        } else {
+            ESP_LOGD(TAG, "Calibration data present: AZ=%.2f° EL=%.2f°",
+                     s.az_mount_offset_deg, s.el_mount_offset_deg);
         }
+    } else {
+        ESP_LOGD(TAG, "Compass not detected or not calibrated - manual calibration only");
     }
 
     ESP_LOGI(TAG, "Entering main tracking loop...");
     ESP_LOGI(TAG, "");
+    
+    uint32_t loop_iteration = 0;
+    uint32_t consecutive_gps_failures = 0;
+    time_t last_successful_gps = 0;
 
     while (1){
-        TickType_t loop_start = xTaskGetTickCount(); // For vTaskDelayUntil cadence
+        loop_iteration++;
+        TickType_t loop_start = xTaskGetTickCount();
+        
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "╔════════════════════════════════════════════════════════════╗");
+        ESP_LOGD(TAG, "║          TRACKING LOOP ITERATION %lu", (unsigned long)loop_iteration);
+        ESP_LOGD(TAG, "╚════════════════════════════════════════════════════════════╝");
+        ESP_LOGD(TAG, "");
+        ESP_LOGV(TAG, "Loop start tick: %lu", (unsigned long)loop_start);
+        ESP_LOGV(TAG, "Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+        ESP_LOGV(TAG, "Stack high water mark: %lu words",
+                 (unsigned long)uxTaskGetStackHighWaterMark(NULL));
 
-        // === GPS Acquisition ===
+        // === GPS Acquisition (WITH DETAILED DIAGNOSTICS) ===
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "=== GPS ACQUISITION ===");
+        
         gps_data_t g = {0};
         bool gps_fresh = gps_poll_nav_pvt(&g);
         bool gps_available = gps_fresh || gps_get_last(&g);
+        
+        ESP_LOGD(TAG, "GPS poll result:");
+        ESP_LOGD(TAG, "  - Fresh fix: %s", gps_fresh ? "YES" : "NO");
+        ESP_LOGD(TAG, "  - Cached available: %s", gps_available ? "YES" : "NO");
 
         if (!gps_available) {
-            status_led_set_mode(LED_WAITING);
-            ESP_LOGW(TAG, "⚠ No GPS data available - retrying in 30s");
+            consecutive_gps_failures++;
+            time_t failure_duration = time(NULL) - last_successful_gps;
+            
+            ESP_LOGW(TAG, "⚠ No GPS data available (failure #%lu)",
+                     (unsigned long)consecutive_gps_failures);
+            ESP_LOGD(TAG, "  Time since last fix: %ld seconds", (long)failure_duration);
+            
+            if (consecutive_gps_failures == 1) {
+                ESP_LOGW(TAG, "  First GPS failure - entering wait mode");
+                status_led_set_mode(LED_WAITING);
+            }
+            
+            if (consecutive_gps_failures % 6 == 0) {  // Every 3 minutes
+                ESP_LOGW(TAG, "  Extended GPS loss: %lu failures over %.1f minutes",
+                         (unsigned long)consecutive_gps_failures,
+                         consecutive_gps_failures * 30.0 / 60.0);
+            }
+            
+            ESP_LOGW(TAG, "  Retrying in 30s...");
             vTaskDelay(pdMS_TO_TICKS(30000));
             continue;
         } else {
             // GPS recovered
-            if (status_led_get_mode() == LED_ERROR) {
-                ESP_LOGI(TAG, "✓ GPS recovered");
+            if (consecutive_gps_failures > 0) {
+                ESP_LOGI(TAG, "✓ GPS recovered after %lu failures", 
+                         (unsigned long)consecutive_gps_failures);
+                ESP_LOGD(TAG, "  Outage duration: %.1f minutes",
+                         consecutive_gps_failures * 30.0 / 60.0);
+                consecutive_gps_failures = 0;
                 status_led_set_mode(LED_TRACKING);
+            }
+            last_successful_gps = time(NULL);
+            
+            ESP_LOGD(TAG, "✓ GPS data available (%s)", gps_fresh ? "FRESH" : "CACHED");
+            DEBUG_GPS(g);
+            ESP_LOGV(TAG, "  Valid flag: %s", g.valid ? "true" : "false");
+            ESP_LOGV(TAG, "  HDOP: (not available in structure)");
+        }
+
+        // === Sun Position Calculation (WITH VERIFICATION) ===
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "=== SUN POSITION CALCULATION ===");
+        
+        time_t now = time(NULL);
+        struct tm *now_tm = localtime(&now);
+        
+        ESP_LOGD(TAG, "Time now: %04d-%02d-%02d %02d:%02d:%02d",
+                 now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
+                 now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
+        ESP_LOGV(TAG, "Unix timestamp: %ld", (long)now);
+        
+        sun_pos_t sun = solar_compute(g.latitude, g.longitude, now);
+        
+        DEBUG_SUN(sun);
+        ESP_LOGV(TAG, "  Calculation input:");
+        ESP_LOGV(TAG, "    - Lat: %.6f°", g.latitude);
+        ESP_LOGV(TAG, "    - Lon: %.6f°", g.longitude);
+        ESP_LOGV(TAG, "    - Time: %ld", (long)now);
+        ESP_LOGV(TAG, "  Output validation:");
+        ESP_LOGV(TAG, "    - Az range: %.1f° ∈ [0°, 360°]? %s",
+                 sun.azimuth_deg,
+                 (sun.azimuth_deg >= 0.0 && sun.azimuth_deg < 360.0) ? "✓" : "✗");
+        ESP_LOGV(TAG, "    - El range: %.1f° ∈ [-90°, 90°]? %s",
+                 sun.elevation_deg,
+                 (sun.elevation_deg >= -90.0 && sun.elevation_deg <= 90.0) ? "✓" : "✗");
+
+        // === Compass Heading (FOR CSV) ===
+        float compass_true = NAN;
+        float mount_front_true = NAN;
+        
+        if (gps_is_compass_present()) {
+            ESP_LOGV(TAG, "");
+            ESP_LOGV(TAG, "=== COMPASS READING ===");
+            
+            float htrue;
+            if (gps_get_compass_heading_true(&htrue)) {
+                compass_true = htrue;
+                mount_front_true = (float)wrap360(htrue + MOUNT_COMPASS_OFFSET_DEG);
+                
+                ESP_LOGV(TAG, "  Compass true: %.1f°", compass_true);
+                ESP_LOGV(TAG, "  Mount front (compass + 180°): %.1f°", mount_front_true);
+                ESP_LOGV(TAG, "  Compass offset correction: %.1f°", MOUNT_COMPASS_OFFSET_DEG);
+            } else {
+                ESP_LOGV(TAG, "  Compass read failed");
             }
         }
 
-        // === Sun Position Calculation ===
-        time_t now = time(NULL);
-        sun_pos_t sun = solar_compute(g.latitude, g.longitude, now);
+        // === Coordinate Transformation (EARTH → MOUNT) ===
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "=== COORDINATE TRANSFORMATION ===");
+        ESP_LOGD(TAG, "Earth frame (sun position):");
+        ESP_LOGD(TAG, "  Az=%.2f° El=%.2f°", sun.azimuth_deg, sun.elevation_deg);
+        ESP_LOGD(TAG, "Mount offsets (from calibration):");
+        ESP_LOGD(TAG, "  Az offset=%.2f° El offset=%.2f°",
+                 s.az_mount_offset_deg, s.el_mount_offset_deg);
         
-        // Convert earth frame → mount frame using offsets
-        s.az_tgt = wrap360(sun.azimuth_deg - s.az_mount_offset_deg);
+        // Transform: mount = earth - offset
+        s.az_tgt = wrap180(sun.azimuth_deg - s.az_mount_offset_deg);
         s.el_tgt = sun.elevation_deg - s.el_mount_offset_deg;
+        
+        ESP_LOGD(TAG, "Mount frame (target position):");
+        ESP_LOGD(TAG, "  Az=%.2f° El=%.2f°", s.az_tgt, s.el_tgt);
+        ESP_LOGV(TAG, "");
+        ESP_LOGV(TAG, "Transformation details:");
+        ESP_LOGV(TAG, "  Az: %.2f° (sun) - %.2f° (offset) = %.2f° (target)",
+                 sun.azimuth_deg, s.az_mount_offset_deg, s.az_tgt);
+        ESP_LOGV(TAG, "  El: %.2f° (sun) - %.2f° (offset) = %.2f° (target)",
+                 sun.elevation_deg, s.el_mount_offset_deg, s.el_tgt);
 
-        // Calculate change since last move
+        // === Movement Threshold Check (DETAILED LOGIC) ===
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "=== MOVEMENT DECISION ===");
+        
         double daz = fabs(wrap180(s.az_tgt - s.last_move_az_tgt));
         double del = fabs(s.el_tgt - s.last_move_el_tgt);
         double dang = fmax(daz, del);
+        
+        ESP_LOGD(TAG, "Error since last move:");
+        ESP_LOGD(TAG, "  Az: %.2f° (target %.2f° vs last %.2f°)",
+                 daz, s.az_tgt, s.last_move_az_tgt);
+        ESP_LOGD(TAG, "  El: %.2f° (target %.2f° vs last %.2f°)",
+                 del, s.el_tgt, s.last_move_el_tgt);
+        ESP_LOGD(TAG, "  Max error: %.2f°", dang);
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "Thresholds:");
+        ESP_LOGD(TAG, "  - Tolerance: %.1f° (must exceed to move)", s.tol_deg);
+        ESP_LOGD(TAG, "  - Min step: %.1f° (ignore tiny adjustments)", s.min_step_deg);
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "Threshold checks:");
+        ESP_LOGD(TAG, "  Error %.2f° > tolerance %.1f°? %s",
+                 dang, s.tol_deg, (dang >= s.tol_deg) ? "YES" : "NO");
+        ESP_LOGD(TAG, "  Error %.2f° > min_step %.1f°? %s",
+                 dang, s.min_step_deg, (dang >= s.min_step_deg) ? "YES" : "NO");
+        
+        bool should_move = (dang >= s.tol_deg) && (dang >= s.min_step_deg);
+        ESP_LOGD(TAG, "");
+        ESP_LOGD(TAG, "Decision: %s", should_move ? "MOVE" : "WAIT");
 
         // === Status Logging ===
         ESP_LOGI(TAG, "");
@@ -1151,6 +1397,12 @@ static void tracking_task(void *arg){
         ESP_LOGI(TAG, "  - Azimuth: %.1f°", sun.azimuth_deg);
         ESP_LOGI(TAG, "  - Elevation: %.1f°", sun.elevation_deg);
         ESP_LOGI(TAG, "  - Daylight: %s", sun.is_daylight ? "YES" : "NO");
+        if (!isnan(compass_true)) {
+            ESP_LOGI(TAG, "");
+            ESP_LOGI(TAG, "Heading:");
+            ESP_LOGI(TAG, "  - Compass true: %.1f°", compass_true);
+            ESP_LOGI(TAG, "  - Mount front (compass +180°): %.1f°", mount_front_true);
+        }
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "Target (Mount Frame):");
         ESP_LOGI(TAG, "  - Azimuth: %.1f° (offset: %.2f°)", s.az_tgt, s.az_mount_offset_deg);
@@ -1162,7 +1414,7 @@ static void tracking_task(void *arg){
         ESP_LOGI(TAG, "  - EL delta: %.2f°", del);
         ESP_LOGI(TAG, "");
 
-        // === Night Detection (Power-Optimized) ===
+        // === Night Detection ===
         // Stop tracking when sun is too low for useful power generation
         // At 5° elevation: ~9% power, heavy atmospheric loss, not worth tracking
         
@@ -1239,12 +1491,13 @@ static void tracking_task(void *arg){
             
             home_to_midpoint();                      // Park at safe position
 
-            // Log to CSV
-            sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
+            // Log to CSV (append compass columns at end)
+            sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s,%.2f,%.2f",
                 now, g.latitude, g.longitude, g.fix_type, g.num_satellites,
                 s.az_tgt, s.el_tgt, s.az_cur, s.el_cur,
-                s.moves_today, s.total_moves, NAN, "SLEEP");
-
+                s.moves_today, s.total_moves, NAN, "SLEEP",
+                isnan(compass_true) ? NAN : compass_true,
+                isnan(mount_front_true) ? NAN : mount_front_true);
             // Calculate wake time
             solar_events_t ev = solar_events(g.latitude, g.longitude, now);
             time_t wake_ts = 0;
@@ -1313,14 +1566,18 @@ static void tracking_task(void *arg){
         ESP_LOGI(TAG, "");
 
         // === CSV Telemetry Logging ===
-        // Format: timestamp,lat,lon,fix_type,sats,az_tgt,el_tgt,az_cur,el_cur,
-        //         moves_today,total_moves,tracking_quality,note
-        sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s",
+        // Append compass_true and mount_front_true as the last two columns
+        sdlog_write_csv(csv, "%ld,%.7f,%.7f,%u,%u,%.2f,%.2f,%.2f,%.2f,%u,%u,%.2f,%s,%.2f,%.2f",
             now, g.latitude, g.longitude, g.fix_type, g.num_satellites,
             s.az_tgt, s.el_tgt, s.az_cur, s.el_cur,
-            s.moves_today, s.total_moves, dang, csv_note);
+            s.moves_today, s.total_moves, dang, csv_note,
+            isnan(compass_true) ? NAN : compass_true,
+            isnan(mount_front_true) ? NAN : mount_front_true);
 
-        ESP_LOGV(TAG, "Telemetry logged to CSV: %s", csv_note);
+        ESP_LOGV(TAG, "Telemetry logged to CSV: %s (compass=%.1f°, front=%.1f°)",
+                 csv_note,
+                 isnan(compass_true) ? -1.0f : compass_true,
+                 isnan(mount_front_true) ? -1.0f : mount_front_true);
 
         // === Daily Maintenance ===
         // Check for midnight rollover and reset daily counter
