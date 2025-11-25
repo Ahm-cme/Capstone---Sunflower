@@ -68,34 +68,29 @@ bool button_is_pressed(void){                        // Instantaneous pressed st
       extremely short bounces.
     - We poll every ~10 ms. If sdkconfig tickrate changes, adjust if needed.
 */
-bool button_wait_for_press(int timeout_ms){          // Block until a debounced press or timeout
-    TickType_t start = xTaskGetTickCount();          // Mark start time for timeout accounting
-    TickType_t tmo   = (timeout_ms < 0) ?            // Convert ms to ticks, or infinite wait
-                       portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+bool button_wait_for_press(int timeout_ms){
+    TickType_t start = xTaskGetTickCount();
+    TickType_t tmo = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
 
     // Phase 1: wait until released (edge qualification)
-    for(;;){                                         // Loop until we see a released state
-        if (tmo != portMAX_DELAY &&                  // Timeout active?
-            (xTaskGetTickCount() - start) >= tmo)    // Exhausted time budget?
-            return false;                            // Give up on timeout
-        if (!button_is_pressed()) break;             // Already released → proceed to wait for press
-        vTaskDelay(pdMS_TO_TICKS(10));               // Back off to reduce CPU usage
+    while (button_is_pressed()) {
+        if (tmo != portMAX_DELAY && 
+            (xTaskGetTickCount() - start) >= tmo)
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Phase 2: wait for press, then debounce
-    for(;;){                                         // Loop until debounced press or timeout
-        if (tmo != portMAX_DELAY &&                  // Timeout active?
-            (xTaskGetTickCount() - start) >= tmo)    // Exhausted time budget?
-            return false;                            // Give up on timeout
-
-        if (button_is_pressed()){                    // Detected a press edge
-            vTaskDelay(pdMS_TO_TICKS(s_cfg.debounce_ms)); // Debounce window (press-only)
-            if (button_is_pressed()) return true;    // Still pressed after debounce → success
-            // If it bounced back to released, keep waiting
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));               // Polling cadence
+    // Phase 2: wait for press edge (CHANGED: immediate detection)
+    while (!button_is_pressed()) {
+        if (tmo != portMAX_DELAY && 
+            (xTaskGetTickCount() - start) >= tmo)
+            return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
+    
+    // Debounce: confirm it's stable
+    vTaskDelay(pdMS_TO_TICKS(s_cfg.debounce_ms));
+    return button_is_pressed();  // Return true if still pressed after debounce
 }
 
 /*

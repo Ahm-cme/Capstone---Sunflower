@@ -65,6 +65,7 @@
 #include <math.h>
 #include "status_led.h"
 #include "esp_sleep.h"
+#include <inttypes.h>
 
 #ifndef DEG2RAD
 #define DEG2RAD(d)  ((d) * M_PI / 180.0)
@@ -72,10 +73,24 @@
 
 #define TAG "TRACK"
 
-// Add a fixed compass→mount-front correction (sensor mounted reversed: front=N, compass reads S)
-#define MOUNT_COMPASS_OFFSET_DEG  180.0f
+// Add debug macros (after TAG definition)
+#define DEBUG_TRACE() ESP_LOGD(TAG, "%s() called", __func__)
 
-// Around line 130, UPDATE the state initialization comment and values:
+#define DEBUG_GPS(g) do { \
+    ESP_LOGD(TAG, "GPS data:"); \
+    ESP_LOGD(TAG, "  Lat: %.6f° Lon: %.6f°", (g).latitude, (g).longitude); \
+    ESP_LOGD(TAG, "  Sats: %u Fix: %u Valid: %s", \
+             (g).num_satellites, (g).fix_type, (g).valid ? "YES" : "NO"); \
+} while(0)
+
+#define DEBUG_SUN(s) do { \
+    ESP_LOGD(TAG, "Sun position:"); \
+    ESP_LOGD(TAG, "  Az: %.2f° El: %.2f°", (s).azimuth_deg, (s).elevation_deg); \
+    ESP_LOGD(TAG, "  Daylight: %s", (s).is_daylight ? "YES" : "NO"); \
+} while(0)
+
+// Compass mounting offset: compass is on back of panel, 180° from front
+#define MOUNT_COMPASS_OFFSET_DEG 180.0
 
 /*
  * Global tracker state (persisted in NVS).
@@ -143,7 +158,27 @@ static tracker_state_t s = {
 };
 
 static SemaphoreHandle_t s_mutex;      // Reserved for future multi-thread access to 's'
+/*
+ * Convert actuator extension (mm) back to angle (deg).
+ * Used for debugging and logging actual actuator positions.
+ */
+static double az_mm_to_angle(double mm) {
+    const double CENTER_MM = 127.0;
+    const double STROKE_MM = 63.5;
+    const double RANGE_DEG = 90.0;
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;
+    
+    return (mm - CENTER_MM) / MM_PER_DEG;
+}
 
+static double el_mm_to_angle(double mm) {
+    const double CENTER_MM = 107.95;
+    const double STROKE_MM = 88.9;
+    const double RANGE_DEG = 112.0;
+    const double MM_PER_DEG = STROKE_MM / RANGE_DEG;
+    
+    return (mm - CENTER_MM) / MM_PER_DEG;
+}
 /*
  * Save tracker state to NVS flash.
  * 
@@ -298,7 +333,7 @@ static void nvs_load(void){
                 ESP_LOGD(TAG, "Configuration:");
                 ESP_LOGD(TAG, "  - Move threshold: %.1f°", s.tol_deg);
                 ESP_LOGD(TAG, "  - Min step: %.1f°", s.min_step_deg);
-                ESP_LOGD(TAG, "  - Cadence: fast=%ds, slow=%ds", s.fast_period_s, s.base_period_s);
+                ESP_LOGD(TAG, "  - Cadence: fast=%ds, slow=%ds", (int)s.fast_period_s, (int)s.base_period_s);
                 ESP_LOGD(TAG, "  - Sleep threshold: %.1f° elevation", s.sleep_thresh_el);
             }
         } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
@@ -668,6 +703,41 @@ static void do_move(double az_tgt, double el_tgt){
 }
 
 /*
+ * Check for midnight rollover and reset daily counter.
+ * Keeps moves_today accurate across day boundaries.
+ */
+static void maybe_midnight_reset(void) {
+    static int last_day = -1;
+    
+    time_t now = time(NULL);
+    struct tm *tm_now = localtime(&now);
+    
+    if (last_day == -1) {
+        // First call - just record the day
+        last_day = tm_now->tm_mday;
+        ESP_LOGD(TAG, "Midnight check initialized: day %d", (int)last_day);
+        return;
+    }
+    
+    if (tm_now->tm_mday != last_day) {
+        // Day changed - reset counter
+        ESP_LOGI(TAG, "Midnight rollover detected: day %d → %d", (int)last_day, (int)tm_now->tm_mday);
+        ESP_LOGI(TAG, "  Moves yesterday: %u", s.moves_today);
+        
+        sdlog_printf("Midnight: Reset daily counter (%u moves yesterday)", s.moves_today);
+        
+        s.moves_today = 0;
+        last_day = tm_now->tm_mday;
+        
+        // Save updated counter to NVS
+        nvs_save();
+        
+        ESP_LOGI(TAG, "  Daily counter reset to 0");
+    }
+}
+
+
+/*
  * Enter deep sleep until the given UTC time.
  * 
  * What happens:
@@ -700,6 +770,7 @@ static void enter_deep_sleep_until(time_t wake_utc){
         delta_s = 43200;  // 12 hours max
     }
 
+    
     // Calculate and log wake time
     struct tm *now_tm = localtime(&now);
     struct tm *wake_tm = localtime(&wake_utc);
@@ -1138,7 +1209,7 @@ static void tracking_task(void *arg){
     ESP_LOGI(TAG, "");
     
     ESP_LOGD(TAG, "Task started: priority=%d, stack=%d bytes",
-             uxTaskPriorityGet(NULL), 4096);
+             (int)uxTaskPriorityGet(NULL), 4096);
     ESP_LOGD(TAG, "Free heap before load: %lu bytes", 
              (unsigned long)esp_get_free_heap_size());
 
@@ -1160,10 +1231,10 @@ static void tracking_task(void *arg){
              s.home_az_deg, s.home_el_deg);
     ESP_LOGI(TAG, "  - Movement threshold: %.1f°", s.tol_deg);
     ESP_LOGI(TAG, "  - Minimum step: %.1f°", s.min_step_deg);
-    ESP_LOGI(TAG, "  - Cadence: %ds waiting, %ds after move", 
-             s.fast_period_s, s.base_period_s);
+    ESP_LOGI(TAG, "  - Cadence: %ds waiting, %ds after move",
+             (int)s.fast_period_s, (int)s.base_period_s);
     ESP_LOGI(TAG, "  - Sleep threshold: %.1f° elevation", s.sleep_thresh_el);
-    ESP_LOGI(TAG, "  - Pre-wake: %d minutes before sunrise", s.prewake_min);
+    ESP_LOGI(TAG, "  - Pre-wake: %d minutes before sunrise", (int)s.prewake_min);
     ESP_LOGD(TAG, "  - CSV log: %s", csv);
     ESP_LOGI(TAG, "");
 
@@ -1508,14 +1579,14 @@ static void tracking_task(void *arg){
                     solar_events_t tomorrow = solar_events(g.latitude, g.longitude, now + 86400);
                     if (tomorrow.has_sunrise) {
                         wake_ts = tomorrow.sunrise_utc - (s.prewake_min * 60);
-                        ESP_LOGI(TAG, "Wake target: %d min before tomorrow's sunrise", s.prewake_min);
+                        ESP_LOGI(TAG, "Wake target: %d min before tomorrow's sunrise", (int)s.prewake_min);
                     } else {
                         wake_ts = now + 21600;  // 6 hours fallback
                         ESP_LOGW(TAG, "Tomorrow's sunrise unavailable - using 6h fallback");
                     }
                 } else {
                     wake_ts = ev.sunrise_utc - (s.prewake_min * 60);
-                    ESP_LOGI(TAG, "Wake target: %d min before today's sunrise", s.prewake_min);
+                    ESP_LOGI(TAG, "Wake target: %d min before today's sunrise", (int)s.prewake_min);
                 }
             } else {
                 wake_ts = now + 21600;  // 6 hours fallback
@@ -1552,7 +1623,7 @@ static void tracking_task(void *arg){
             // Set status to TRACKING when actively moving
             status_led_set_mode(LED_TRACKING);
 
-            ESP_LOGI(TAG, "Next check in %d minutes", s.cur_period_s / 60);
+            ESP_LOGI(TAG, "Next check in %d minutes", (int)(s.cur_period_s / 60));
         } else {
             s.cur_period_s = s.fast_period_s;       // Speed up while waiting
             csv_note = "WAIT";
@@ -1560,7 +1631,7 @@ static void tracking_task(void *arg){
             status_led_set_mode(LED_WAITING);       
 
             ESP_LOGI(TAG, "Below threshold (%.2f° < %.1f°)", dang, s.tol_deg);
-            ESP_LOGI(TAG, "Next check in %d minutes", s.cur_period_s / 60);
+            ESP_LOGI(TAG, "Next check in %d minutes", (int)(s.cur_period_s / 60));
         }
 
         ESP_LOGI(TAG, "");
@@ -1592,7 +1663,7 @@ static void tracking_task(void *arg){
 
         // === Loop Cadence Control ===
         // Wait until next scheduled iteration (maintains precise timing)
-        ESP_LOGD(TAG, "Waiting %d seconds until next check...", s.cur_period_s);
+        ESP_LOGD(TAG, "Waiting %d seconds until next check...", (int)s.cur_period_s);
         vTaskDelayUntil(&loop_start, pdMS_TO_TICKS(s.cur_period_s * 1000));
     }
 }
@@ -1653,7 +1724,7 @@ void tracking_start(void){
     if (ret != pdPASS) {
         ESP_LOGE(TAG, "");
         ESP_LOGE(TAG, "✗ CRITICAL: Failed to create tracking task");
-        ESP_LOGE(TAG, "  - Return code: %d", ret);
+        ESP_LOGE(TAG, "  - Return code: %d", (int)ret);
         ESP_LOGE(TAG, "  - Check available heap (need ~4KB stack)");
         ESP_LOGE(TAG, "  - System cannot track without this task");
         ESP_LOGE(TAG, "");

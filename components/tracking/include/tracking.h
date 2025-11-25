@@ -240,3 +240,9 @@ void tracking_get_current_angles(float *az_deg, float *el_deg);
     ```
 */
 void tracking_get_move_stats(uint32_t *moves_today, uint32_t *total_moves);
+
+
+/**
+ * Get mount calibration offsets
+ */
+void tracking_get_mount_offsets(float *az_offset_deg, float *el_offset_deg);

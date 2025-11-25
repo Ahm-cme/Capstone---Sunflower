@@ -197,7 +197,7 @@ static uint32_t move_time_ms(double cur_mm, double tgt_mm){
     uint32_t total_ms = (uint32_t)safe_time_ms + MIN_SAFETY_BUFFER_MS;
     
     ESP_LOGD(TAG, "  Minimum buffer: +%d ms (startup/coast)", MIN_SAFETY_BUFFER_MS);
-    ESP_LOGD(TAG, "  Total time: %u ms", total_ms);
+    ESP_LOGD(TAG, "  Total time: %" PRIu32 " ms", total_ms);
     
     // Calculate effective speed after all safety factors
     double effective_speed_mm_per_s = (distance_mm / total_ms) * 1000.0;
@@ -421,7 +421,7 @@ esp_err_t motor_init(const motor_cfg_t *cfg){
              (timer_config.speed_mode == LEDC_LOW_SPEED_MODE) ? "LOW_SPEED" : "HIGH_SPEED");
     ESP_LOGV(TAG, "  - Timer: %d", timer_config.timer_num);
     ESP_LOGV(TAG, "  - Resolution: 13-bit (8192 steps)");
-    ESP_LOGV(TAG, "  - Frequency: %d Hz (%.2f kHz)", timer_config.freq_hz, timer_config.freq_hz / 1000.0);
+    ESP_LOGV(TAG, "  - Frequency: %" PRIu32 " Hz (%.2f kHz)", timer_config.freq_hz, timer_config.freq_hz / 1000.0);
     ESP_LOGV(TAG, "  - Period: %.2f µs", 1000000.0 / timer_config.freq_hz);
     ESP_LOGV(TAG, "  - Time resolution: %.3f µs/step", 
              (1000000.0 / timer_config.freq_hz) / 8192.0);
@@ -539,7 +539,7 @@ esp_err_t motor_init(const motor_cfg_t *cfg){
     ESP_LOGD(TAG, "Move statistics initialized:");
     ESP_LOGD(TAG, "  - AZ last move: %.1f° (0 ms)", s_stats.last_az_move_deg);
     ESP_LOGD(TAG, "  - EL last move: %.1f° (0 ms)", s_stats.last_el_move_deg);
-    ESP_LOGD(TAG, "  - Total moves: %u", s_stats.total_moves);
+    ESP_LOGD(TAG, "  - Total moves: %" PRIu32, s_stats.total_moves);
     
     s_initialized = true;
     
@@ -547,6 +547,9 @@ esp_err_t motor_init(const motor_cfg_t *cfg){
     ESP_LOGI(TAG, "  System ready for tracking operations");
     ESP_LOGD(TAG, "  Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
     ESP_LOGI(TAG, "");
+
+    return ESP_OK;
+    
 }
 
 /*
@@ -648,7 +651,7 @@ void motor_move_az(double current_deg, double target_deg){
     ESP_LOGI(TAG, "  Position: %.2f° → %.2f° (Δ=%.2f°)", current_deg, clamped_target, move_delta);
     ESP_LOGI(TAG, "  Stroke: %.1f mm → %.1f mm (Δ=%.1f mm)", current_mm, target_mm, fabs(target_mm - current_mm));
     ESP_LOGI(TAG, "  Direction: %s", dir_name);
-    ESP_LOGI(TAG, "  Duration: %u ms (conservative)", move_ms);
+    ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
     ESP_LOGD(TAG, "  PWM: 100%% duty (8191/8191)");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Executing...");
@@ -675,7 +678,7 @@ void motor_move_az(double current_deg, double target_deg){
     
     ESP_LOGV(TAG, "  End tick: %lu", (unsigned long)end_tick);
     ESP_LOGV(TAG, "  Ticks elapsed: %lu", (unsigned long)(end_tick - start_tick));
-    ESP_LOGV(TAG, "  Tick period: %u ms", portTICK_PERIOD_MS);
+    ESP_LOGV(TAG, "  Tick period: %lu ms", (unsigned long)portTICK_PERIOD_MS);
     
     // Update statistics
     s_stats.last_az_move_deg = move_delta;
@@ -685,17 +688,17 @@ void motor_move_az(double current_deg, double target_deg){
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "✓ AZ move complete:");
     ESP_LOGI(TAG, "  Final position: ~%.1f° (open-loop estimate)", clamped_target);
-    ESP_LOGI(TAG, "  Actual duration: %u ms", actual_ms);
-    ESP_LOGD(TAG, "  Planned duration: %u ms", move_ms);
+    ESP_LOGI(TAG, "  Actual duration: %" PRIu32 " ms", actual_ms);
+    ESP_LOGD(TAG, "  Planned duration: %" PRIu32 " ms", move_ms);
     ESP_LOGD(TAG, "  Timing accuracy: %s%d ms (%s%.1f%%)",
-             (timing_error_ms >= 0) ? "+" : "", timing_error_ms,
+             (timing_error_ms >= 0) ? "+" : "", (int)timing_error_ms,
              (timing_error_ms >= 0) ? "+" : "", (timing_error_ms * 100.0) / move_ms);
-    ESP_LOGD(TAG, "  Total system moves: %u", s_stats.total_moves);
+    ESP_LOGD(TAG, "  Total system moves: %" PRIu32, s_stats.total_moves);
     ESP_LOGI(TAG, "");
     
     // Warn if timing error is large (>5% suggests system lag or high load)
     if (abs(timing_error_ms) > (int32_t)(move_ms * 0.05)) {
-        ESP_LOGW(TAG, "⚠ Large timing error detected: %d ms", timing_error_ms);
+        ESP_LOGW(TAG, "⚠ Large timing error detected: %d ms", (int)timing_error_ms);
         ESP_LOGD(TAG, "  Possible causes:");
         ESP_LOGD(TAG, "    - System load (other tasks consuming CPU)");
         ESP_LOGD(TAG, "    - Tick rate inaccuracy");
@@ -801,7 +804,7 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGI(TAG, "  Position: %.2f° → %.2f° (Δ=%.2f°)", current_deg, clamped_target, move_delta);
     ESP_LOGI(TAG, "  Stroke: %.1f mm → %.1f mm (Δ=%.1f mm)", current_mm, target_mm, fabs(target_mm - current_mm));
     ESP_LOGI(TAG, "  Direction: %s", dir_name);
-    ESP_LOGI(TAG, "  Duration: %u ms (conservative)", move_ms);
+    ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
     ESP_LOGD(TAG, "  PWM: 100%% duty (8191/8191)");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Executing...");
@@ -828,7 +831,7 @@ void motor_move_el(double current_deg, double target_deg){
     
     ESP_LOGV(TAG, "  End tick: %lu", (unsigned long)end_tick);
     ESP_LOGV(TAG, "  Ticks elapsed: %lu", (unsigned long)(end_tick - start_tick));
-    ESP_LOGV(TAG, "  Tick period: %u ms", portTICK_PERIOD_MS);
+    ESP_LOGV(TAG, "  Tick period: %lu ms", (unsigned long)portTICK_PERIOD_MS);
     
     // Update statistics
     s_stats.last_el_move_deg = move_delta;
@@ -838,17 +841,17 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "✓ EL move complete:");
     ESP_LOGI(TAG, "  Final position: ~%.1f° (open-loop estimate)", clamped_target);
-    ESP_LOGI(TAG, "  Actual duration: %u ms", actual_ms);
-    ESP_LOGD(TAG, "  Planned duration: %u ms", move_ms);
+    ESP_LOGI(TAG, "  Actual duration: %" PRIu32 " ms", actual_ms);
+    ESP_LOGD(TAG, "  Planned duration: %" PRIu32 " ms", move_ms);
     ESP_LOGD(TAG, "  Timing accuracy: %s%d ms (%s%.1f%%)",
-             (timing_error_ms >= 0) ? "+" : "", timing_error_ms,
+             (timing_error_ms >= 0) ? "+" : "", (int)timing_error_ms,
              (timing_error_ms >= 0) ? "+" : "", (timing_error_ms * 100.0) / move_ms);
-    ESP_LOGD(TAG, "  Total system moves: %u", s_stats.total_moves);
+    ESP_LOGD(TAG, "  Total system moves: %" PRIu32, s_stats.total_moves);
     ESP_LOGI(TAG, "");
     
     // Warn if timing error is large (>5% suggests system lag or high load)
     if (abs(timing_error_ms) > (int32_t)(move_ms * 0.05)) {
-        ESP_LOGW(TAG, "⚠ Large timing error detected: %d ms", timing_error_ms);
+        ESP_LOGW(TAG, "⚠ Large timing error detected: %d ms", (int)timing_error_ms);
         ESP_LOGD(TAG, "  Possible causes:");
         ESP_LOGD(TAG, "    - System load (other tasks consuming CPU)");
         ESP_LOGD(TAG, "    - Tick rate inaccuracy");
@@ -1119,9 +1122,9 @@ void motor_get_stats(motor_stats_t *stats){
     *stats = s_stats;
     
     ESP_LOGV(TAG, "Statistics retrieved:");
-    ESP_LOGV(TAG, "  - AZ last: %.1f° (%u ms)", 
+    ESP_LOGV(TAG, "  - AZ last: %.1f° (%" PRIu32 " ms)", 
              s_stats.last_az_move_deg, s_stats.last_az_duration_ms);
-    ESP_LOGV(TAG, "  - EL last: %.1f° (%u ms)",
+    ESP_LOGV(TAG, "  - EL last: %.1f° (%" PRIu32 " ms)",
              s_stats.last_el_move_deg, s_stats.last_el_duration_ms);
-    ESP_LOGV(TAG, "  - Total moves: %u", s_stats.total_moves);
+    ESP_LOGV(TAG, "  - Total moves: %" PRIu32, s_stats.total_moves);
 }

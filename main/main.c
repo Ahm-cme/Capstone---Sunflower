@@ -120,12 +120,88 @@
 
 // User interface
 #define STATUS_LED_GPIO 4     // Built-in LED on ESP32-CAM
-#define START_BTN_GPIO  5     // Start/calibrate button
+#define START_BTN_GPIO  25     // Start/calibrate button
 
 // Battery monitoring (ADC)
 #define BATTERY_ADC_GPIO    35     // GPIO35 (ADC1_CH7) - best for analog input
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_7
 #define BATTERY_VOLTAGE_RATIO 6.89f  // Voltage divider: (68k+15k)/15k = 6.89
+
+#define DEBUG_TRACE() ESP_LOGD(TAG, "%s() called", __func__)
+
+/*
+ * Serial Console Input Handler
+ * 
+ * Reads commands from USB serial (UART0) for debugging/testing.
+ * Commands:
+ *   's' or ENTER → Start tracking (same as button press)
+ *   'c'         → Calibrate mount (same as long-press)
+ *   'x'         → Calibrate compass (same as double-press)
+ */
+static bool check_serial_input(void) {
+    uint8_t buf[1];
+    int len = uart_read_bytes(UART_NUM_0, buf, 1, pdMS_TO_TICKS(10));
+    
+    if (len > 0) {
+        char cmd = (char)buf[0];
+        
+        // Convert to lowercase
+        if (cmd >= 'A' && cmd <= 'Z') {
+            cmd = cmd + ('a' - 'A');
+        }
+        
+        switch(cmd) {
+            case 's':  // Start tracking
+            case '\r': // Enter key
+            case '\n':
+                ESP_LOGI(TAG, "✓ Serial command: START TRACKING");
+                sdlog_printf("Serial input: Start tracking command");
+                return true;
+                
+            case 'c':  // Calibrate mount
+                ESP_LOGI(TAG, "✓ Serial command: CALIBRATE MOUNT");
+                sdlog_printf("Serial input: Mount calibration command");
+                
+                status_led_set_mode(LED_STARTUP);
+                tracking_calibrate_mount_offset_now();
+                status_led_set_mode(LED_WAITING);
+                
+                ESP_LOGI(TAG, "Mount calibration complete");
+                return false;  // Don't start tracking
+                
+            case 'x':  // Calibrate compass
+                ESP_LOGI(TAG, "✓ Serial command: CALIBRATE COMPASS");
+                sdlog_printf("Serial input: Compass calibration command");
+                
+                status_led_set_mode(LED_STARTUP);
+                bool success = gps_calibrate_compass();
+                
+                if (success) {
+                    ESP_LOGI(TAG, "Compass calibration successful");
+                    // Blink 3 times
+                    for (int i = 0; i < 3; i++) {
+                        status_led_set_mode(LED_ERROR);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                        status_led_set_mode(LED_TRACKING);
+                        vTaskDelay(pdMS_TO_TICKS(200));
+                    }
+                } else {
+                    ESP_LOGE(TAG, "Compass calibration failed");
+                    status_led_set_mode(LED_ERROR);
+                    vTaskDelay(pdMS_TO_TICKS(3000));
+                }
+                
+                status_led_set_mode(LED_WAITING);
+                return false;  // Don't start tracking
+                
+            default:
+                // Ignore unknown characters
+                break;
+        }
+    }
+    
+    return false;
+}
 
 /*
  * Calibration Task
@@ -146,6 +222,9 @@ static void calib_task(void *arg){
     ESP_LOGI(TAG, "Calibration monitor running");
     ESP_LOGI(TAG, "Hold START button for 3 seconds to calibrate");
     
+    // Log calibration task startup
+    sdlog_printf("Calibration monitor started");
+    
     uint32_t loop_count = 0;
     
     for(;;){
@@ -154,6 +233,8 @@ static void calib_task(void *arg){
         // Log every 60 seconds to show task is alive
         if (loop_count % 300 == 0) {
             ESP_LOGD(TAG, "Calibration monitor: alive (iteration %lu)", (unsigned long)loop_count);
+            // Periodic SD log for calibration task health
+            sdlog_printf("Calibration monitor: alive (%lu iterations)", (unsigned long)loop_count);
         }
         
         // Check if button is pressed
@@ -162,6 +243,8 @@ static void calib_task(void *arg){
             uint32_t hold_time = 0;
             
             ESP_LOGD(TAG, "Button press detected at tick %lu", (unsigned long)press_start);
+            // Log button press event
+            sdlog_printf("Button press detected (calibration check)");
             
             // Keep checking while button is held down
             while (button_is_pressed()) {
@@ -184,13 +267,15 @@ static void calib_task(void *arg){
                     
                     // Log to SD card
                     ESP_LOGD(TAG, "Writing calibration start to SD log");
-                    sdlog_printf("Starting mount calibration");
+                    sdlog_printf("Starting mount calibration (button held %lums)", (unsigned long)hold_time);
                     
                     // Get angles BEFORE calibration
                     float before_az, before_el;
                     tracking_get_current_angles(&before_az, &before_el);
                     ESP_LOGI(TAG, "Current position BEFORE calibration: Az=%.1f° El=%.1f°", 
                              before_az, before_el);
+                    // Log pre-calibration position
+                    sdlog_printf("Pre-calibration position: Az=%.1f° El=%.1f°", before_az, before_el);
                     
                     // Do the actual calibration
                     ESP_LOGD(TAG, "Calling tracking_calibrate_mount_offset_now()...");
@@ -202,6 +287,9 @@ static void calib_task(void *arg){
                     tracking_get_mount_offsets(&after_az_offset, &after_el_offset);
                     ESP_LOGI(TAG, "Mount offsets AFTER calibration: Az=%.1f° El=%.1f°",
                              after_az_offset, after_el_offset);
+                    // Log calibration results
+                    sdlog_printf("Mount calibration complete: Offsets Az=%.1f° El=%.1f°", 
+                                after_az_offset, after_el_offset);
                     
                     // Back to normal LED pattern
                     ESP_LOGD(TAG, "Setting LED mode: LED_TRACKING");
@@ -220,6 +308,8 @@ static void calib_task(void *arg){
                         }
                     }
                     ESP_LOGD(TAG, "Button released after %lu ms", (unsigned long)release_wait);
+                    // Log button release
+                    sdlog_printf("Calibration button released after %lums", (unsigned long)release_wait);
                     break;
                 }
             }
@@ -227,6 +317,8 @@ static void calib_task(void *arg){
             // Button was released before 3 seconds
             if (hold_time < 3000) {
                 ESP_LOGD(TAG, "Button released too early (%lu ms < 3000 ms)", (unsigned long)hold_time);
+                // Log early release
+                sdlog_printf("Calibration cancelled: button held only %lums (need 3000ms)", (unsigned long)hold_time);
             }
         }
         
@@ -255,6 +347,9 @@ static void compass_calib_task(void *arg){
     ESP_LOGI(TAG, "Compass calibration monitor running");
     ESP_LOGI(TAG, "Double-press START to calibrate compass");
     
+    // Log compass task startup
+    sdlog_printf("Compass calibration monitor started");
+    
     uint32_t last_press = 0;
     uint32_t loop_count = 0;
     
@@ -264,6 +359,8 @@ static void compass_calib_task(void *arg){
         // Log every 60 seconds
         if (loop_count % 300 == 0) {
             ESP_LOGD(TAG, "Compass monitor: alive (iteration %lu)", (unsigned long)loop_count);
+            // Periodic health check
+            sdlog_printf("Compass monitor: alive (%lu iterations)", (unsigned long)loop_count);
         }
         
         if (button_wait_for_press(100)) {
@@ -278,7 +375,7 @@ static void compass_calib_task(void *arg){
                          (unsigned long)time_since_last);
                 
                 ESP_LOGD(TAG, "Writing compass calibration start to SD log");
-                sdlog_printf("Starting compass calibration");
+                sdlog_printf("Starting compass calibration (double-press, interval=%lums)", (unsigned long)time_since_last);
                 
                 // Fast blink = calibration mode
                 ESP_LOGD(TAG, "Setting LED mode: LED_STARTUP");
@@ -287,18 +384,22 @@ static void compass_calib_task(void *arg){
                 // Check compass status BEFORE calibration
                 bool was_calibrated = gps_is_compass_calibrated();
                 ESP_LOGD(TAG, "Compass calibrated before: %s", was_calibrated ? "YES" : "NO");
+                // Log pre-calibration state
+                sdlog_printf("Compass pre-calibration state: %s", was_calibrated ? "CALIBRATED" : "UNCALIBRATED");
                 
                 ESP_LOGI(TAG, "Starting compass calibration (rotate panel slowly)...");
                 bool success = gps_calibrate_compass();
                 
                 if (success) {
                     ESP_LOGI(TAG, "✓ Compass calibration successful");
-                    sdlog_printf("Compass calibration: OK");
+                    sdlog_printf("Compass calibration: SUCCESS");
                     
                     // Test compass reading after calibration
                     float heading;
                     if (gps_get_compass_heading(&heading)) {
                         ESP_LOGI(TAG, "  Compass reading after calibration: %.1f°", heading);
+                        // Log compass test reading
+                        sdlog_printf("Compass post-calibration test: Heading=%.1f°", heading);
                     }
                     
                     // Blink LED 3 times to show success
@@ -311,7 +412,7 @@ static void compass_calib_task(void *arg){
                     }
                 } else {
                     ESP_LOGW(TAG, "✗ Compass calibration failed");
-                    sdlog_printf("Compass calibration: FAILED");
+                    sdlog_printf("Compass calibration: FAILED - retry required");
                     
                     ESP_LOGD(TAG, "Setting LED mode: LED_ERROR (3s)");
                     status_led_set_mode(LED_ERROR);
@@ -324,6 +425,8 @@ static void compass_calib_task(void *arg){
             } else {
                 last_press = now;
                 ESP_LOGD(TAG, "First press recorded (waiting for second press within 1s)");
+                // Log first press of potential double-press
+                sdlog_printf("Button press 1 of 2 (waiting for double-press)");
             }
         }
         
@@ -333,6 +436,8 @@ static void compass_calib_task(void *arg){
             uint32_t elapsed = (now - last_press) * portTICK_PERIOD_MS;
             if (elapsed >= 1000) {
                 ESP_LOGV(TAG, "Double-press timeout (%lu ms), resetting", (unsigned long)elapsed);
+                // Log timeout
+                sdlog_printf("Double-press timeout (%lums) - reset", (unsigned long)elapsed);
                 last_press = 0;
             }
         }
@@ -392,7 +497,7 @@ static bool perform_system_check(bool init_results[9]) {
         warnings++;
     }
     
-    // === 2. NVS Flash Check (ADD DETAILED DIAGNOSTICS) ===
+    // === 2. NVS Flash Check ===
     ESP_LOGD(TAG, "[2/9] NVS Flash check starting...");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "[2/9] Checking NVS Flash Storage...");
@@ -407,15 +512,14 @@ static bool perform_system_check(bool init_results[9]) {
             ESP_LOGI(TAG, "  ✓ NVS Flash: OK (read/write verified)");
             
             // Try to read some saved values
-            float saved_az = 0.0f;
-            uint32_t saved_moves = 0;
+            // Read blob instead of direct float (NVS doesn't have nvs_get_float)
+            tracker_state_t test_state = {0};
+            size_t required_size = sizeof(tracker_state_t);
             
-            if (nvs_get_float(test_handle, "az_cur", &saved_az) == ESP_OK) {
-                ESP_LOGD(TAG, "    Found saved position: Az=%.1f°", saved_az);
-            }
-            
-            if (nvs_get_u32(test_handle, "total_moves", &saved_moves) == ESP_OK) {
-                ESP_LOGD(TAG, "    Found saved move count: %lu", (unsigned long)saved_moves);
+            if (nvs_get_blob(test_handle, "state", &test_state, &required_size) == ESP_OK) {
+                ESP_LOGD(TAG, "    Found saved state: Az=%.1f° El=%.1f°", 
+                         test_state.az_cur, test_state.el_cur);
+                ESP_LOGD(TAG, "    Total moves: %lu", (unsigned long)test_state.total_moves);
             }
             
             nvs_close(test_handle);
@@ -793,7 +897,7 @@ void app_main(void){
     ESP_LOGI(TAG, "Wake reason: %s", wake_reason);
     ESP_LOGI(TAG, "");
 
-    bool init_results[9] = {false};  // Changed from 7 to 9 for new checks
+    bool init_results[9] = {false};
 
     // === Initialize Status LED ===
     ESP_LOGI(TAG, "Initializing status LED...");
@@ -809,15 +913,19 @@ void app_main(void){
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
         init_results[1] = true;
+        // Log NVS erase event
+        sdlog_printf("NVS flash erased and reinitialized");
     } else if (ret != ESP_OK) {
         init_results[1] = false;
+        // Log NVS failure
+        sdlog_printf("ERROR: NVS flash init failed: %s", esp_err_to_name(ret));
     } else {
         init_results[1] = true;
     }
 
     // === Initialize SD Card Logging ===
     ESP_LOGI(TAG, "Waiting for boot to stabilize before SD init...");
-    vTaskDelay(pdMS_TO_TICKS(2000));  // 2 second delay
+    vTaskDelay(pdMS_TO_TICKS(2000));
     
     ESP_LOGI(TAG, "Initializing SD card...");
     sdlog_cfg_t sd_config = {
@@ -825,6 +933,15 @@ void app_main(void){
         .sclk = SD_SCLK, .cs = SD_CS
     };
     init_results[2] = sdlog_init(&sd_config);
+    
+    // Log system startup info to SD (now that SD is initialized)
+    if (init_results[2]) {
+        sdlog_printf("=== SYSTEM BOOT ===");
+        sdlog_printf("Build: %s %s", __DATE__, __TIME__);
+        sdlog_printf("ESP-IDF: %s", esp_get_idf_version());
+        sdlog_printf("Wake reason: %s", wake_reason);
+        sdlog_printf("Free heap: %lu bytes", (unsigned long)esp_get_free_heap_size());
+    }
 
     // === Initialize GPS ===
     ESP_LOGI(TAG, "Initializing GPS system...");
@@ -839,6 +956,12 @@ void app_main(void){
     };
     ret = gps_init(&gps_config);
     init_results[3] = (ret == ESP_OK);
+    // Log GPS init result
+    if (init_results[2]) {
+        sdlog_printf("GPS init: %s (UART%d @ %d baud, I2C port %d)",
+                    init_results[3] ? "OK" : "FAILED",
+                    GPS_UART_PORT, GPS_BAUD, I2C_PORT);
+    }
 
     // === Initialize Motors ===
     ESP_LOGI(TAG, "Initializing motor control...");
@@ -847,14 +970,22 @@ void app_main(void){
         .az_dir_pin = MOTOR_AZ_DIR,
         .el_pwm_pin = MOTOR_EL_PWM, 
         .el_dir_pin = MOTOR_EL_DIR,
-        .stroke_mm = 200.0,          // Keep for now (will update motor.c separately)
-        .speed_mm_per_s = 11.94,     // Nominal speed
-        .max_az_deg = 45,            // CHANGED: ±45° range (90° total)
-        .max_el_deg = 56,            // CHANGED: ±56° range (112° total)
-        .min_el_deg = -56            // CHANGED: Lower limit
+        .stroke_mm = 200.0,
+        .speed_mm_per_s = 11.94,
+        .max_az_deg = 45,
+        .max_el_deg = 56,
+        .min_el_deg = -56
     };
     ret = motor_init(&motor_config);
     init_results[4] = (ret == ESP_OK);
+    // Log motor init result
+    if (init_results[2]) {
+        sdlog_printf("Motor init: %s (Az:GPIO%d/%d El:GPIO%d/%d Range:±%d°/±%d°)",
+                    init_results[4] ? "OK" : "FAILED",
+                    MOTOR_AZ_PWM, MOTOR_AZ_DIR,
+                    MOTOR_EL_PWM, MOTOR_EL_DIR,
+                    motor_config.max_az_deg, motor_config.max_el_deg);
+    }
 
     // === Initialize Button ===
     ESP_LOGI(TAG, "Initializing button interface...");
@@ -867,6 +998,12 @@ void app_main(void){
     };
     ret = button_init(&button_config);
     init_results[5] = (ret == ESP_OK);
+    // Log button init result
+    if (init_results[2]) {
+        sdlog_printf("Button init: %s (GPIO%d, active_low, debounce=%dms)",
+                    init_results[5] ? "OK" : "FAILED",
+                    START_BTN_GPIO, button_config.debounce_ms);
+    }
 
     // === Initialize Battery Monitor ===
     ESP_LOGI(TAG, "Initializing battery monitor...");
@@ -881,15 +1018,31 @@ void app_main(void){
         .samples_per_read = 32
     };
     ret = battery_init(&battery_config);
-    init_results[7] = (ret == ESP_OK);  // Battery is index 7
+    init_results[7] = (ret == ESP_OK);
+    // Log battery init result
+    if (init_results[2]) {
+        sdlog_printf("Battery init: %s (GPIO%d/ADC_CH%d, ratio=%.2f, samples=%d)",
+                    init_results[7] ? "OK" : "FAILED",
+                    BATTERY_ADC_GPIO, BATTERY_ADC_CHANNEL,
+                    BATTERY_VOLTAGE_RATIO, battery_config.samples_per_read);
+    }
 
     // === Initialize WiFi Access Point ===
     ESP_LOGI(TAG, "Initializing WiFi AP for LCD display...");
     ret = wifi_comm_init_ap();
     init_results[6] = (ret == ESP_OK);
+    // Log WiFi init result
+    if (init_results[2]) {
+        sdlog_printf("WiFi AP init: %s (SSID:SunflowerTracker, Port:8888)",
+                    init_results[6] ? "OK" : "FAILED");
+    }
 
     // Compass check will be done in system check (index 8)
     init_results[8] = gps_is_compass_calibrated();
+    // Log compass calibration state
+    if (init_results[2]) {
+        sdlog_printf("Compass state: %s", init_results[8] ? "CALIBRATED" : "UNCALIBRATED");
+    }
 
     ESP_LOGI(TAG, "");
     
@@ -908,6 +1061,11 @@ void app_main(void){
         
         if (init_results[2]) {
             sdlog_printf("CRITICAL: System halted due to initialization failures");
+            // Log which subsystems failed
+            if (!init_results[1]) sdlog_printf("  - NVS Flash FAILED");
+            if (!init_results[3]) sdlog_printf("  - GPS Module FAILED");
+            if (!init_results[4]) sdlog_printf("  - Motor Drivers FAILED");
+            if (!init_results[5]) sdlog_printf("  - Button Interface FAILED");
         }
         
         while(1) {
@@ -918,6 +1076,8 @@ void app_main(void){
 
     // === Check If We Should Auto-Start ===
     bool auto_start = (wake_cause == ESP_SLEEP_WAKEUP_TIMER);
+
+
     
     if (!auto_start) {
         ESP_LOGI(TAG, "");
@@ -925,30 +1085,34 @@ void app_main(void){
         ESP_LOGI(TAG, "║           WAITING FOR USER INPUT                           ║");
         ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
         ESP_LOGI(TAG, "");
-        ESP_LOGI(TAG, "  Actions:");
-        ESP_LOGI(TAG, "   • Press button once      → Start tracking");
-        ESP_LOGI(TAG, "   • Hold button 3 seconds  → Calibrate mount");
-        ESP_LOGI(TAG, "   • Double-press button    → Calibrate compass");
+        ESP_LOGI(TAG, "  Hardware Button:");
+        ESP_LOGI(TAG, "   • Press once      → Start tracking");
+        ESP_LOGI(TAG, "   • Hold 3 seconds  → Calibrate mount");
+        ESP_LOGI(TAG, "   • Double-press    → Calibrate compass");
+        ESP_LOGI(TAG, "");
+        ESP_LOGI(TAG, "  Serial Console (USB):"); // NEW
+        ESP_LOGI(TAG, "   • Press 's' or ENTER → Start tracking");
+        ESP_LOGI(TAG, "   • Press 'c'          → Calibrate mount");
+        ESP_LOGI(TAG, "   • Press 'x'          → Calibrate compass");
         ESP_LOGI(TAG, "");
         ESP_LOGI(TAG, "  System Status:");
         ESP_LOGI(TAG, "   • WiFi AP active - broadcasting data");
         ESP_LOGI(TAG, "   • LCD display shows live sensor readings");
-        ESP_LOGI(TAG, "   • Press button when ready to track");
         ESP_LOGI(TAG, "");
         
         status_led_set_mode(LED_WAITING);
         if (init_results[2]) {
-            sdlog_printf("Waiting for button press (transmitting status)");
+            sdlog_printf("Waiting for button press or serial input");
         }
         
-        // === NON-BLOCKING BUTTON WAIT WITH DATA TRANSMISSION ===
         ESP_LOGI(TAG, "Starting background data transmission...");
-        ESP_LOGI(TAG, "Press START button to begin tracking");
+        ESP_LOGI(TAG, "Waiting for input...");
         ESP_LOGI(TAG, "");
         
         time_t boot_time = time(NULL);
         uint32_t button_wait_seconds = 0;
         bool button_pressed = false;
+        bool serial_triggered = false; // NEW
         
         // Initialize previous values for delta calculation
         float prev_azimuth = 0.0f;
@@ -959,20 +1123,32 @@ void app_main(void){
         uint32_t last_press_time = 0;
         bool waiting_for_double_press = false;
         
-        while (!button_pressed) {
-            // === CHECK FOR BUTTON EVENTS (BEFORE DATA TRANSMISSION) ===
+        while (!button_pressed && !serial_triggered) {
+            // === CHECK SERIAL INPUT FIRST ===
+            if (check_serial_input()) {
+                ESP_LOGI(TAG, "✓ Serial input detected - starting tracking");
+                serial_triggered = true;
+                button_pressed = true;
+                break;
+            }
             
-            // Check for button press using proper wait function
-            if (button_wait_for_press(10)) {  // 10ms timeout (non-blocking check)
-                uint32_t press_time = xTaskGetTickCount();
-                uint32_t time_since_last = pdTICKS_TO_MS(press_time - last_press_time);
+            // === CHECK FOR BUTTON EVENTS (SIMPLIFIED) ===
+            if (button_is_pressed()) {
+                // Debounce: confirm stable press
+                vTaskDelay(pdMS_TO_TICKS(50));
+                if (!button_is_pressed()) {
+                    continue;  // False trigger, ignore
+                }
+                
+                uint32_t press_start = xTaskGetTickCount();
+                uint32_t time_since_last = pdTICKS_TO_MS(press_start - last_press_time);
                 
                 ESP_LOGI(TAG, "Button pressed (time since last: %lu ms)", 
                          (unsigned long)time_since_last);
                 
-                // Check for DOUBLE-PRESS (for compass calibration)
+                // Check for DOUBLE-PRESS (within 1 second)
                 if (waiting_for_double_press && time_since_last < 1000) {
-                    ESP_LOGI(TAG, "✓ DOUBLE-PRESS detected - starting compass calibration");
+                    ESP_LOGI(TAG, "✓ DOUBLE-PRESS detected - calibrating compass");
                     
                     status_led_set_mode(LED_STARTUP);
                     sdlog_printf("Compass calibration started (double-press)");
@@ -1000,20 +1176,23 @@ void app_main(void){
                     status_led_set_mode(LED_WAITING);
                     waiting_for_double_press = false;
                     last_press_time = 0;
-                    continue;  // Stay in button wait loop
+                    
+                    // Wait for release
+                    while (button_is_pressed()) {
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                    }
+                    continue;
                 }
                 
-                // Check for LONG-PRESS (for mount calibration)
-                uint32_t hold_start = xTaskGetTickCount();
+                // Check for LONG-PRESS (hold for 3 seconds)
                 bool is_long_press = false;
-                
                 while (button_is_pressed()) {
                     vTaskDelay(pdMS_TO_TICKS(50));
-                    uint32_t hold_time = pdTICKS_TO_MS(xTaskGetTickCount() - hold_start);
+                    uint32_t hold_time = pdTICKS_TO_MS(xTaskGetTickCount() - press_start);
                     
-                    if (hold_time >= 3000) {
+                    if (hold_time >= 3000 && !is_long_press) {
                         is_long_press = true;
-                        ESP_LOGI(TAG, "✓ LONG-PRESS detected (3+ seconds) - starting mount calibration");
+                        ESP_LOGI(TAG, "✓ LONG-PRESS detected - calibrating mount");
                         
                         status_led_set_mode(LED_STARTUP);
                         sdlog_printf("Mount calibration started (long-press)");
@@ -1024,46 +1203,43 @@ void app_main(void){
                         sdlog_printf("Mount calibration: OK");
                         
                         status_led_set_mode(LED_WAITING);
-                        
-                        // Wait for release
-                        while (button_is_pressed()) {
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                        }
-                        
-                        break;
                     }
                 }
                 
                 if (is_long_press) {
                     waiting_for_double_press = false;
                     last_press_time = 0;
-                    continue;  // Stay in button wait loop
+                    continue;
                 }
                 
-                // SINGLE-PRESS: Start tracking
-                if (!is_long_press && !waiting_for_double_press) {
-                    ESP_LOGI(TAG, "✓ SINGLE-PRESS detected - waiting 1s for possible double-press");
+                // SINGLE-PRESS: Wait 1 second to check for double-press
+                if (!waiting_for_double_press) {
+                    ESP_LOGI(TAG, "✓ First press - waiting for possible double-press");
                     waiting_for_double_press = true;
-                    last_press_time = press_time;
-                    
-                    // Wait 1 second to see if there's a second press
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    
-                    if (waiting_for_double_press) {
-                        // No second press within 1 second = START TRACKING
-                        ESP_LOGI(TAG, "✓ Starting tracking (no second press detected)");
-                        button_pressed = true;
-                        
-                        if (init_results[2]) {
-                            sdlog_printf("Button pressed after %lu seconds - starting tracking", 
-                                         (unsigned long)button_wait_seconds);
-                        }
-                        break;
-                    }
+                    last_press_time = press_start;
+                    continue;
+                } else {
+                    // Timeout expired, treat as single press = START
+                    ESP_LOGI(TAG, "✓ Starting tracking (single press confirmed)");
+                    button_pressed = true;
+                    sdlog_printf("Button pressed - starting tracking");
+                    break;
                 }
             }
             
-            // === BACKGROUND DATA TRANSMISSION (SAME AS BEFORE) ===
+            // Check if double-press timeout expired (1 second)
+            if (waiting_for_double_press) {
+                uint32_t now = xTaskGetTickCount();
+                uint32_t elapsed = pdTICKS_TO_MS(now - last_press_time);
+                if (elapsed >= 1000) {
+                    ESP_LOGI(TAG, "✓ Starting tracking (single press, no double-press)");
+                    button_pressed = true;
+                    sdlog_printf("Button pressed - starting tracking");
+                    break;
+                }
+            }
+            
+            // === BACKGROUND DATA TRANSMISSION ===
             
             // Get current time
             time_t now = time(NULL);
@@ -1209,8 +1385,8 @@ void app_main(void){
             if (send_ret == ESP_OK) {
                 // Log every 10 seconds to reduce spam
                 if (button_wait_seconds % 10 == 0) {
-                    ESP_LOGI(TAG, "WAITING[%lu]: Batt=%.2fV GPS=%s(%u) Clients=%u (Press button to start)",
-                             (unsigned long)button_wait_seconds,  // FIXED: Cast to unsigned long
+                    ESP_LOGI(TAG, "WAITING[%" PRIu32 "]: Batt=%.2fV GPS=%s(%u) Clients=%u (Press button to start)",
+                             button_wait_seconds,  // No cast needed with PRIu32
                              battery_v,
                              gps_valid ? "OK" : "NO_FIX",
                              gps_valid ? g.num_satellites : 0,
@@ -1262,14 +1438,13 @@ void app_main(void){
     ESP_LOGI(TAG, "  - System will start WITHOUT waiting for GPS");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Attempting initial GPS fix (60s timeout)...");
-    ESP_LOGI(TAG, "  (System continues if GPS not available)");
-    ESP_LOGI(TAG, "");
-    
-    status_led_set_mode(LED_WAITING);
+    if (init_results[2]) {
+        sdlog_printf("GPS acquisition started (60s timeout)");
+    }
     
     gps_data_t first_fix;
     int wait_count = 0;
-    const int MAX_WAIT = 12;  // 60 seconds max (12 * 5s)
+    const int MAX_WAIT = 12;
     bool got_initial_fix = false;
     
     while (!gps_poll_nav_pvt(&first_fix) && wait_count < MAX_WAIT) {
@@ -1278,6 +1453,10 @@ void app_main(void){
         // Progress indicator every 10 seconds
         if (wait_count % 2 == 0) {
             ESP_LOGI(TAG, "Searching for satellites... (%d seconds elapsed)", wait_count * 5);
+            // Log GPS search progress
+            if (init_results[2]) {
+                sdlog_printf("GPS search: %d seconds elapsed", wait_count * 5);
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1412,16 +1591,19 @@ void app_main(void){
     
     // === Main Loop: Transmit Tracking Data to LCD Display ===
     ESP_LOGI(TAG, "Entering WiFi data transmission loop (1 Hz)...");
+    if (init_results[2]) {
+        sdlog_printf("Main loop started: WiFi data transmission @ 1 Hz");
+    }
     
     uint32_t connection_wait_counter = 0;
-    
-    // Initialize previous values for delta calculation
     float prev_azimuth = 0.0f;
     float prev_elevation = 0.0f;
     bool first_reading = true;
-    
-    // Track uptime since wake
     time_t boot_time = time(NULL);
+    
+    // Periodic comprehensive status logging
+    uint32_t last_comprehensive_log = 0;
+    const uint32_t COMPREHENSIVE_LOG_INTERVAL = 300; // Every 5 minutes
     
     while (1) {
         // Get current time (BOTH UTC and local)
@@ -1494,7 +1676,7 @@ void app_main(void){
             }
         } else {
             // NO GPS AT ALL: Set LED to waiting/standby
-            status_led_set_mode(LED_WAITING);  // ADD THIS LINE
+            status_led_set_mode(LED_WAITING);  
             
             static uint32_t last_no_gps_warn = 0;
             if ((now - last_no_gps_warn) >= 30) {
