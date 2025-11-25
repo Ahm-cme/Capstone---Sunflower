@@ -493,8 +493,29 @@ esp_err_t wifi_comm_send_data(const tracker_data_t *data)
     timeout.tv_usec = 0;
     setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    // Send packet
-    int bytes_sent = send(client_socket, data, sizeof(tracker_data_t), 0);
+    // CHANGED: Send with retry on EAGAIN
+    int bytes_sent = -1;
+    int retry_count = 0;
+    const int MAX_RETRIES = 3;
+    
+    while (retry_count < MAX_RETRIES) {
+        bytes_sent = send(client_socket, data, sizeof(tracker_data_t), 0);
+        
+        if (bytes_sent >= 0) {
+            break;  // Success
+        }
+        
+        // Check if error is recoverable (EAGAIN/EWOULDBLOCK)
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            retry_count++;
+            ESP_LOGW(TAG, "Send buffer full (EAGAIN), retry %d/%d", retry_count, MAX_RETRIES);
+            vTaskDelay(pdMS_TO_TICKS(100));  // Wait 100ms
+            continue;
+        }
+        
+        // Non-recoverable error
+        break;
+    }
     
     if (bytes_sent < 0) {
         // Send failed - log error and close socket

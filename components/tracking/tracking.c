@@ -53,7 +53,32 @@
  */
 
 #include "tracking.h"
+
+// === ADD MOCK GPS SUPPORT (MUST MATCH main.c) ===
+#ifndef USE_MOCK_GPS
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+#endif
+
+#if USE_MOCK_GPS
+#include "mock_gps.h"
+#define GPS_POLL_NAV_PVT(data)        mock_gps_poll_nav_pvt(data)
+#define GPS_GET_LAST(data)            mock_gps_get_last(data)
+#define GPS_GET_COMPASS_HEADING_TRUE(h) mock_gps_get_compass_heading_true(h)
+#define GPS_IS_COMPASS_CALIBRATED()   mock_gps_is_compass_calibrated()
+#define GPS_GET_MAGNETIC_DECLINATION() mock_gps_get_magnetic_declination()
+#define GPS_CALIBRATE_COMPASS()       mock_gps_calibrate_compass()
+#define GPS_IS_COMPASS_PRESENT()      true  // Mock always has compass
+#else
 #include "gps.h"
+#define GPS_POLL_NAV_PVT(data)        gps_poll_nav_pvt(data)
+#define GPS_GET_LAST(data)            gps_get_last(data)
+#define GPS_GET_COMPASS_HEADING_TRUE(h) gps_get_compass_heading_true(h)
+#define GPS_IS_COMPASS_CALIBRATED()   gps_is_compass_calibrated()
+#define GPS_GET_MAGNETIC_DECLINATION() gps_get_magnetic_declination()
+#define GPS_CALIBRATE_COMPASS()       gps_calibrate_compass()
+#define GPS_IS_COMPASS_PRESENT()      gps_is_compass_present()
+#endif
+
 #include "solar.h"
 #include "motor.h"
 #include "sdlog.h"
@@ -1074,7 +1099,7 @@ void tracking_auto_calibrate_with_compass(void) {
     ESP_LOGI(TAG, "");
 
     // Verify compass is calibrated
-    if (!gps_is_compass_calibrated()) {
+    if (!GPS_IS_COMPASS_CALIBRATED()) {
         ESP_LOGW(TAG, "✗ Compass not calibrated");
         ESP_LOGW(TAG, "  - Double-press button to calibrate compass first");
         ESP_LOGW(TAG, "  - Rotate tracker 2-3 full circles during calibration");
@@ -1084,7 +1109,7 @@ void tracking_auto_calibrate_with_compass(void) {
 
     // Get GPS fix
     gps_data_t gps;
-    if (!gps_get_last(&gps) || !gps.valid) {
+    if (!GPS_GET_LAST(&gps) || !gps.valid) {
         ESP_LOGW(TAG, "✗ No valid GPS fix");
         ESP_LOGW(TAG, "  - Wait for GPS fix before auto-calibrating");
         ESP_LOGW(TAG, "");
@@ -1111,7 +1136,7 @@ void tracking_auto_calibrate_with_compass(void) {
 
     // Read compass heading (TRUE north, declination-corrected)
     float compass_heading_true;
-    if (!gps_get_compass_heading_true(&compass_heading_true)) {
+    if (!GPS_GET_COMPASS_HEADING_TRUE(&compass_heading_true)) {
         ESP_LOGE(TAG, "✗ Failed to read compass");
         ESP_LOGE(TAG, "  - Check compass connection");
         ESP_LOGE(TAG, "  - Recalibrate compass if needed");
@@ -1119,7 +1144,7 @@ void tracking_auto_calibrate_with_compass(void) {
         return;
     }
 
-    float declination = gps_get_magnetic_declination();
+    float declination = GPS_GET_MAGNETIC_DECLINATION();
     
     ESP_LOGI(TAG, "Panel Orientation (from Compass):");
     ESP_LOGI(TAG, "  - True heading: %.2f°", compass_heading_true);
@@ -1239,7 +1264,7 @@ static void tracking_task(void *arg){
     ESP_LOGI(TAG, "");
 
     // Auto-calibration logic with detailed diagnostics
-    if (gps_is_compass_calibrated()) {
+    if (GPS_IS_COMPASS_CALIBRATED()) {
         ESP_LOGD(TAG, "Compass detected and calibrated");
         
         if (fabs(s.az_mount_offset_deg) < 0.1 && fabs(s.el_mount_offset_deg) < 0.1) {
@@ -1254,7 +1279,7 @@ static void tracking_task(void *arg){
             
             ESP_LOGD(TAG, "Waiting for GPS fix (timeout: 60s)...");
             
-            while (!gps_poll_nav_pvt(&gps) && wait_count < 60) {
+            while (!GPS_POLL_NAV_PVT(&gps) && wait_count < 60) {
                 ESP_LOGI(TAG, "Waiting for GPS fix... (%d/60)", ++wait_count);
                 ESP_LOGV(TAG, "  GPS poll attempt %d", wait_count);
                 vTaskDelay(pdMS_TO_TICKS(5000));
@@ -1307,8 +1332,8 @@ static void tracking_task(void *arg){
         ESP_LOGD(TAG, "=== GPS ACQUISITION ===");
         
         gps_data_t g = {0};
-        bool gps_fresh = gps_poll_nav_pvt(&g);
-        bool gps_available = gps_fresh || gps_get_last(&g);
+        bool gps_fresh = GPS_POLL_NAV_PVT(&g);  // Prefer fresh fix
+        bool gps_available = gps_fresh || GPS_GET_LAST(&g);
         
         ESP_LOGD(TAG, "GPS poll result:");
         ESP_LOGD(TAG, "  - Fresh fix: %s", gps_fresh ? "YES" : "NO");
@@ -1385,12 +1410,12 @@ static void tracking_task(void *arg){
         float compass_true = NAN;
         float mount_front_true = NAN;
         
-        if (gps_is_compass_present()) {
+        if (GPS_IS_COMPASS_PRESENT()) {
             ESP_LOGV(TAG, "");
             ESP_LOGV(TAG, "=== COMPASS READING ===");
             
             float htrue;
-            if (gps_get_compass_heading_true(&htrue)) {
+            if (GPS_GET_COMPASS_HEADING_TRUE(&htrue)) {
                 compass_true = htrue;
                 mount_front_true = (float)wrap360(htrue + MOUNT_COMPASS_OFFSET_DEG);
                 

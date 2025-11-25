@@ -69,7 +69,6 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "gps.h"
 #include "motor.h"
 #include "sdlog.h"
 #include "tracking.h"
@@ -81,8 +80,31 @@
 #include "wifi_comm.h"
 #include "solar.h"
 #include "battery.h"
-#include "esp_adc/adc_oneshot.h"  
-#include "esp_wifi.h"             
+#include "esp_wifi.h"
+#include "esp_adc/adc_oneshot.h"
+
+// Mock GPS for testing
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+
+#if USE_MOCK_GPS
+#include "mock_gps.h"
+#define GPS_INIT()                     mock_gps_init()
+#define GPS_POLL_NAV_PVT(data)        mock_gps_poll_nav_pvt(data)
+#define GPS_GET_LAST(data)            mock_gps_get_last(data)
+#define GPS_GET_COMPASS_HEADING_TRUE(h) mock_gps_get_compass_heading_true(h)
+#define GPS_IS_COMPASS_CALIBRATED()   mock_gps_is_compass_calibrated()
+#define GPS_GET_MAGNETIC_DECLINATION() mock_gps_get_magnetic_declination()
+#define GPS_CALIBRATE_COMPASS()       mock_gps_calibrate_compass()
+#else
+#include "gps.h"
+#define GPS_INIT()                     gps_init(&gps_config)
+#define GPS_POLL_NAV_PVT(data)        gps_poll_nav_pvt(data)
+#define GPS_GET_LAST(data)            gps_get_last(data)
+#define GPS_GET_COMPASS_HEADING_TRUE(h) gps_get_compass_heading_true(h)
+#define GPS_IS_COMPASS_CALIBRATED()   gps_is_compass_calibrated()
+#define GPS_GET_MAGNETIC_DECLINATION() gps_get_magnetic_declination()
+#define GPS_CALIBRATE_COMPASS()       gps_calibrate_compass()
+#endif
 
 #define TAG "APP"
 
@@ -139,67 +161,8 @@
  *   'x'         → Calibrate compass (same as double-press)
  */
 static bool check_serial_input(void) {
-    uint8_t buf[1];
-    int len = uart_read_bytes(UART_NUM_0, buf, 1, pdMS_TO_TICKS(10));
-    
-    if (len > 0) {
-        char cmd = (char)buf[0];
-        
-        // Convert to lowercase
-        if (cmd >= 'A' && cmd <= 'Z') {
-            cmd = cmd + ('a' - 'A');
-        }
-        
-        switch(cmd) {
-            case 's':  // Start tracking
-            case '\r': // Enter key
-            case '\n':
-                ESP_LOGI(TAG, "✓ Serial command: START TRACKING");
-                sdlog_printf("Serial input: Start tracking command");
-                return true;
-                
-            case 'c':  // Calibrate mount
-                ESP_LOGI(TAG, "✓ Serial command: CALIBRATE MOUNT");
-                sdlog_printf("Serial input: Mount calibration command");
-                
-                status_led_set_mode(LED_STARTUP);
-                tracking_calibrate_mount_offset_now();
-                status_led_set_mode(LED_WAITING);
-                
-                ESP_LOGI(TAG, "Mount calibration complete");
-                return false;  // Don't start tracking
-                
-            case 'x':  // Calibrate compass
-                ESP_LOGI(TAG, "✓ Serial command: CALIBRATE COMPASS");
-                sdlog_printf("Serial input: Compass calibration command");
-                
-                status_led_set_mode(LED_STARTUP);
-                bool success = gps_calibrate_compass();
-                
-                if (success) {
-                    ESP_LOGI(TAG, "Compass calibration successful");
-                    // Blink 3 times
-                    for (int i = 0; i < 3; i++) {
-                        status_led_set_mode(LED_ERROR);
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        status_led_set_mode(LED_TRACKING);
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Compass calibration failed");
-                    status_led_set_mode(LED_ERROR);
-                    vTaskDelay(pdMS_TO_TICKS(3000));
-                }
-                
-                status_led_set_mode(LED_WAITING);
-                return false;  // Don't start tracking
-                
-            default:
-                // Ignore unknown characters
-                break;
-        }
-    }
-    
+    // REMOVED: uart_read_bytes() - causes driver errors
+    // Serial input disabled for now - use hardware button instead
     return false;
 }
 
@@ -388,7 +351,7 @@ static void compass_calib_task(void *arg){
                 sdlog_printf("Compass pre-calibration state: %s", was_calibrated ? "CALIBRATED" : "UNCALIBRATED");
                 
                 ESP_LOGI(TAG, "Starting compass calibration (rotate panel slowly)...");
-                bool success = gps_calibrate_compass();
+                bool success = GPS_CALIBRATE_COMPASS();  // CHANGED
                 
                 if (success) {
                     ESP_LOGI(TAG, "✓ Compass calibration successful");
@@ -945,6 +908,22 @@ void app_main(void){
 
     // === Initialize GPS ===
     ESP_LOGI(TAG, "Initializing GPS system...");
+    
+#if USE_MOCK_GPS
+    ret = GPS_INIT();  // Mock GPS (FORCE init NOW before tracking starts)
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ Mock GPS init failed: %s", esp_err_to_name(ret));
+        init_results[3] = false;
+    } else {
+        init_results[3] = true;
+        ESP_LOGI(TAG, "✓ Mock GPS initialized (testing mode)");
+    }
+    
+    if (init_results[2]) {
+        sdlog_printf("Mock GPS init: %s (Testing mode - simulated data)", 
+                    init_results[3] ? "OK" : "FAILED");
+    }
+#else
     gps_cfg_t gps_config = {
         .uart_port = GPS_UART_PORT,
         .tx_io = GPS_TX_PIN,
@@ -954,13 +933,23 @@ void app_main(void){
         .sda_io = I2C_SDA_PIN,
         .scl_io = I2C_SCL_PIN
     };
-    ret = gps_init(&gps_config);
+    ret = GPS_INIT();  // Real GPS
     init_results[3] = (ret == ESP_OK);
-    // Log GPS init result
+    
     if (init_results[2]) {
         sdlog_printf("GPS init: %s (UART%d @ %d baud, I2C port %d)",
                     init_results[3] ? "OK" : "FAILED",
                     GPS_UART_PORT, GPS_BAUD, I2C_PORT);
+    }
+#endif
+
+    // === VERIFY GPS IS READY BEFORE CONTINUING ===
+    if (!init_results[3]) {
+        ESP_LOGE(TAG, "✗ GPS initialization FAILED - system cannot track");
+        status_led_set_mode(LED_ERROR);
+        while(1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
     }
 
     // === Initialize Motors ===
@@ -1038,7 +1027,7 @@ void app_main(void){
     }
 
     // Compass check will be done in system check (index 8)
-    init_results[8] = gps_is_compass_calibrated();
+    init_results[8] = GPS_IS_COMPASS_CALIBRATED();  // CHANGED
     // Log compass calibration state
     if (init_results[2]) {
         sdlog_printf("Compass state: %s", init_results[8] ? "CALIBRATED" : "UNCALIBRATED");
@@ -1153,7 +1142,7 @@ void app_main(void){
                     status_led_set_mode(LED_STARTUP);
                     sdlog_printf("Compass calibration started (double-press)");
                     
-                    bool success = gps_calibrate_compass();
+                    bool success = GPS_CALIBRATE_COMPASS();  // CHANGED
                     
                     if (success) {
                         ESP_LOGI(TAG, "✓ Compass calibration successful");
@@ -1265,8 +1254,8 @@ void app_main(void){
             
             // Get GPS data (continue background acquisition)
             gps_data_t g = {0};
-            bool gps_fresh = gps_poll_nav_pvt(&g);
-            bool gps_valid = gps_fresh || gps_get_last(&g);
+            bool gps_fresh = GPS_POLL_NAV_PVT(&g);  // CHANGED
+            bool gps_valid = gps_fresh || GPS_GET_LAST(&g);  // CHANGED
             uint32_t gps_fix_age_sec = 9999;
             if (gps_valid) {
                 if (now >= g.timestamp) {
@@ -1447,13 +1436,19 @@ void app_main(void){
     const int MAX_WAIT = 12;
     bool got_initial_fix = false;
     
-    while (!gps_poll_nav_pvt(&first_fix) && wait_count < MAX_WAIT) {
+#if USE_MOCK_GPS
+    // Mock GPS always has fix immediately
+    ESP_LOGI(TAG, "Mock GPS: Immediate fix available (testing mode)");
+    GPS_POLL_NAV_PVT(&first_fix);  // CHANGED
+    got_initial_fix = true;
+    wait_count = 0;
+#else
+    // Real GPS: wait for fix
+    while (!GPS_POLL_NAV_PVT(&first_fix) && wait_count < MAX_WAIT) {  // CHANGED
         wait_count++;
         
-        // Progress indicator every 10 seconds
         if (wait_count % 2 == 0) {
             ESP_LOGI(TAG, "Searching for satellites... (%d seconds elapsed)", wait_count * 5);
-            // Log GPS search progress
             if (init_results[2]) {
                 sdlog_printf("GPS search: %d seconds elapsed", wait_count * 5);
             }
@@ -1462,6 +1457,9 @@ void app_main(void){
         vTaskDelay(pdMS_TO_TICKS(5000));
     }
     
+    got_initial_fix = (wait_count < MAX_WAIT);
+#endif
+
     if (wait_count >= MAX_WAIT) {
         ESP_LOGW(TAG, "");
         ESP_LOGW(TAG, "⚠ GPS TIMEOUT - No fix after 60 seconds");
@@ -1533,12 +1531,12 @@ void app_main(void){
         status_led_set_mode(LED_TRACKING);
     }
     
-    // === START TRACKING SYSTEM (EXISTING CODE) ===
+    // === START TRACKING SYSTEM ===
+    // GPS is now GUARANTEED to be initialized before tracking starts
     ESP_LOGI(TAG, "=== STARTING TRACKING ===");
+    tracking_start();  // Now safe to call GPS functions in tracking loop
     
-    tracking_start();
     status_led_set_mode(LED_TRACKING);
-    
     ESP_LOGI(TAG, "✓ Tracking active");
     if (init_results[2]) {
         sdlog_printf("Tracking started");
@@ -1549,7 +1547,7 @@ void app_main(void){
     BaseType_t calib_ret = xTaskCreate(
         calib_task,
         "calibration",
-        2048,
+        4096,
         NULL,
         4,
         NULL
@@ -1562,12 +1560,14 @@ void app_main(void){
         ESP_LOGI(TAG, "Calibration monitor OK");
     }
 
+
+
     // === Start Compass Calibration Monitor ===
     ESP_LOGI(TAG, "Starting compass calibration monitor...");
     BaseType_t compass_ret = xTaskCreate(
         compass_calib_task,
         "compass_calib",
-        2048,
+        4096,
         NULL,
         3,
         NULL
@@ -1591,7 +1591,7 @@ void app_main(void){
     
     // === Main Loop: Transmit Tracking Data to LCD Display ===
     ESP_LOGI(TAG, "Entering WiFi data transmission loop (1 Hz)...");
-    if (init_results[2]) {
+       if (init_results[2]) {
         sdlog_printf("Main loop started: WiFi data transmission @ 1 Hz");
     }
     
@@ -1643,8 +1643,8 @@ void app_main(void){
         
         // Get GPS data and calculate fix age
         gps_data_t g = {0};
-        bool gps_fresh = gps_poll_nav_pvt(&g);
-        bool gps_valid = gps_fresh || gps_get_last(&g);
+        bool gps_fresh = GPS_POLL_NAV_PVT(&g);  // CHANGED
+        bool gps_valid = gps_fresh || GPS_GET_LAST(&g);  // CHANGED
         uint32_t gps_fix_age_sec = 0;
         
         if (gps_valid) {
@@ -1758,13 +1758,13 @@ void app_main(void){
         float compass_heading_true = 0.0f;
         bool compass_valid = false;
         if (gps_is_compass_calibrated()) {
-            compass_valid = gps_get_compass_heading_true(&compass_heading_true);
+            compass_valid = GPS_GET_COMPASS_HEADING_TRUE(&compass_heading_true);  // CHANGED
         }
 
         // Log compass periodically (every 60 seconds)
         static uint32_t last_compass_log = 0;
         if (compass_valid && (now - last_compass_log) >= 60) {
-            float declination = gps_get_magnetic_declination();
+            float declination = GPS_GET_MAGNETIC_DECLINATION();  // CHANGED
             ESP_LOGI(TAG, "Compass: True heading=%.1f° (Decl=%.1f°)",
                      compass_heading_true, declination);
             sdlog_printf("Compass: True=%.1f° Decl=%.1f°",

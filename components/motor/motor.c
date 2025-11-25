@@ -627,12 +627,12 @@ void motor_move_az(double current_deg, double target_deg){
     
     // Determine direction: extend if target > current, retract otherwise
     int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";
+    const char* dir_name = dir_level ? "RETRACT" : "EXTEND";
     
     // Check if direction changed
     if (s_az_dir_state >= 0 && s_az_dir_state != dir_level) {
         ESP_LOGD(TAG, "  Direction change: %s → %s", 
-                 s_az_dir_state ? "EXTEND" : "RETRACT", dir_name);
+                 s_az_dir_state ? "RETRACT" : "EXTEND", dir_name);
     }
     
     // Set direction pin before starting PWM
@@ -789,11 +789,32 @@ void motor_move_el(double current_deg, double target_deg){
                  s_el_dir_state ? "EXTEND" : "RETRACT", dir_name);
     }
     
+    // === NEW: Pre-move diagnostics ===
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "Pre-move GPIO states:");
+    int current_dir = gpio_get_level(s_cfg.el_dir_pin);
+    ESP_LOGD(TAG, "  - DIR (GPIO%d): current=%d, target=%d", 
+             s_cfg.el_dir_pin, current_dir, dir_level);
+    
     // Set direction before starting motion
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "Setting direction GPIO...");
     gpio_set_level(s_cfg.el_dir_pin, dir_level);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Short settle time
     s_el_dir_state = dir_level;
+    
+    // Verify direction was set
+    int readback_dir = gpio_get_level(s_cfg.el_dir_pin);
+    if (readback_dir != dir_level) {
+        ESP_LOGE(TAG, "✗ DIR GPIO READBACK MISMATCH!");
+        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
+        ESP_LOGE(TAG, "  GPIO%d may be damaged or not configured correctly", s_cfg.el_dir_pin);
+        ESP_LOGI(TAG, "");
+        return;
+    }
+    
     DEBUG_GPIO(s_cfg.el_dir_pin, dir_level);
-    ESP_LOGD(TAG, "  Direction set: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
+    ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
 
     // Calculate conservative timing
     ESP_LOGD(TAG, "");
@@ -806,6 +827,15 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGI(TAG, "  Direction: %s", dir_name);
     ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
     ESP_LOGD(TAG, "  PWM: 100%% duty (8191/8191)");
+    
+    // === NEW: Detailed PWM diagnostics ===
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "EL Motor Control Signals:");
+    ESP_LOGI(TAG, "  - DIR pin: GPIO%d → %d (%s)", 
+             s_cfg.el_dir_pin, dir_level, dir_name);
+    ESP_LOGI(TAG, "  - PWM pin: GPIO%d → 100%% duty (CH%d)", 
+             s_cfg.el_pwm_pin, (int)EL_CH);
+    
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Executing...");
 
@@ -815,13 +845,41 @@ void motor_move_el(double current_deg, double target_deg){
     
     ESP_LOGV(TAG, "  Start tick: %lu", (unsigned long)start_tick);
     
-    // Execute the move
-    start_pwm(EL_CH, 8191);                     // 100% duty
+    // === NEW: Enhanced PWM start with error checking ===
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "Starting EL motor...");
+    ESP_LOGD(TAG, "  - Channel: %d", (int)EL_CH);
+    ESP_LOGD(TAG, "  - Duty: 8191/8191 (100%%)");
     
-    ESP_LOGD(TAG, "  → Motor running...");
-    vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
+    esp_err_t pwm_ret = ledc_set_duty(LEDC_LOW_SPEED_MODE, EL_CH, 8191);
+    if (pwm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ PWM set_duty failed: %s", esp_err_to_name(pwm_ret));
+        ESP_LOGE(TAG, "  Channel %d may not be initialized", (int)EL_CH);
+        ESP_LOGI(TAG, "");
+        return;
+    }
+    ESP_LOGV(TAG, "  ✓ ledc_set_duty() OK");
     
-    stop_pwm(EL_CH);                            // Stop
+    pwm_ret = ledc_update_duty(LEDC_LOW_SPEED_MODE, EL_CH);
+    if (pwm_ret != ESP_OK) {
+        ESP_LOGE(TAG, "✗ PWM update failed: %s", esp_err_to_name(pwm_ret));
+        ESP_LOGI(TAG, "");
+        return;
+    }
+    ESP_LOGV(TAG, "  ✓ ledc_update_duty() OK");
+    
+    ESP_LOGD(TAG, "✓ PWM started successfully");
+    ESP_LOGD(TAG, "  → Motor running at 100%% duty");
+    
+    // Wait for move to complete
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "  → Motor running for %" PRIu32 " ms...", move_ms);
+    vTaskDelay(pdMS_TO_TICKS(move_ms));
+    
+    // Stop PWM
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "Stopping EL motor...");
+    stop_pwm(EL_CH);
     ESP_LOGD(TAG, "  → Motor stopped (coasting)");
     
     // Calculate actual duration
