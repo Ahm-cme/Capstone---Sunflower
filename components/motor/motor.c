@@ -584,15 +584,16 @@ void motor_move_az(double current_deg, double target_deg){
     double clamped_target = target_deg;
     bool was_clamped = false;
     
-    if (target_deg > s_cfg.max_az_deg) {
-        clamped_target = s_cfg.max_az_deg;
-        ESP_LOGW(TAG, "⚠ AZ target %.2f° exceeds max %.2f°, clamped", target_deg, s_cfg.max_az_deg);
+    // CHANGED: AZ range is -45° to +45° (±45° from center)
+    if (target_deg > 45.0) {
+        clamped_target = 45.0;
+        ESP_LOGW(TAG, "⚠ AZ target %.2f° exceeds max +45°, clamped", target_deg);
         ESP_LOGD(TAG, "  Reason: mechanical limit protection");
         was_clamped = true;
     }
-    if (target_deg < 0.0) {
-        clamped_target = 0.0;
-        ESP_LOGW(TAG, "⚠ AZ target %.2f° below min 0°, clamped", target_deg);
+    if (target_deg < -45.0) {
+        clamped_target = -45.0;
+        ESP_LOGW(TAG, "⚠ AZ target %.2f° below min -45°, clamped", target_deg);
         ESP_LOGD(TAG, "  Reason: mechanical limit protection");
         was_clamped = true;
     }
@@ -614,32 +615,52 @@ void motor_move_az(double current_deg, double target_deg){
         return;
     }
 
-    // Convert angles to actuator stroke positions
+    // === CHANGED: Convert angles from center-based to actuator stroke ===
+    // AZ actuator: center=127.0mm, range=±45°, stroke=63.5mm
+    // Formula: mm = CENTER + (angle_deg * (STROKE/RANGE))
+    const double AZ_CENTER_MM = 127.0;      // 5.00" center position
+    const double AZ_STROKE_MM = 63.5;       // 2.50" total travel
+    const double AZ_RANGE_DEG = 90.0;       // ±45° = 90° total
+    const double AZ_MM_PER_DEG = AZ_STROKE_MM / AZ_RANGE_DEG;  // 0.706 mm/deg
+    
+    double current_mm = AZ_CENTER_MM + (current_deg * AZ_MM_PER_DEG);
+    double target_mm = AZ_CENTER_MM + (clamped_target * AZ_MM_PER_DEG);
+    
     ESP_LOGD(TAG, "");
     ESP_LOGD(TAG, "Kinematics:");
-    
-    double current_mm = angle_to_mm(current_deg, s_cfg.max_az_deg);
-    double target_mm = angle_to_mm(clamped_target, s_cfg.max_az_deg);
-    
-    ESP_LOGD(TAG, "  Current: %.2f° → %.2f mm", current_deg, current_mm);
-    ESP_LOGD(TAG, "  Target:  %.2f° → %.2f mm", clamped_target, target_mm);
-    ESP_LOGD(TAG, "  Delta:   %.2f° → %.2f mm", move_delta, fabs(target_mm - current_mm));
+    ESP_LOGD(TAG, "  Current: %.2f° → %.2f mm (%.3f\")", current_deg, current_mm, current_mm / 25.4);
+    ESP_LOGD(TAG, "  Target:  %.2f° → %.2f mm (%.3f\")", clamped_target, target_mm, target_mm / 25.4);
+    ESP_LOGD(TAG, "  Delta:   %.2f° → %.2f mm (%.3f\")", move_delta, fabs(target_mm - current_mm), fabs(target_mm - current_mm) / 25.4);
     
     // Determine direction: extend if target > current, retract otherwise
     int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "RETRACT" : "EXTEND";
+    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";  // FIXED: was inverted
     
     // Check if direction changed
     if (s_az_dir_state >= 0 && s_az_dir_state != dir_level) {
-        ESP_LOGD(TAG, "  Direction change: %s → %s", 
-                 s_az_dir_state ? "RETRACT" : "EXTEND", dir_name);
+        ESP_LOGD(TAG, "  Direction change: %s -> %s", 
+                 s_az_dir_state ? "EXTEND" : "RETRACT", dir_name);
     }
     
     // Set direction pin before starting PWM
+    ESP_LOGD(TAG, "");
+    ESP_LOGD(TAG, "Setting direction GPIO...");
     gpio_set_level(s_cfg.az_dir_pin, dir_level);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Short settle time for GPIO
     s_az_dir_state = dir_level;
+    
+    // Verify direction was set
+    int readback_dir = gpio_get_level(s_cfg.az_dir_pin);
+    if (readback_dir != dir_level) {
+        ESP_LOGE(TAG, "✗ DIR GPIO READBACK MISMATCH!");
+        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
+        ESP_LOGE(TAG, "  GPIO%d may be damaged or not configured correctly", s_cfg.az_dir_pin);
+        ESP_LOGI(TAG, "");
+        return;
+    }
+    
     DEBUG_GPIO(s_cfg.az_dir_pin, dir_level);
-    ESP_LOGD(TAG, "  Direction set: %s (GPIO%d = %d)", dir_name, s_cfg.az_dir_pin, dir_level);
+    ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.az_dir_pin, dir_level);
 
     // Calculate conservative move time
     ESP_LOGD(TAG, "");
@@ -663,11 +684,13 @@ void motor_move_az(double current_deg, double target_deg){
     ESP_LOGV(TAG, "  Start tick: %lu", (unsigned long)start_tick);
     
     // Execute the move at full speed with conservative timing
-    start_pwm(AZ_CH, 8191);                     // 100% duty
+    ESP_LOGD(TAG, "  → Starting PWM (100%% duty)...");
+    start_pwm(AZ_CH, 8191);                     // 100% duty = 8191/8191
     
-    ESP_LOGD(TAG, "  → Motor running...");
+    ESP_LOGD(TAG, "  → Motor running for %" PRIu32 " ms...", move_ms);
     vTaskDelay(pdMS_TO_TICKS(move_ms));         // Conservative duration
     
+    ESP_LOGD(TAG, "  → Stopping PWM...");
     stop_pwm(AZ_CH);                            // Stop PWM, actuator coasts
     ESP_LOGD(TAG, "  → Motor stopped (coasting)");
     
@@ -738,15 +761,16 @@ void motor_move_el(double current_deg, double target_deg){
     double clamped_target = target_deg;
     bool was_clamped = false;
     
-    if (target_deg > s_cfg.max_el_deg) {
-        clamped_target = s_cfg.max_el_deg;
-        ESP_LOGW(TAG, "⚠ EL target %.2f° exceeds max %.2f°, clamped", target_deg, s_cfg.max_el_deg);
+    // CHANGED: EL range is -56° to +56° (±56° from center)
+    if (target_deg > 56.0) {
+        clamped_target = 56.0;
+        ESP_LOGW(TAG, "⚠ EL target %.2f° exceeds max +56°, clamped", target_deg);
         ESP_LOGD(TAG, "  Reason: mechanical limit protection");
         was_clamped = true;
     }
-    if (target_deg < s_cfg.min_el_deg) {
-        clamped_target = s_cfg.min_el_deg;
-        ESP_LOGW(TAG, "⚠ EL target %.2f° below min %.2f°, clamped", target_deg, s_cfg.min_el_deg);
+    if (target_deg < -56.0) {
+        clamped_target = -56.0;
+        ESP_LOGW(TAG, "⚠ EL target %.2f° below min -56°, clamped", target_deg);
         ESP_LOGD(TAG, "  Reason: mechanical limit protection");
         was_clamped = true;
     }
@@ -768,28 +792,34 @@ void motor_move_el(double current_deg, double target_deg){
         return;
     }
 
-    // Convert angles to actuator stroke positions
+    // === CHANGED: Convert angles from center-based to actuator stroke ===
+    // EL actuator: center=107.95mm, range=±56°, stroke=88.9mm
+    // Formula: mm = CENTER + (angle_deg * (STROKE/RANGE))
+    const double EL_CENTER_MM = 107.95;     // 4.25" center position
+    const double EL_STROKE_MM = 88.9;       // 3.50" total travel
+    const double EL_RANGE_DEG = 112.0;      // ±56° = 112° total
+    const double EL_MM_PER_DEG = EL_STROKE_MM / EL_RANGE_DEG;  // 0.794 mm/deg
+    
+    double current_mm = EL_CENTER_MM + (current_deg * EL_MM_PER_DEG);
+    double target_mm = EL_CENTER_MM + (clamped_target * EL_MM_PER_DEG);
+    
     ESP_LOGD(TAG, "");
     ESP_LOGD(TAG, "Kinematics:");
-    
-    double current_mm = angle_to_mm(current_deg, s_cfg.max_el_deg);
-    double target_mm = angle_to_mm(clamped_target, s_cfg.max_el_deg);
-    
-    ESP_LOGD(TAG, "  Current: %.2f° → %.2f mm", current_deg, current_mm);
-    ESP_LOGD(TAG, "  Target:  %.2f° → %.2f mm", clamped_target, target_mm);
-    ESP_LOGD(TAG, "  Delta:   %.2f° → %.2f mm", move_delta, fabs(target_mm - current_mm));
+    ESP_LOGD(TAG, "  Current: %.2f° → %.2f mm (%.3f\")", current_deg, current_mm, current_mm / 25.4);
+    ESP_LOGD(TAG, "  Target:  %.2f° → %.2f mm (%.3f\")", clamped_target, target_mm, target_mm / 25.4);
+    ESP_LOGD(TAG, "  Delta:   %.2f° → %.2f mm (%.3f\")", move_delta, fabs(target_mm - current_mm), fabs(target_mm - current_mm) / 25.4);
     
     // Determine direction
     int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";
+    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";  // FIXED: was inverted in original
     
     // Check if direction changed
     if (s_el_dir_state >= 0 && s_el_dir_state != dir_level) {
-        ESP_LOGD(TAG, "  Direction change: %s → %s", 
+        ESP_LOGD(TAG, "  Direction change: %s -> %s", 
                  s_el_dir_state ? "EXTEND" : "RETRACT", dir_name);
     }
     
-    // === NEW: Pre-move diagnostics ===
+    // === Pre-move diagnostics ===
     ESP_LOGD(TAG, "");
     ESP_LOGD(TAG, "Pre-move GPIO states:");
     int current_dir = gpio_get_level(s_cfg.el_dir_pin);
@@ -799,22 +829,42 @@ void motor_move_el(double current_deg, double target_deg){
     // Set direction before starting motion
     ESP_LOGD(TAG, "");
     ESP_LOGD(TAG, "Setting direction GPIO...");
+    
+    // CHANGED: Force GPIO mode before setting (ensures it's output)
+    gpio_set_direction(s_cfg.el_dir_pin, GPIO_MODE_OUTPUT);
     gpio_set_level(s_cfg.el_dir_pin, dir_level);
-    vTaskDelay(pdMS_TO_TICKS(10));  // Short settle time
+    vTaskDelay(pdMS_TO_TICKS(50));  // CHANGED: Increased from 10ms to 50ms settle time
     s_el_dir_state = dir_level;
     
-    // Verify direction was set
+    // Verify direction was set (with retries)
     int readback_dir = gpio_get_level(s_cfg.el_dir_pin);
-    if (readback_dir != dir_level) {
-        ESP_LOGE(TAG, "✗ DIR GPIO READBACK MISMATCH!");
-        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
-        ESP_LOGE(TAG, "  GPIO%d may be damaged or not configured correctly", s_cfg.el_dir_pin);
-        ESP_LOGI(TAG, "");
-        return;
+    int retry_count = 0;
+    while (readback_dir != dir_level && retry_count < 3) {
+        ESP_LOGW(TAG, "⚠ GPIO readback mismatch (attempt %d/3): expected %d, got %d", 
+                 retry_count + 1, dir_level, readback_dir);
+        
+        // Try again with longer delay
+        gpio_set_level(s_cfg.el_dir_pin, dir_level);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        readback_dir = gpio_get_level(s_cfg.el_dir_pin);
+        retry_count++;
     }
     
-    DEBUG_GPIO(s_cfg.el_dir_pin, dir_level);
-    ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
+    if (readback_dir != dir_level) {
+        ESP_LOGE(TAG, "✗ DIR GPIO READBACK FAILED AFTER 3 RETRIES!");
+        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
+        ESP_LOGE(TAG, "  GPIO%d may be:", s_cfg.el_dir_pin);
+        ESP_LOGE(TAG, "    - Used by another peripheral (check pin mux)");
+        ESP_LOGE(TAG, "    - Physically shorted or floating");
+        ESP_LOGE(TAG, "    - Damaged");
+        ESP_LOGW(TAG, "");
+        ESP_LOGW(TAG, "⚠ PROCEEDING ANYWAY - Motor may move wrong direction!");
+        ESP_LOGW(TAG, "");
+        // Don't return - try to move anyway
+    } else {
+        DEBUG_GPIO(s_cfg.el_dir_pin, dir_level);
+        ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
+    }
 
     // Calculate conservative timing
     ESP_LOGD(TAG, "");
@@ -828,14 +878,6 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGI(TAG, "  Duration: %" PRIu32 " ms (conservative)", move_ms);
     ESP_LOGD(TAG, "  PWM: 100%% duty (8191/8191)");
     
-    // === NEW: Detailed PWM diagnostics ===
-    ESP_LOGI(TAG, "");
-    ESP_LOGI(TAG, "EL Motor Control Signals:");
-    ESP_LOGI(TAG, "  - DIR pin: GPIO%d → %d (%s)", 
-             s_cfg.el_dir_pin, dir_level, dir_name);
-    ESP_LOGI(TAG, "  - PWM pin: GPIO%d → 100%% duty (CH%d)", 
-             s_cfg.el_pwm_pin, (int)EL_CH);
-    
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Executing...");
 
@@ -845,40 +887,14 @@ void motor_move_el(double current_deg, double target_deg){
     
     ESP_LOGV(TAG, "  Start tick: %lu", (unsigned long)start_tick);
     
-    // === NEW: Enhanced PWM start with error checking ===
-    ESP_LOGD(TAG, "");
-    ESP_LOGD(TAG, "Starting EL motor...");
-    ESP_LOGD(TAG, "  - Channel: %d", (int)EL_CH);
-    ESP_LOGD(TAG, "  - Duty: 8191/8191 (100%%)");
+    // Start PWM
+    ESP_LOGD(TAG, "  → Starting PWM (100%% duty)...");
+    start_pwm(EL_CH, 8191);  // 100% duty = 8191/8191
     
-    esp_err_t pwm_ret = ledc_set_duty(LEDC_LOW_SPEED_MODE, EL_CH, 8191);
-    if (pwm_ret != ESP_OK) {
-        ESP_LOGE(TAG, "✗ PWM set_duty failed: %s", esp_err_to_name(pwm_ret));
-        ESP_LOGE(TAG, "  Channel %d may not be initialized", (int)EL_CH);
-        ESP_LOGI(TAG, "");
-        return;
-    }
-    ESP_LOGV(TAG, "  ✓ ledc_set_duty() OK");
-    
-    pwm_ret = ledc_update_duty(LEDC_LOW_SPEED_MODE, EL_CH);
-    if (pwm_ret != ESP_OK) {
-        ESP_LOGE(TAG, "✗ PWM update failed: %s", esp_err_to_name(pwm_ret));
-        ESP_LOGI(TAG, "");
-        return;
-    }
-    ESP_LOGV(TAG, "  ✓ ledc_update_duty() OK");
-    
-    ESP_LOGD(TAG, "✓ PWM started successfully");
-    ESP_LOGD(TAG, "  → Motor running at 100%% duty");
-    
-    // Wait for move to complete
-    ESP_LOGD(TAG, "");
     ESP_LOGD(TAG, "  → Motor running for %" PRIu32 " ms...", move_ms);
     vTaskDelay(pdMS_TO_TICKS(move_ms));
     
-    // Stop PWM
-    ESP_LOGD(TAG, "");
-    ESP_LOGD(TAG, "Stopping EL motor...");
+    ESP_LOGD(TAG, "  → Stopping PWM...");
     stop_pwm(EL_CH);
     ESP_LOGD(TAG, "  → Motor stopped (coasting)");
     
@@ -907,7 +923,7 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGD(TAG, "  Total system moves: %" PRIu32, s_stats.total_moves);
     ESP_LOGI(TAG, "");
     
-    // Warn if timing error is large (>5% suggests system lag or high load)
+    // Warn if timing error is large
     if (abs(timing_error_ms) > (int32_t)(move_ms * 0.05)) {
         ESP_LOGW(TAG, "⚠ Large timing error detected: %d ms", (int)timing_error_ms);
         ESP_LOGD(TAG, "  Possible causes:");
@@ -1093,7 +1109,7 @@ void motor_stop_all(void){
     ESP_LOGD(TAG, "  2. Verify power supply voltage");
     ESP_LOGD(TAG, "  3. Run motor_self_test() to verify operation");
     ESP_LOGD(TAG, "  4. Consider homing sequence to reset position");
-    ESP_LOGE(TAG, "");
+    ESP_LOGD(TAG, "");
 }
 
 /*

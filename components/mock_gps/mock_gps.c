@@ -50,9 +50,9 @@ esp_err_t mock_gps_init(void) {
     struct tm mock_time = {
         .tm_year = 2025 - 1900,  // Years since 1900
         .tm_mon = 11 - 1,        // 0-11 (November = 10)
-        .tm_mday = 25,           // Day of month
-        .tm_hour = 17,           // 17:00 UTC = 12:00 PM EST
-        .tm_min = 0,
+        .tm_mday = 28,           // Day of month
+        .tm_hour = 21,           // 17:00 UTC = 12:00 PM EST
+        .tm_min = 30,
         .tm_sec = 0,
         .tm_isdst = 0            // Not daylight saving (standard time)
     };

@@ -115,7 +115,7 @@
 } while(0)
 
 // Compass mounting offset: compass is on back of panel, 180° from front
-#define MOUNT_COMPASS_OFFSET_DEG 180.0
+#define MOUNT_COMPASS_OFFSET_DEG 0.0
 
 /*
  * Global tracker state (persisted in NVS).
