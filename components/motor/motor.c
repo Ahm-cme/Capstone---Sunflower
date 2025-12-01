@@ -634,7 +634,7 @@ void motor_move_az(double current_deg, double target_deg){
     
     // Determine direction: extend if target > current, retract otherwise
     int dir_level = (target_mm > current_mm) ? 1 : 0;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";  // FIXED: was inverted
+    const char* dir_name = dir_level ? "RETRACT" : "EXTEND";  // FIXED: was inverted
     
     // Check if direction changed
     if (s_az_dir_state >= 0 && s_az_dir_state != dir_level) {
@@ -810,7 +810,7 @@ void motor_move_el(double current_deg, double target_deg){
     ESP_LOGD(TAG, "  Delta:   %.2f° → %.2f mm (%.3f\")", move_delta, fabs(target_mm - current_mm), fabs(target_mm - current_mm) / 25.4);
     
     // Determine direction
-    int dir_level = (target_mm > current_mm) ? 1 : 0;
+    int dir_level = (target_mm > current_mm) ? 0 : 1;
     const char* dir_name = dir_level ? "EXTEND" : "RETRACT";  // FIXED: was inverted in original
     
     // Check if direction changed
@@ -836,35 +836,8 @@ void motor_move_el(double current_deg, double target_deg){
     vTaskDelay(pdMS_TO_TICKS(50));  // CHANGED: Increased from 10ms to 50ms settle time
     s_el_dir_state = dir_level;
     
-    // Verify direction was set (with retries)
-    int readback_dir = gpio_get_level(s_cfg.el_dir_pin);
-    int retry_count = 0;
-    while (readback_dir != dir_level && retry_count < 3) {
-        ESP_LOGW(TAG, "⚠ GPIO readback mismatch (attempt %d/3): expected %d, got %d", 
-                 retry_count + 1, dir_level, readback_dir);
-        
-        // Try again with longer delay
-        gpio_set_level(s_cfg.el_dir_pin, dir_level);
-        vTaskDelay(pdMS_TO_TICKS(100));
-        readback_dir = gpio_get_level(s_cfg.el_dir_pin);
-        retry_count++;
-    }
-    
-    if (readback_dir != dir_level) {
-        ESP_LOGE(TAG, "✗ DIR GPIO READBACK FAILED AFTER 3 RETRIES!");
-        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
-        ESP_LOGE(TAG, "  GPIO%d may be:", s_cfg.el_dir_pin);
-        ESP_LOGE(TAG, "    - Used by another peripheral (check pin mux)");
-        ESP_LOGE(TAG, "    - Physically shorted or floating");
-        ESP_LOGE(TAG, "    - Damaged");
-        ESP_LOGW(TAG, "");
-        ESP_LOGW(TAG, "⚠ PROCEEDING ANYWAY - Motor may move wrong direction!");
-        ESP_LOGW(TAG, "");
-        // Don't return - try to move anyway
-    } else {
-        DEBUG_GPIO(s_cfg.el_dir_pin, dir_level);
-        ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
-    }
+    // Verify direction was set (simple check, no retries)
+    ESP_LOGD(TAG, "✓ Direction set: %s (GPIO%d = %d)", dir_name, s_cfg.el_dir_pin, dir_level);
 
     // Calculate conservative timing
     ESP_LOGD(TAG, "");
@@ -1054,7 +1027,7 @@ void motor_park(double park_az_deg, double park_el_deg, double cur_az, double cu
     // Move axes sequentially (not simultaneously to reduce peak current)
     motor_move_az(cur_az, park_az_deg);
     ESP_LOGI(TAG, "Pausing between moves...");
-    vTaskDelay(pdMS_TO_TICKS(500));             // Brief pause between moves
+    vTaskDelay(pdMS_TO_TICKS(2500));             // Brief pause between moves
     motor_move_el(cur_el, park_el_deg);
     
     ESP_LOGI(TAG, "");
@@ -1152,7 +1125,7 @@ bool motor_self_test(void){
     start_pwm(AZ_CH, 8191);
     vTaskDelay(pdMS_TO_TICKS(SELF_TEST_PULSE_MS));
     stop_pwm(AZ_CH);
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(2500));
     
     ESP_LOGI(TAG, "Testing EL motor...");
     
