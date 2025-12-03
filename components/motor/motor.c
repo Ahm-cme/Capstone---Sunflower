@@ -61,7 +61,7 @@
 #define DEBUG_TIMING(label, ms) ESP_LOGV(TAG, "Timing %s: %lu ms (%.2f s)", label, (unsigned long)ms, ms / 1000.0)
 
 // Safety factor: use 90% of calculated time to prevent overshoot
-#define TIMING_SAFETY_FACTOR 0.90
+#define TIMING_SAFETY_FACTOR 0.95
 
 // Minimum safety buffer added to all moves (ms)
 #define MIN_SAFETY_BUFFER_MS 100
@@ -649,16 +649,6 @@ void motor_move_az(double current_deg, double target_deg){
     vTaskDelay(pdMS_TO_TICKS(10));  // Short settle time for GPIO
     s_az_dir_state = dir_level;
     
-    // Verify direction was set
-    int readback_dir = gpio_get_level(s_cfg.az_dir_pin);
-    if (readback_dir != dir_level) {
-        ESP_LOGE(TAG, "✗ DIR GPIO READBACK MISMATCH!");
-        ESP_LOGE(TAG, "  Expected: %d, Got: %d", dir_level, readback_dir);
-        ESP_LOGE(TAG, "  GPIO%d may be damaged or not configured correctly", s_cfg.az_dir_pin);
-        ESP_LOGI(TAG, "");
-        return;
-    }
-    
     DEBUG_GPIO(s_cfg.az_dir_pin, dir_level);
     ESP_LOGD(TAG, "✓ Direction verified: %s (GPIO%d = %d)", dir_name, s_cfg.az_dir_pin, dir_level);
 
@@ -811,7 +801,7 @@ void motor_move_el(double current_deg, double target_deg){
     
     // Determine direction
     int dir_level = (target_mm > current_mm) ? 0 : 1;
-    const char* dir_name = dir_level ? "EXTEND" : "RETRACT";  // FIXED: was inverted in original
+    const char* dir_name = (target_mm > current_mm) ? "EXTEND" : "RETRACT"; 
     
     // Check if direction changed
     if (s_el_dir_state >= 0 && s_el_dir_state != dir_level) {

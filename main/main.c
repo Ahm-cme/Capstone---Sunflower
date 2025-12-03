@@ -84,7 +84,7 @@
 #include "esp_adc/adc_oneshot.h"
 
 // Mock GPS for testing
-#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+#define USE_MOCK_GPS  0  // Set to 1 for mock mode, 0 for real GPS
 
 #if USE_MOCK_GPS
 #include "mock_gps.h"
