@@ -455,17 +455,8 @@ esp_err_t wifi_client_receive_data(tracker_data_t *data, uint32_t timeout_ms)
             return ESP_FAIL;
         }
         
-        // Verify connection with a test send (0-byte send should succeed if connected)
-        int test = send(client_socket, NULL, 0, MSG_DONTWAIT);
-        if (test < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            ESP_LOGW(TAG, "TCP connection verification failed: %d (%s)", errno, strerror(errno));
-            close(client_socket);
-            client_socket = -1;
-            tcp_connected = false;
-            return ESP_FAIL;
-        }
-        
-        ESP_LOGI(TAG, "✓ TCP connection verified and ready");
+        // Connection successful, don't verify with test send
+        ESP_LOGI(TAG, "✓ TCP connection established");
     }
     
     // Set receive timeout
@@ -564,16 +555,7 @@ esp_err_t wifi_client_reconnect(void)
     // Reconnect TCP
     esp_err_t ret = connect_tcp();
     if (ret == ESP_OK) {
-        // Verify with test send
-        int test = send(client_socket, NULL, 0, MSG_DONTWAIT);
-        if (test < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            ESP_LOGW(TAG, "TCP connection verification failed after reconnect");
-            close(client_socket);
-            client_socket = -1;
-            tcp_connected = false;
-            return ESP_FAIL;
-        }
-        ESP_LOGI(TAG, "✓ Reconnection successful and verified");
+        ESP_LOGI(TAG, "✓ Reconnection successful");
     }
     
     return ret;
@@ -584,39 +566,7 @@ esp_err_t wifi_client_reconnect(void)
  */
 bool wifi_client_is_connected(void)
 {
-    // Check WiFi first
-    if (!wifi_connected) {
-        return false;
-    }
-    
-    // Check TCP socket exists
-    if (client_socket < 0) {
-        tcp_connected = false;
-        return false;
-    }
-    
-    // Verify socket is actually alive using SO_ERROR
-    int error = 0;
-    socklen_t len = sizeof(error);
-    if (getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-        // getsockopt failed, socket is dead
-        ESP_LOGW(TAG, "Socket state check failed, marking as disconnected");
-        close(client_socket);
-        client_socket = -1;
-        tcp_connected = false;
-        return false;
-    }
-    
-    if (error != 0) {
-        // Socket has pending error, it's dead
-        ESP_LOGW(TAG, "Socket has error: %d (%s)", error, strerror(error));
-        close(client_socket);
-        client_socket = -1;
-        tcp_connected = false;
-        return false;
-    }
-    
-    return tcp_connected;
+    return wifi_connected && tcp_connected && (client_socket >= 0);
 }
 
 /*
