@@ -731,11 +731,14 @@ void wifi_comm_update_web_data(const tracker_data_t *data) {
     if (data) {
         memcpy(&latest_data, data, sizeof(tracker_data_t));
         
-        // ADD THIS DEBUG LOG
-        ESP_LOGI(TAG, "✓ Web data updated: Az=%.1f° El=%.1f° Batt=%.2fV",
+        // ENHANCED DEBUG LOG with statistics
+        ESP_LOGI(TAG, "✓ Web data updated: Az=%.1f° El=%.1f° Batt=%.2fV Moves=%lu/%lu Uptime=%uh",
                  latest_data.azimuth,
                  latest_data.elevation,
-                 latest_data.battery_voltage);
+                 latest_data.battery_voltage,
+                 (unsigned long)latest_data.moves_today,
+                 (unsigned long)latest_data.total_moves,
+                 latest_data.uptime_hours);
     } else {
         ESP_LOGW(TAG, "⚠ NULL data passed to wifi_comm_update_web_data()");
     }

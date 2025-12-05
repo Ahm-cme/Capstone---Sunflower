@@ -1669,6 +1669,9 @@ void app_main(void){
     float prev_elevation = 0.0f;
     bool first_reading = true;
     time_t boot_time = time(NULL);
+
+    uint32_t moves_today = 0;
+    uint32_t total_moves = 0;
     
     // Periodic comprehensive status logging
     uint32_t last_comprehensive_log = 0;
@@ -1851,8 +1854,6 @@ void app_main(void){
         int8_t rssi = -128;  // Default: no signal (we're the AP, not station)
         
         // Get move counters from tracking module
-        uint32_t moves_today = 0;
-        uint32_t total_moves = 0;
         tracking_get_move_stats(&moves_today, &total_moves);
         
         // Get current LED status to determine system state
