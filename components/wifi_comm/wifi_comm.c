@@ -487,30 +487,52 @@ esp_err_t wifi_comm_send_data(const tracker_data_t *data)
         }
     }
 
-    // Set send timeout (prevents blocking if client stalls)
+    // Set longer send timeout for better reliability
     struct timeval timeout;
-    timeout.tv_sec = 2;   // 2 second timeout
+    timeout.tv_sec = 5;   // Increased to 5 seconds (was 2)
     timeout.tv_usec = 0;
     setsockopt(client_socket, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    // CHANGED: Send with retry on EAGAIN
+    // Check socket is still alive before sending
+    int error = 0;
+    socklen_t len = sizeof(error);
+    int retval = getsockopt(client_socket, SOL_SOCKET, SO_ERROR, &error, &len);
+    
+    if (retval != 0 || error != 0) {
+        ESP_LOGW(TAG, "Socket error detected before send (err=%d), closing", error);
+        close(client_socket);
+        client_socket = -1;
+        s_stats.tx_errors++;
+        return ESP_FAIL;
+    }
+
+    // Send with retry on transient errors
     int bytes_sent = -1;
     int retry_count = 0;
     const int MAX_RETRIES = 3;
     
     while (retry_count < MAX_RETRIES) {
-        bytes_sent = send(client_socket, data, sizeof(tracker_data_t), 0);
+        bytes_sent = send(client_socket, data, sizeof(tracker_data_t), MSG_NOSIGNAL);
         
         if (bytes_sent >= 0) {
             break;  // Success
         }
         
-        // Check if error is recoverable (EAGAIN/EWOULDBLOCK)
+        // Check if error is recoverable
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             retry_count++;
             ESP_LOGW(TAG, "Send buffer full (EAGAIN), retry %d/%d", retry_count, MAX_RETRIES);
-            vTaskDelay(pdMS_TO_TICKS(100));  // Wait 100ms
+            vTaskDelay(pdMS_TO_TICKS(200));  // Increased wait time to 200ms
             continue;
+        }
+        
+        // Check for broken pipe or connection reset
+        if (errno == EPIPE || errno == ECONNRESET) {
+            ESP_LOGW(TAG, "Client disconnected during send: %s", strerror(errno));
+            close(client_socket);
+            client_socket = -1;
+            s_stats.tx_errors++;
+            return ESP_FAIL;
         }
         
         // Non-recoverable error
@@ -533,6 +555,10 @@ esp_err_t wifi_comm_send_data(const tracker_data_t *data)
     if (bytes_sent != sizeof(tracker_data_t)) {
         // Partial send (shouldn't happen with TCP, but check anyway)
         ESP_LOGW(TAG, "⚠ Partial send: %d/%zu bytes", bytes_sent, sizeof(tracker_data_t));
+        // Close socket on partial send - indicates problem
+        close(client_socket);
+        client_socket = -1;
+        return ESP_FAIL;
     }
 
     // Success
