@@ -429,85 +429,158 @@ esp_err_t wifi_comm_init_ap(void)
 }
 
 /*
- * HTTP Handler: Root page (dashboard HTML)
+ * HTTP Handler: Root page (dashboard HTML) - UPDATED WITH GREY/BLACK/ORANGE THEME
  */
 static esp_err_t dashboard_get_handler(httpd_req_t *req) {
-    // Simple HTML dashboard with auto-refresh
     const char *html = 
         "<!DOCTYPE html><html><head>"
         "<meta charset='UTF-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        "<title>Sunflower Tracker</title>"
+        "<title>Sunflower</title>"
         "<style>"
-        "body{font-family:Arial,sans-serif;background:#1a1a1a;color:#fff;margin:0;padding:20px}"
-        "h1{text-align:center;color:#FFD700;margin-bottom:30px}"
-        ".container{max-width:600px;margin:0 auto}"
-        ".card{background:#2a2a2a;border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}"
-        ".card h2{margin-top:0;color:#4CAF50;border-bottom:2px solid #4CAF50;padding-bottom:10px}"
-        ".row{display:flex;justify-content:space-between;margin:10px 0}"
-        ".label{color:#aaa;font-size:14px}"
-        ".value{font-size:20px;font-weight:bold;color:#fff}"
-        ".status{display:inline-block;padding:5px 15px;border-radius:20px;font-size:12px;margin-top:10px}"
-        ".status-ok{background:#4CAF50}"
-        ".status-warn{background:#FF9800}"
-        ".status-error{background:#F44336}"
-        ".sun{color:#FFD700}"
-        ".gps{color:#2196F3}"
-        ".battery{color:#4CAF50}"
-        "footer{text-align:center;color:#666;margin-top:40px;font-size:12px}"
+        // Modern grey/black/orange color scheme
+        "body{font-family:'Segoe UI',Roboto,Arial,sans-serif;background:linear-gradient(135deg,#1a1a1a 0%,#2d2d2d 100%);"
+        "color:#e0e0e0;margin:0;padding:20px;min-height:100vh}"
+        
+        // Header styling
+        "h1{text-align:center;color:#ff8c00;margin:20px 0 10px;font-size:2.8em;font-weight:700;"
+        "text-shadow:0 0 20px rgba(255,140,0,0.5),0 2px 4px rgba(0,0,0,0.8);"
+        "letter-spacing:2px}"
+        
+        ".subtitle{text-align:center;color:#808080;margin-bottom:40px;font-size:0.95em;font-weight:300;"
+        "text-transform:uppercase;letter-spacing:3px}"
+        
+        ".container{max-width:900px;margin:0 auto}"
+        
+        // Card styling with grey/black gradient
+        ".card{background:linear-gradient(145deg,#2a2a2a 0%,#1f1f1f 100%);"
+        "border-radius:16px;padding:28px;margin-bottom:24px;"
+        "box-shadow:0 10px 30px rgba(0,0,0,0.6),0 1px 2px rgba(255,140,0,0.1);"
+        "border:1px solid #3a3a3a;position:relative;overflow:hidden}"
+        
+        // Orange accent bar on left edge of each card
+        ".card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;"
+        "background:linear-gradient(180deg,#ff8c00 0%,#ff6600 100%)}"
+        
+        // Section headers with orange accent
+        ".card h2{margin:0 0 24px;font-size:1.3em;color:#ff8c00;font-weight:600;"
+        "border-bottom:2px solid #3a3a3a;padding-bottom:14px;padding-left:12px;"
+        "text-transform:uppercase;letter-spacing:1px}"
+        
+        // Data rows
+        ".row{display:flex;justify-content:space-between;align-items:center;"
+        "margin:14px 0;padding:12px 12px 12px 16px;background:rgba(0,0,0,0.2);"
+        "border-radius:8px;border-left:3px solid transparent;transition:all 0.3s ease}"
+        
+        ".row:hover{background:rgba(255,140,0,0.08);border-left-color:#ff8c00}"
+        
+        ".label{color:#999;font-size:14px;font-weight:500;text-transform:uppercase;letter-spacing:0.5px}"
+        
+        ".value{font-size:24px;font-weight:700;color:#fff;text-shadow:0 2px 4px rgba(0,0,0,0.5);"
+        "font-family:'Consolas','Monaco',monospace}"
+        
+        ".value.large{font-size:32px;color:#ff8c00}"
+        
+        // GPS coordinates styling
+        ".gps-coords{display:block;margin-top:8px;font-size:15px;color:#b0b0b0;"
+        "font-family:'Consolas',monospace;background:rgba(0,0,0,0.3);padding:8px 12px;"
+        "border-radius:6px;border-left:3px solid #ff8c00}"
+        
+        // Status badges with orange theme
+        ".status-badge{display:inline-block;padding:8px 20px;border-radius:24px;"
+        "font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:1px;"
+        "box-shadow:0 2px 8px rgba(0,0,0,0.4)}"
+        
+        ".status-ok{background:linear-gradient(135deg,#ff8c00 0%,#ff6600 100%);color:#000}"
+        ".status-warn{background:linear-gradient(135deg,#ffa500 0%,#ff8c00 100%);color:#000}"
+        ".status-error{background:linear-gradient(135deg,#666 0%,#444 100%);color:#ff8c00}"
+        
+        // Grid layout
+        ".grid-2{display:grid;grid-template-columns:1fr 1fr;gap:24px}"
+        "@media(max-width:768px){.grid-2{grid-template-columns:1fr}}"
+        
+        // Footer styling
+        "footer{text-align:center;color:#666;margin-top:50px;font-size:13px;padding:30px;"
+        "border-top:1px solid #3a3a3a}"
+        
+        "footer a{color:#ff8c00;text-decoration:none;margin:0 15px;font-weight:600;"
+        "transition:color 0.3s ease}"
+        "footer a:hover{color:#ffa500;text-decoration:underline}"
+        
+        // Pulsing live indicator
+        ".pulse{animation:pulse 2s infinite;color:#ff8c00;font-size:1.2em}"
+        "@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}"
+        
+        // Emoji styling
+        ".emoji{font-size:1.4em;margin-right:10px;filter:drop-shadow(0 0 8px rgba(255,140,0,0.5))}"
+        
+        // Scrollbar styling (webkit browsers)
+        "::-webkit-scrollbar{width:10px}"
+        "::-webkit-scrollbar-track{background:#1a1a1a}"
+        "::-webkit-scrollbar-thumb{background:#ff8c00;border-radius:5px}"
+        "::-webkit-scrollbar-thumb:hover{background:#ffa500}"
+        
         "</style>"
         "</head><body>"
         "<div class='container'>"
-        "<h1>🌻 Sunflower Tracker</h1>"
+        "<h1>SUNFL🌻WER</h1>"
+        "<div class='subtitle'>Real-Time Solar Tracking Dashboard</div>"
+        
+        "<div class='grid-2'>"
         
         "<div class='card'>"
-        "<h2>📡 Panel Position</h2>"
-        "<div class='row'><span class='label'>Azimuth:</span><span class='value' id='az'>---°</span></div>"
-        "<div class='row'><span class='label'>Elevation:</span><span class='value' id='el'>---°</span></div>"
-        "</div>"
-        
-        "<div class='card sun'>"
-        "<h2>☀️ Sun Position</h2>"
-        "<div class='row'><span class='label'>Azimuth:</span><span class='value' id='sun_az'>---°</span></div>"
-        "<div class='row'><span class='label'>Elevation:</span><span class='value' id='sun_el'>---°</span></div>"
-        "<div class='row'><span class='label'>Tracking Error:</span><span class='value' id='error'>---°</span></div>"
-        "</div>"
-        
-        "<div class='card battery'>"
-        "<h2>🔋 Battery</h2>"
-        "<div class='row'><span class='label'>Voltage:</span><span class='value' id='batt_v'>--.--V</span></div>"
-        "<div class='row'><span class='label'>Charge:</span><span class='value' id='batt_soc'>---%</span></div>"
-        "<div class='row'><span class='label'>Status:</span><span class='value' id='batt_status'>---</span></div>"
-        "</div>"
-        
-        "<div class='card gps'>"
-        "<h2>🛰️ GPS Status</h2>"
-        "<div class='row'><span class='label'>Position:</span><span class='value' id='gps_pos'>Waiting...</span></div>"
-        "<div class='row'><span class='label'>Satellites:</span><span class='value' id='gps_sats'>-</span></div>"
-        "<div class='row'><span class='label'>Fix Age:</span><span class='value' id='gps_age'>---s</span></div>"
+        "<h2><span class='emoji'>📡</span>Panel Position</h2>"
+        "<div class='row'><span class='label'>Azimuth</span><span class='value' id='az'>---°</span></div>"
+        "<div class='row'><span class='label'>Elevation</span><span class='value' id='el'>---°</span></div>"
         "</div>"
         
         "<div class='card'>"
-        "<h2>📊 Statistics</h2>"
-        "<div class='row'><span class='label'>Moves Today:</span><span class='value' id='moves_today'>-</span></div>"
-        "<div class='row'><span class='label'>Total Moves:</span><span class='value' id='total_moves'>-</span></div>"
-        "<div class='row'><span class='label'>Uptime:</span><span class='value' id='uptime'>-h</span></div>"
+        "<h2><span class='emoji'>☀️</span>Sun Position</h2>"
+        "<div class='row'><span class='label'>Azimuth</span><span class='value' id='sun_az'>---°</span></div>"
+        "<div class='row'><span class='label'>Elevation</span><span class='value' id='sun_el'>---°</span></div>"
+        "<div class='row'><span class='label'>Tracking Error</span><span class='value' id='error'>---°</span></div>"
         "</div>"
         
         "</div>"
-        "<footer>Auto-refreshes every 2 seconds | <a href='/data' style='color:#4CAF50'>Raw JSON</a></footer>"
+        
+        "<div class='card'>"
+        "<h2><span class='emoji'>🔋</span>Battery Status</h2>"
+        "<div class='row'><span class='label'>Voltage</span><span class='value large' id='batt_v'>--.--V</span></div>"
+        "<div class='row'><span class='label'>Charge Level</span><span class='value' id='batt_soc'>---%</span></div>"
+        "<div class='row'><span class='label'>Status</span><span class='status-badge' id='batt_status'>---</span></div>"
+        "</div>"
+        
+        "<div class='card'>"
+        "<h2><span class='emoji'>🛰️</span>GPS Status</h2>"
+        "<div class='row' style='flex-direction:column;align-items:flex-start'>"
+        "<span class='label'>Position</span>"
+        "<span class='gps-coords' id='gps_pos'>Waiting for GPS fix...</span>"
+        "</div>"
+        "<div class='row'><span class='label'>Satellites</span><span class='value' id='gps_sats'>-</span></div>"
+        "<div class='row'><span class='label'>Fix Age</span><span class='value' id='gps_age'>---s</span></div>"
+        "</div>"
+        
+        "<div class='card'>"
+        "<h2><span class='emoji'>📊</span>Statistics</h2>"
+        "<div class='row'><span class='label'>Moves Today</span><span class='value' id='moves_today'>-</span></div>"
+        "<div class='row'><span class='label'>Total Moves</span><span class='value' id='total_moves'>-</span></div>"
+        "<div class='row'><span class='label'>Uptime</span><span class='value' id='uptime'>-h</span></div>"
+        "</div>"
+        
+        "</div>"
+        "<footer>"
+        "<span class='pulse'>●</span> LIVE · Auto-refresh every 2s"
+        "<br><a href='/data'>📥 Raw JSON Data</a>"
+        "</footer>"
         
         "<script>"
         "function update(){"
-        "  console.log('Fetching /data...');"  // Debug log
         "  fetch('/data')"
         "    .then(r => {"
-        "      console.log('Response status:', r.status);"
         "      if (!r.ok) throw new Error('HTTP ' + r.status);"
         "      return r.json();"
         "    })"
         "    .then(d => {"
-        "      console.log('Data received:', d);"  // Debug log
         "      document.getElementById('az').textContent=d.az.toFixed(1)+'°';"
         "      document.getElementById('el').textContent=d.el.toFixed(1)+'°';"
         "      document.getElementById('sun_az').textContent=d.sun_az.toFixed(1)+'°';"
@@ -515,21 +588,29 @@ static esp_err_t dashboard_get_handler(httpd_req_t *req) {
         "      document.getElementById('error').textContent=d.track_err+'°';"
         "      document.getElementById('batt_v').textContent=d.batt_v.toFixed(2)+'V';"
         "      document.getElementById('batt_soc').textContent=d.batt_soc.toFixed(0)+'%';"
-        "      document.getElementById('batt_status').textContent=d.batt_charging?'CHARGING':'DISCHARGING';"
-        "      document.getElementById('gps_pos').textContent=d.gps_valid?(d.lat.toFixed(6)+'°N, '+d.lon.toFixed(6)+'°W'):'NO FIX';"
+        "      var status=document.getElementById('batt_status');"
+        "      status.textContent=d.batt_charging?'CHARGING':'DISCHARGING';"
+        "      status.className='status-badge '+(d.batt_charging?'status-ok':'status-warn');"
+        "      if(d.gps_valid){"
+        "        document.getElementById('gps_pos').textContent=d.lat.toFixed(6)+'°N, '+d.lon.toFixed(6)+'°W';"
+        "      }else{"
+        "        document.getElementById('gps_pos').textContent='NO FIX';"
+        "      }"
         "      document.getElementById('gps_sats').textContent=d.gps_sats;"
         "      document.getElementById('gps_age').textContent=d.gps_age+'s';"
-        "      document.getElementById('moves_today').textContent=d.moves_today;"
-        "      document.getElementById('total_moves').textContent=d.total_moves;"
+        // FIX: Changed from d.moves_today to d.moves_today (already correct)
+        // FIX: Changed d.total_moves to d.total_moves (already correct)
+        // FIX: Changed d.uptime_h to d.uptime_h (already correct)
+        "      document.getElementById('moves_today').textContent=d.moves_today.toLocaleString();"
+        "      document.getElementById('total_moves').textContent=d.total_moves.toLocaleString();"
         "      document.getElementById('uptime').textContent=d.uptime_h+'h';"
         "    })"
         "    .catch(e => {"
-        "      console.error('Fetch error:', e);"  // Debug log
-        "      alert('Connection lost: ' + e.message);"
+        "      console.error('Fetch error:', e);"
         "    });"
         "}"
-        "update();"  // Initial load
-        "setInterval(update, 2000);"  // Auto-refresh every 2s
+        "update();"
+        "setInterval(update, 2000);"
         "</script>"
         "</body></html>";
     
