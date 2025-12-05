@@ -351,6 +351,7 @@ static void compass_calib_task(void *arg){
                 sdlog_printf("Compass pre-calibration state: %s", was_calibrated ? "CALIBRATED" : "UNCALIBRATED");
                 
                 ESP_LOGI(TAG, "Starting compass calibration (rotate panel slowly)...");
+
                 bool success = GPS_CALIBRATE_COMPASS();  // CHANGED
                 
                 if (success) {
@@ -541,6 +542,7 @@ static bool perform_system_check(bool init_results[9]) {
         
         // Try to get GPS data (non-blocking, short timeout)
         ESP_LOGI(TAG, "    - Testing GPS communication (5s timeout)...");
+
         gps_data_t gps_test;
         bool gps_responding = gps_poll_nav_pvt(&gps_test);
         
@@ -1035,6 +1037,58 @@ void app_main(void){
             if (init_results[2]) {
                 sdlog_printf("HTTP server started: http://192.168.4.1");
             }
+            
+            // === FORCE INITIAL WEB DATA UPDATE WITH GPS ===
+            tracker_data_t initial_data = {0};
+            
+            // Get battery if available
+            battery_data_t battery;
+            if (battery_read(&battery) == ESP_OK) {
+                initial_data.battery_voltage = battery.voltage;
+                initial_data.battery_soc_percent = battery.soc_percent;
+                initial_data.battery_soc = (uint8_t)battery.soc_level;
+                initial_data.battery_charging = battery.is_charging ? 1 : 0;
+            }
+            
+            // Get current position from tracking
+            tracking_get_current_angles(&initial_data.azimuth, &initial_data.elevation);
+            
+            // === ADD GPS DATA (Mock GPS should have fix immediately) ===
+            gps_data_t gps_initial;
+            if (GPS_POLL_NAV_PVT(&gps_initial)) {
+                initial_data.latitude = (float)gps_initial.latitude;
+                initial_data.longitude = (float)gps_initial.longitude;
+                initial_data.gps_valid = 1;
+                initial_data.gps_satellites = gps_initial.num_satellites;
+                initial_data.last_gps_fix_age_sec = 0;
+                
+                // Calculate sun position with GPS data
+                time_t now = time(NULL);
+                sun_pos_t sun = solar_compute(gps_initial.latitude, gps_initial.longitude, now);
+                initial_data.sun_azimuth = (float)sun.azimuth_deg;
+                initial_data.sun_elevation = (float)sun.elevation_deg;
+                
+                ESP_LOGI(TAG, "GPS data for web: %.6f,%.6f Sun[%.1f°,%.1f°]",
+                         initial_data.latitude, initial_data.longitude,
+                         initial_data.sun_azimuth, initial_data.sun_elevation);
+            } else {
+                ESP_LOGW(TAG, "No GPS data yet for web dashboard");
+            }
+            
+            // Get current timestamp
+            time_t now = time(NULL);
+            initial_data.timestamp = (uint32_t)now;
+            
+            // System status = waiting
+            initial_data.status = 0;
+            
+            // Update web server with initial data
+            wifi_comm_update_web_data(&initial_data);
+            ESP_LOGI(TAG, "✓ Web data initialized: Az=%.1f° El=%.1f° Batt=%.2fV GPS=%s",
+                     initial_data.azimuth, initial_data.elevation, 
+                     initial_data.battery_voltage,
+                     initial_data.gps_valid ? "OK" : "NO");
+            
         } else {
             ESP_LOGW(TAG, "⚠ Web server failed (TCP display still works)");
         }
@@ -1441,6 +1495,7 @@ void app_main(void){
     ESP_LOGI(TAG, "  - System will start WITHOUT waiting for GPS");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Attempting initial GPS fix (60s timeout)...");
+
     if (init_results[2]) {
         sdlog_printf("GPS acquisition started (60s timeout)");
     }
@@ -1886,19 +1941,20 @@ void app_main(void){
             .tracking_quality = tracking_quality,
         };
         
+        // UPDATE WEB DATA FIRST (before TCP send)
+        wifi_comm_update_web_data(&tx_data);
+        
         // Send data over WiFi (TCP for LCD display)
         esp_err_t send_ret = wifi_comm_send_data(&tx_data);
-        
-        // ALSO update web dashboard data
-        wifi_comm_update_web_data(&tx_data);
         
         ESP_LOGV(TAG, "wifi_comm_send_data() returned: %s", esp_err_to_name(send_ret));
         
         if (send_ret == ESP_OK) {
-            ESP_LOGI(TAG, "LCD[%u]: El=%.1f° Az=%.1f° Batt=%.2fV(%.0f%%) GPS=%lus SD=%u Sun[%.1f°,%.1f°]",
+            ESP_LOGI(TAG, "LCD[%u]: El=%.1f° Az=%.1f° Batt=%.2fV(%.0f%%) GPS=%s(%lus) SD=%u Sun[%.1f°,%.1f°]",
                      wifi_client_count,
                      tx_data.elevation, tx_data.azimuth,
                      tx_data.battery_voltage, tx_data.battery_soc_percent,
+                     gps_valid ? "OK" : "NO_FIX",
                      (unsigned long)gps_fix_age_sec,
                      sd_status,
                      tx_data.sun_elevation, tx_data.sun_azimuth);

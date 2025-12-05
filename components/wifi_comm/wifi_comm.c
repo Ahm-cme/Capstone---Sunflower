@@ -499,25 +499,37 @@ static esp_err_t dashboard_get_handler(httpd_req_t *req) {
         
         "<script>"
         "function update(){"
-        "fetch('/data').then(r=>r.json()).then(d=>{"
-        "document.getElementById('az').textContent=d.az.toFixed(1)+'°';"
-        "document.getElementById('el').textContent=d.el.toFixed(1)+'°';"
-        "document.getElementById('sun_az').textContent=d.sun_az.toFixed(1)+'°';"
-        "document.getElementById('sun_el').textContent=d.sun_el.toFixed(1)+'°';"
-        "document.getElementById('error').textContent=d.track_err+'°';"
-        "document.getElementById('batt_v').textContent=d.batt_v.toFixed(2)+'V';"
-        "document.getElementById('batt_soc').textContent=d.batt_soc.toFixed(0)+'%';"
-        "document.getElementById('batt_status').textContent=d.batt_charging?'CHARGING':'DISCHARGING';"
-        "document.getElementById('gps_pos').textContent=d.gps_valid?(d.lat.toFixed(6)+'°N, '+d.lon.toFixed(6)+'°W'):'NO FIX';"
-        "document.getElementById('gps_sats').textContent=d.gps_sats;"
-        "document.getElementById('gps_age').textContent=d.gps_age+'s';"
-        "document.getElementById('moves_today').textContent=d.moves_today;"
-        "document.getElementById('total_moves').textContent=d.total_moves;"
-        "document.getElementById('uptime').textContent=d.uptime_h+'h';"
-        "}).catch(e=>console.error(e));"
+        "  console.log('Fetching /data...');"  // Debug log
+        "  fetch('/data')"
+        "    .then(r => {"
+        "      console.log('Response status:', r.status);"
+        "      if (!r.ok) throw new Error('HTTP ' + r.status);"
+        "      return r.json();"
+        "    })"
+        "    .then(d => {"
+        "      console.log('Data received:', d);"  // Debug log
+        "      document.getElementById('az').textContent=d.az.toFixed(1)+'°';"
+        "      document.getElementById('el').textContent=d.el.toFixed(1)+'°';"
+        "      document.getElementById('sun_az').textContent=d.sun_az.toFixed(1)+'°';"
+        "      document.getElementById('sun_el').textContent=d.sun_el.toFixed(1)+'°';"
+        "      document.getElementById('error').textContent=d.track_err+'°';"
+        "      document.getElementById('batt_v').textContent=d.batt_v.toFixed(2)+'V';"
+        "      document.getElementById('batt_soc').textContent=d.batt_soc.toFixed(0)+'%';"
+        "      document.getElementById('batt_status').textContent=d.batt_charging?'CHARGING':'DISCHARGING';"
+        "      document.getElementById('gps_pos').textContent=d.gps_valid?(d.lat.toFixed(6)+'°N, '+d.lon.toFixed(6)+'°W'):'NO FIX';"
+        "      document.getElementById('gps_sats').textContent=d.gps_sats;"
+        "      document.getElementById('gps_age').textContent=d.gps_age+'s';"
+        "      document.getElementById('moves_today').textContent=d.moves_today;"
+        "      document.getElementById('total_moves').textContent=d.total_moves;"
+        "      document.getElementById('uptime').textContent=d.uptime_h+'h';"
+        "    })"
+        "    .catch(e => {"
+        "      console.error('Fetch error:', e);"  // Debug log
+        "      alert('Connection lost: ' + e.message);"
+        "    });"
         "}"
-        "setInterval(update,2000);"  // Refresh every 2 seconds
         "update();"  // Initial load
+        "setInterval(update, 2000);"  // Auto-refresh every 2s
         "</script>"
         "</body></html>";
     
@@ -529,6 +541,12 @@ static esp_err_t dashboard_get_handler(httpd_req_t *req) {
  * HTTP Handler: JSON data endpoint
  */
 static esp_err_t data_get_handler(httpd_req_t *req) {
+    // ADD THIS DEBUG LOG AT THE TOP
+    ESP_LOGI(TAG, "📡 /data endpoint called - Az=%.1f° El=%.1f° Batt=%.2fV",
+             latest_data.azimuth,
+             latest_data.elevation, 
+             latest_data.battery_voltage);
+    
     // Convert tracker_data_t to JSON
     char json[512];
     snprintf(json, sizeof(json),
@@ -631,6 +649,14 @@ esp_err_t wifi_comm_init_web_server(void) {
 void wifi_comm_update_web_data(const tracker_data_t *data) {
     if (data) {
         memcpy(&latest_data, data, sizeof(tracker_data_t));
+        
+        // ADD THIS DEBUG LOG
+        ESP_LOGI(TAG, "✓ Web data updated: Az=%.1f° El=%.1f° Batt=%.2fV",
+                 latest_data.azimuth,
+                 latest_data.elevation,
+                 latest_data.battery_voltage);
+    } else {
+        ESP_LOGW(TAG, "⚠ NULL data passed to wifi_comm_update_web_data()");
     }
 }
 
