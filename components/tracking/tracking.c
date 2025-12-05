@@ -56,7 +56,7 @@
 
 // === ADD MOCK GPS SUPPORT (MUST MATCH main.c) ===
 #ifndef USE_MOCK_GPS
-#define USE_MOCK_GPS  0  // Set to 1 for mock mode, 0 for real GPS
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
 #endif
 
 #if USE_MOCK_GPS

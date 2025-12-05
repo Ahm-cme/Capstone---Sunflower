@@ -86,6 +86,7 @@
 #include "lwip/err.h"
 #include "lwip/sys.h"
 #include "lwip/sockets.h"
+#include "esp_http_server.h" 
 
 #include "wifi_comm.h"
 
@@ -104,6 +105,10 @@ static const char *TAG = "WIFI_COMM";
 static int server_socket = -1;          // Listening socket
 static int client_socket = -1;          // Active client connection
 static bool is_connected = false;       // Station associated with AP
+
+// HTTP server handle and cached data for web dashboard
+static httpd_handle_t web_server = NULL;
+static tracker_data_t latest_data = {0};  // Cached data for web clients
 
 // Statistics tracking
 static wifi_stats_t s_stats = {0};
@@ -421,6 +426,212 @@ esp_err_t wifi_comm_init_ap(void)
     ESP_LOGI(TAG, "");
     
     return ESP_OK;
+}
+
+/*
+ * HTTP Handler: Root page (dashboard HTML)
+ */
+static esp_err_t dashboard_get_handler(httpd_req_t *req) {
+    // Simple HTML dashboard with auto-refresh
+    const char *html = 
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>Sunflower Tracker</title>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;background:#1a1a1a;color:#fff;margin:0;padding:20px}"
+        "h1{text-align:center;color:#FFD700;margin-bottom:30px}"
+        ".container{max-width:600px;margin:0 auto}"
+        ".card{background:#2a2a2a;border-radius:10px;padding:20px;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,0.3)}"
+        ".card h2{margin-top:0;color:#4CAF50;border-bottom:2px solid #4CAF50;padding-bottom:10px}"
+        ".row{display:flex;justify-content:space-between;margin:10px 0}"
+        ".label{color:#aaa;font-size:14px}"
+        ".value{font-size:20px;font-weight:bold;color:#fff}"
+        ".status{display:inline-block;padding:5px 15px;border-radius:20px;font-size:12px;margin-top:10px}"
+        ".status-ok{background:#4CAF50}"
+        ".status-warn{background:#FF9800}"
+        ".status-error{background:#F44336}"
+        ".sun{color:#FFD700}"
+        ".gps{color:#2196F3}"
+        ".battery{color:#4CAF50}"
+        "footer{text-align:center;color:#666;margin-top:40px;font-size:12px}"
+        "</style>"
+        "</head><body>"
+        "<div class='container'>"
+        "<h1>🌻 Sunflower Tracker</h1>"
+        
+        "<div class='card'>"
+        "<h2>📡 Panel Position</h2>"
+        "<div class='row'><span class='label'>Azimuth:</span><span class='value' id='az'>---°</span></div>"
+        "<div class='row'><span class='label'>Elevation:</span><span class='value' id='el'>---°</span></div>"
+        "</div>"
+        
+        "<div class='card sun'>"
+        "<h2>☀️ Sun Position</h2>"
+        "<div class='row'><span class='label'>Azimuth:</span><span class='value' id='sun_az'>---°</span></div>"
+        "<div class='row'><span class='label'>Elevation:</span><span class='value' id='sun_el'>---°</span></div>"
+        "<div class='row'><span class='label'>Tracking Error:</span><span class='value' id='error'>---°</span></div>"
+        "</div>"
+        
+        "<div class='card battery'>"
+        "<h2>🔋 Battery</h2>"
+        "<div class='row'><span class='label'>Voltage:</span><span class='value' id='batt_v'>--.--V</span></div>"
+        "<div class='row'><span class='label'>Charge:</span><span class='value' id='batt_soc'>---%</span></div>"
+        "<div class='row'><span class='label'>Status:</span><span class='value' id='batt_status'>---</span></div>"
+        "</div>"
+        
+        "<div class='card gps'>"
+        "<h2>🛰️ GPS Status</h2>"
+        "<div class='row'><span class='label'>Position:</span><span class='value' id='gps_pos'>Waiting...</span></div>"
+        "<div class='row'><span class='label'>Satellites:</span><span class='value' id='gps_sats'>-</span></div>"
+        "<div class='row'><span class='label'>Fix Age:</span><span class='value' id='gps_age'>---s</span></div>"
+        "</div>"
+        
+        "<div class='card'>"
+        "<h2>📊 Statistics</h2>"
+        "<div class='row'><span class='label'>Moves Today:</span><span class='value' id='moves_today'>-</span></div>"
+        "<div class='row'><span class='label'>Total Moves:</span><span class='value' id='total_moves'>-</span></div>"
+        "<div class='row'><span class='label'>Uptime:</span><span class='value' id='uptime'>-h</span></div>"
+        "</div>"
+        
+        "</div>"
+        "<footer>Auto-refreshes every 2 seconds | <a href='/data' style='color:#4CAF50'>Raw JSON</a></footer>"
+        
+        "<script>"
+        "function update(){"
+        "fetch('/data').then(r=>r.json()).then(d=>{"
+        "document.getElementById('az').textContent=d.az.toFixed(1)+'°';"
+        "document.getElementById('el').textContent=d.el.toFixed(1)+'°';"
+        "document.getElementById('sun_az').textContent=d.sun_az.toFixed(1)+'°';"
+        "document.getElementById('sun_el').textContent=d.sun_el.toFixed(1)+'°';"
+        "document.getElementById('error').textContent=d.track_err+'°';"
+        "document.getElementById('batt_v').textContent=d.batt_v.toFixed(2)+'V';"
+        "document.getElementById('batt_soc').textContent=d.batt_soc.toFixed(0)+'%';"
+        "document.getElementById('batt_status').textContent=d.batt_charging?'CHARGING':'DISCHARGING';"
+        "document.getElementById('gps_pos').textContent=d.gps_valid?(d.lat.toFixed(6)+'°N, '+d.lon.toFixed(6)+'°W'):'NO FIX';"
+        "document.getElementById('gps_sats').textContent=d.gps_sats;"
+        "document.getElementById('gps_age').textContent=d.gps_age+'s';"
+        "document.getElementById('moves_today').textContent=d.moves_today;"
+        "document.getElementById('total_moves').textContent=d.total_moves;"
+        "document.getElementById('uptime').textContent=d.uptime_h+'h';"
+        "}).catch(e=>console.error(e));"
+        "}"
+        "setInterval(update,2000);"  // Refresh every 2 seconds
+        "update();"  // Initial load
+        "</script>"
+        "</body></html>";
+    
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+/*
+ * HTTP Handler: JSON data endpoint
+ */
+static esp_err_t data_get_handler(httpd_req_t *req) {
+    // Convert tracker_data_t to JSON
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{"
+        "\"az\":%.1f,"
+        "\"el\":%.1f,"
+        "\"sun_az\":%.1f,"
+        "\"sun_el\":%.1f,"
+        "\"track_err\":%u,"
+        "\"batt_v\":%.2f,"
+        "\"batt_soc\":%.0f,"
+        "\"batt_charging\":%s,"
+        "\"lat\":%.6f,"
+        "\"lon\":%.6f,"
+        "\"gps_valid\":%s,"
+        "\"gps_sats\":%u,"
+        "\"gps_age\":%lu,"
+        "\"moves_today\":%lu,"
+        "\"total_moves\":%lu,"
+        "\"uptime_h\":%u"
+        "}",
+        latest_data.azimuth,
+        latest_data.elevation,
+        latest_data.sun_azimuth,
+        latest_data.sun_elevation,
+        latest_data.tracking_quality,
+        latest_data.battery_voltage,
+        latest_data.battery_soc_percent,
+        latest_data.battery_charging ? "true" : "false",
+        latest_data.latitude,
+        latest_data.longitude,
+        latest_data.gps_valid ? "true" : "false",
+        latest_data.gps_satellites,
+        (unsigned long)latest_data.last_gps_fix_age_sec,
+        (unsigned long)latest_data.moves_today,
+        (unsigned long)latest_data.total_moves,
+        latest_data.uptime_hours);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");  // Allow CORS
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+/*
+ * Initialize HTTP Web Server
+ */
+esp_err_t wifi_comm_init_web_server(void) {
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "╔════════════════════════════════════════════════════════════╗");
+    ESP_LOGI(TAG, "║          WEB DASHBOARD INITIALIZATION                      ║");
+    ESP_LOGI(TAG, "╚════════════════════════════════════════════════════════════╝");
+    ESP_LOGI(TAG, "");
+    
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;  // Allow multiple browsers
+    config.lru_purge_enable = true;
+    
+    if (httpd_start(&web_server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "✗ Failed to start HTTP server");
+        return ESP_FAIL;
+    }
+    
+    // Register dashboard page handler
+    httpd_uri_t dashboard_uri = {
+        .uri       = "/",
+        .method    = HTTP_GET,
+        .handler   = dashboard_get_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(web_server, &dashboard_uri);
+    
+    // Register JSON data endpoint
+    httpd_uri_t data_uri = {
+        .uri       = "/data",
+        .method    = HTTP_GET,
+        .handler   = data_get_handler,
+        .user_ctx  = NULL
+    };
+    httpd_register_uri_handler(web_server, &data_uri);
+    
+    ESP_LOGI(TAG, "✓ HTTP Server: RUNNING");
+    ESP_LOGI(TAG, "  - Port: 80");
+    ESP_LOGI(TAG, "  - Dashboard: http://192.168.4.1/");
+    ESP_LOGI(TAG, "  - JSON API: http://192.168.4.1/data");
+    ESP_LOGI(TAG, "  - Max connections: %d", config.max_open_sockets);
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Instructions:");
+    ESP_LOGI(TAG, "  1. Connect phone to WiFi 'SunflowerTracker'");
+    ESP_LOGI(TAG, "  2. Open browser and go to: http://192.168.4.1");
+    ESP_LOGI(TAG, "  3. Dashboard shows live tracking data");
+    ESP_LOGI(TAG, "");
+    
+    return ESP_OK;
+}
+
+/*
+ * Update web dashboard data
+ */
+void wifi_comm_update_web_data(const tracker_data_t *data) {
+    if (data) {
+        memcpy(&latest_data, data, sizeof(tracker_data_t));
+    }
 }
 
 /*

@@ -354,4 +354,32 @@ typedef struct {
 
 void wifi_comm_get_stats(wifi_stats_t *stats);
 
+/*
+ * Start HTTP web server for phone browser access
+ * 
+ * Creates a simple HTTP server on port 80 that serves a dashboard page.
+ * Users manually navigate to http://192.168.4.1 after connecting to WiFi.
+ * 
+ * Returns:
+ *  ESP_OK   - Web server started successfully
+ *  ESP_FAIL - Failed to start (check console logs)
+ * 
+ * Usage:
+ *  1. Call after wifi_comm_init_ap()
+ *  2. Dashboard auto-refreshes every 2 seconds
+ *  3. Works on any phone/tablet browser
+ */
+esp_err_t wifi_comm_init_web_server(void);
+
+/*
+ * Update latest tracker data for web dashboard
+ * 
+ * Call this every second with fresh tracker data.
+ * Web clients fetch this data when they refresh the page.
+ * 
+ * Args:
+ *  data - Current tracker state (same as TCP packet)
+ */
+void wifi_comm_update_web_data(const tracker_data_t *data);
+
 #endif // WIFI_COMM_H

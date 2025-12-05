@@ -84,7 +84,7 @@
 #include "esp_adc/adc_oneshot.h"
 
 // Mock GPS for testing
-#define USE_MOCK_GPS  0  // Set to 1 for mock mode, 0 for real GPS
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
 
 #if USE_MOCK_GPS
 #include "mock_gps.h"
@@ -1026,6 +1026,20 @@ void app_main(void){
                     init_results[6] ? "OK" : "FAILED");
     }
 
+    // === Initialize HTTP Web Server ===
+    if (init_results[6]) {  // Only start if WiFi AP is working
+        ESP_LOGI(TAG, "Initializing HTTP web server...");
+        ret = wifi_comm_init_web_server();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Web dashboard available at http://192.168.4.1");
+            if (init_results[2]) {
+                sdlog_printf("HTTP server started: http://192.168.4.1");
+            }
+        } else {
+            ESP_LOGW(TAG, "⚠ Web server failed (TCP display still works)");
+        }
+    }
+
     // Compass check will be done in system check (index 8)
     init_results[8] = GPS_IS_COMPASS_CALIBRATED();  // CHANGED
     // Log compass calibration state
@@ -1872,8 +1886,11 @@ void app_main(void){
             .tracking_quality = tracking_quality,
         };
         
-        // Send data over WiFi
+        // Send data over WiFi (TCP for LCD display)
         esp_err_t send_ret = wifi_comm_send_data(&tx_data);
+        
+        // ALSO update web dashboard data
+        wifi_comm_update_web_data(&tx_data);
         
         ESP_LOGV(TAG, "wifi_comm_send_data() returned: %s", esp_err_to_name(send_ret));
         
