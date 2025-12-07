@@ -1854,11 +1854,14 @@ void tracking_get_move_stats(uint32_t *moves_today, uint32_t *total_moves) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
     }
 
+    // FIXED: Actually write the values to the pointers
     if (moves_today) {
+        *moves_today = s.moves_today;  // ← ASSIGN the value
         ESP_LOGV(TAG, "Get moves_today: %lu", (unsigned long)*moves_today);
     }
     
     if (total_moves) {
+        *total_moves = s.total_moves;  // ← ASSIGN the value
         ESP_LOGV(TAG, "Get total_moves: %lu", (unsigned long)*total_moves);
     }
 

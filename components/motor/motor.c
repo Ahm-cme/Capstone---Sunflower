@@ -61,10 +61,10 @@
 #define DEBUG_TIMING(label, ms) ESP_LOGV(TAG, "Timing %s: %lu ms (%.2f s)", label, (unsigned long)ms, ms / 1000.0)
 
 // Safety factor: use 90% of calculated time to prevent overshoot
-#define TIMING_SAFETY_FACTOR 0.95
+#define TIMING_SAFETY_FACTOR 1.10
 
 // Minimum safety buffer added to all moves (ms)
-#define MIN_SAFETY_BUFFER_MS 100
+#define MIN_SAFETY_BUFFER_MS 200
 
 // Self-test pulse duration (ms)
 #define SELF_TEST_PULSE_MS 200
@@ -1017,7 +1017,7 @@ void motor_park(double park_az_deg, double park_el_deg, double cur_az, double cu
     // Move axes sequentially (not simultaneously to reduce peak current)
     motor_move_az(cur_az, park_az_deg);
     ESP_LOGI(TAG, "Pausing between moves...");
-    vTaskDelay(pdMS_TO_TICKS(2500));             // Brief pause between moves
+    vTaskDelay(pdMS_TO_TICKS(4000));             // Brief pause between moves
     motor_move_el(cur_el, park_el_deg);
     
     ESP_LOGI(TAG, "");
