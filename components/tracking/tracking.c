@@ -54,9 +54,9 @@
 
 #include "tracking.h"
 
-// === ADD MOCK GPS SUPPORT (MUST MATCH main.c) ===
+// === MOCK GPS  ===
 #ifndef USE_MOCK_GPS
-#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+#define USE_MOCK_GPS  0  // Set to 1 for mock mode, 0 for real GPS
 #endif
 
 #if USE_MOCK_GPS

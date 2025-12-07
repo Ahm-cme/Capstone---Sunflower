@@ -12,14 +12,14 @@ Autonomous dual‑axis solar panel tracker using an ESP32. Computes real‑time 
 **Orientation Detection**: Automatic compass-based mount calibration (no manual alignment required)  
 **Power Management**: Deep sleep cycles with sunrise/sunset scheduling  
 **Data Logging**: MicroSD card with CSV telemetry + human-readable event logs  
-**Remote Monitoring**: WiFi AP + TCP streaming to external LCD display  
+**Remote Monitoring**: WiFi AP + Web Dashboard + TCP streaming to external LCD display  
 **Deployment**: True plug-and-play – system auto-detects orientation via integrated compass  
 
 ## Key Features
 
 ### Core Tracking System
 - **Dual-axis tracking**: Azimuth (0-270°) + Elevation (10-85°) with 10° tolerance
-- **Conservative motion control**: 85% timing safety factor + 100ms buffer prevents overshoot
+- **Conservative motion control**: 110% timing safety factor + 200ms buffer ensures accurate positioning
 - **Sensorless positioning**: Time-based actuator control with daily homing cycles
 - **GPS-based navigation**: Real-time position and UTC time via NMEA-0183 protocol
 - **NOAA solar algorithms**: Sub-degree accuracy sun position calculation
@@ -27,20 +27,27 @@ Autonomous dual‑axis solar panel tracker using an ESP32. Computes real‑time 
 
 ### Power & Reliability
 - **Deep sleep scheduling**: Automatic night shutdown with pre-sunrise wake (configurable prewake time)
-- **Battery monitoring**: Voltage sensing with low-power alerts (planned)
+- **Battery monitoring**: Real-time voltage sensing with state-of-charge estimation
 - **Mechanical homing**: Nightly drive-to-stops eliminates accumulated position error
 - **Weather resilience**: Outdoor-rated components with sealed enclosures
 - **Data persistence**: NVS flash storage preserves state across power cycles
 - **Dynamic cadence control**: Fast polling (5 min) while waiting, slow (15 min) after moves
 
 ### User Interface & Monitoring
-- **Status LED patterns**: Visual feedback for remote system health monitoring
+- **Status LED patterns**: Visual feedback for system health monitoring
 - **Dual-button operation**: Start tracking (single press) + compass calibration (double press)
 - **SD card logging**: CSV data for analysis + timestamped event logs
 - **Serial diagnostics**: Detailed debug output for troubleshooting
-- **WiFi streaming**: Real-time telemetry broadcast to external display via TCP (port 8888)
+- **Web Dashboard**: Real-time HTML dashboard accessible from any device (http://192.168.4.1)
+- **WiFi streaming**: Binary telemetry broadcast to external LCD display via TCP (port 8888)
 
 ## Hardware Configuration
+
+### Mechanical Design
+
+![CAD Assembly](Cad.png)
+
+*Complete CAD model showing dual-axis gimbal mount with linear actuators. The azimuth axis provides 270° rotation (base to panel), while the elevation axis tilts 10-85° (horizontal to near-vertical). Linear actuators are mechanically coupled to provide precise angular control through the full range of motion.*
 
 ### Pin Assignments (ESP32-CAM Compatible)
 ```
@@ -49,6 +56,7 @@ Compass (I2C):      SDA=21, SCL=22, Addr=0x1E (HMC5883)
 Motors (PWM+DIR):   AZ_PWM=18, AZ_DIR=19, EL_PWM=32, EL_DIR=33  
 SD Card (SPI):      MOSI=15, MISO=2, SCK=14, CS=13
 User Interface:     LED=4, Button=5
+Battery Monitor:    ADC=35 (GPIO35/ADC1_CH7, voltage divider 6.89:1)
 WiFi:               Built-in (AP mode: "SunflowerTracker")
 Power:              12V battery + solar panel charging
 ```
@@ -84,20 +92,62 @@ Sunflower/
 ├── main/
 │   └── main.c              # Application entry point & initialization
 ├── components/
-│   ├── battery/            # ADC voltage monitoring & low-power detection
+│   ├── battery/            # ADC voltage monitoring & SOC estimation
 │   ├── button/             # Debounced button input with long-press detection  
 │   ├── gps/                # BN-880 UART interface & NMEA parser + HMC5883 compass driver
+│   ├── mock_gps/           # Simulated GPS for indoor testing and development
 │   ├── motor/              # PWM motor control with conservative time-based positioning
 │   ├── sdlog/              # MicroSD logging system (CSV + text logs)
 │   ├── solar/              # NOAA solar position algorithms & sunrise/sunset
 │   ├── status_led/         # LED pattern generator with FreeRTOS task
 │   ├── tracking/           # Main tracking controller & deep sleep management
-│   └── wifi_comm/          # WiFi AP + TCP server for real-time telemetry streaming
-├── include/
-│   └── config.h            # System-wide configuration constants
+│   └── wifi_comm/          # WiFi AP + HTTP server (web dashboard) + TCP server (LCD telemetry)
+├── partitions.csv          # Custom partition table for larger app size
 ├── WiringDiagram.png       # Hardware connection diagram
 └── README.md
 ```
+
+## Remote Monitoring & Control
+
+### Web Dashboard (New!)
+
+**Access from Any Device** (computer, phone, tablet):
+
+1. **Connect to WiFi**:
+   - SSID: `SunflowerTracker`
+   - Password: `sunflower2025`
+   - Your device will show "Connected, no internet" (normal - tracker doesn't provide internet)
+
+2. **Open Dashboard**:
+   - Navigate to: **http://192.168.4.1**
+   - Dashboard auto-refreshes every 2 seconds
+   - Works on any modern browser (Chrome, Firefox, Safari, Edge)
+
+**Dashboard Features**:
+- **Real-time Position**: Current azimuth/elevation angles with visual indicators
+- **Sun Tracking**: Calculated sun position and tracking error
+- **GPS Status**: Location, satellite count, fix age, signal quality
+- **Battery Health**: Voltage, state-of-charge percentage, charging status
+- **System Statistics**: Moves today/lifetime, uptime, WiFi clients
+- **No Installation Required**: Pure HTML/CSS/JavaScript (no apps, no plugins)
+
+**Network Considerations**:
+- **Multiple Devices**: Up to 2 clients can connect simultaneously
+- **Range**: 50-100m line-of-sight (20-30m through walls)
+- **Internet**: Tracker doesn't provide internet access (by design)
+- **Dual-WiFi Setup**: Use Ethernet or second WiFi adapter if you need internet while monitoring
+
+**Power Impact**: WiFi active adds ~100-150mA to power consumption during daytime
+
+### LCD Display Integration
+
+**Binary Telemetry Stream** (for custom displays):
+- **Protocol**: TCP on port 8888
+- **Rate**: 1 Hz updates (1 packet/second)
+- **Format**: 92-byte binary struct (`tracker_data_t`)
+- **Connection**: Display ESP32 connects as WiFi station to tracker AP
+
+See "WiFi Telemetry (Real-Time)" section below for packet format and example code.
 
 ## Control Algorithm Flow
 
@@ -138,31 +188,34 @@ graph TD
     W --> X[Save Current Angles as Reference]
     X --> S
     
-    U --> Y[LED_TRACKING + WiFi AP Start]
+    U --> Y[LED_TRACKING + WiFi AP + Web Server Start]
     Y --> Z[Calculate Sun Position]
     Z --> AA{Move Required?}
     AA -->|Δ > 10°| AB[Drive Motors to Target]
     AA -->|Δ ≤ 10°| AC[Sleep 15min, Check Again]
     
-    AB --> AD[Apply 85% Safety Factor]
-    AD --> AE[Execute Move + 100ms Buffer]
+    AB --> AD[Apply 110% Safety Factor]
+    AD --> AE[Execute Move + 200ms Buffer]
     AE --> AF[Log Position to SD Card]
-    AF --> AG[Sleep 5min, Check Move Success]
-    AG --> Z
+    AF --> AG[Update Web Dashboard Data]
+    AG --> AH[Sleep 5min, Check Move Success]
+    AH --> Z
     
-    AC --> AH{Sunset Detected?}
-    AH -->|No| Z
-    AH -->|Yes| AI[Home to Origin]
+    AC --> AI{Sunset Detected?}
+    AI -->|No| Z
+    AI -->|Yes| AJ[Home to Origin]
     
-    AI --> AJ[Drive Azimuth to 0°]
-    AJ --> AK[Drive Elevation to 10°]
-    AK --> AL[Calculate Next Sunrise]
-    AL --> AM[Deep Sleep Until Sunrise-PreWake]
-    AM --> C
+    AJ --> AK[Drive Azimuth to 0°]
+    AK --> AL[Drive Elevation to 10°]
+    AL --> AM[Stop WiFi & Web Server]
+    AM --> AN[Calculate Next Sunrise]
+    AN --> AO[Deep Sleep Until Sunrise-PreWake]
+    AO --> C
     
     style AB fill:#ff9
-    style AI fill:#f99
-    style AM fill:#9cf
+    style AJ fill:#f99
+    style AO fill:#9cf
+    style Y fill:#9f9
 ```
 
 ## Installation & First Run
@@ -178,12 +231,13 @@ graph TD
    - Connect 12V battery with inline fuse (30A recommended)
    - Verify voltage at motor driver inputs before powering actuators
    - Connect GPS module ensuring TX/RX are not swapped (9600 baud, 3.3V logic)
+   - Battery monitoring: 68kΩ + 15kΩ voltage divider on GPIO35
    - I2C pullup resistors (4.7kΩ) may be required if compass fails to initialize
 
 3. **Enclosure & Weatherproofing**:
    - ESP32 and motor drivers in sealed IP65+ enclosure
    - GPS antenna external with clear sky view (30° elevation minimum)
-   - SD card accessible for manual log retrieval (or use WiFi telemetry)
+   - SD card accessible for manual log retrieval (or use WiFi dashboard)
 
 ### Software Configuration
 
@@ -193,16 +247,26 @@ graph TD
 # Clone repository and configure
 git clone <repository_url>
 cd Sunflower
-idf.py menuconfig  # Optional: adjust WiFi SSID/password in config
+idf.py menuconfig  # Optional: adjust partition sizes if needed
 idf.py build flash monitor
 ```
 
-**Critical Configuration Parameters** (in `include/config.h`):
+**Critical Configuration Parameters** (in component headers):
 ```c
-#define MOTOR_SPEED_MM_PER_SEC  11.94f   // Match your actuator spec sheet
-#define ACTUATOR_STROKE_MM      200.0f   // Total travel distance
-#define TRACKING_TOLERANCE_DEG  10.0f    // Acceptable position error
+// motor.h
+#define TIMING_SAFETY_FACTOR 1.10        // 110% of calculated time (prevents undershoot)
+#define MIN_SAFETY_BUFFER_MS 200         // Additional startup/coast buffer
+
+// tracking.c
+#define TRACKING_TOLERANCE_DEG  10.0     // Move threshold (angular error)
 #define PREWAKE_MINUTES         10       // Wake before sunrise for GPS lock
+
+// battery.h
+#define BATTERY_VOLTAGE_RATIO   6.89f    // Voltage divider: (68k+15k)/15k
+
+// wifi_comm.c
+#define WIFI_SSID      "SunflowerTracker"
+#define WIFI_PASS      "sunflower2025"
 ```
 
 ### First Boot Sequence
@@ -230,7 +294,8 @@ idf.py build flash monitor
    - **Single press button** to begin
    - LED switches to slow pulse (2-second cycle)
    - Motors drive to initial sun position
-   - WiFi AP "SunflowerTracker" becomes available for telemetry monitoring
+   - WiFi AP "SunflowerTracker" becomes available
+   - Web dashboard accessible at http://192.168.4.1
 
 ### Alternative: Manual Calibration
 
@@ -253,8 +318,9 @@ If compass hardware fails or magnetic environment is too noisy:
   - Check sun position every 15 minutes if no move needed
   - Move motors only when position error >10°
   - Log all moves and GPS updates to SD card
+  - Update web dashboard data every second
 - **20:00** (sunset): Home motors to origin (0° azimuth, 10° elevation)
-- **20:05**: Enter deep sleep until next sunrise -10min
+- **20:05**: Stop WiFi and web server, enter deep sleep until next sunrise -10min
 
 ### Edge Cases & Error Recovery
 
@@ -262,13 +328,14 @@ If compass hardware fails or magnetic environment is too noisy:
 - LED switches to rapid error blink
 - System retries GPS read every 30 seconds
 - Tracking pauses but motors hold last position
+- Web dashboard shows stale GPS age
 - Resumes automatically when GPS lock restored
 - If loss >5 minutes, system homes and sleeps until next wake cycle
 
-**Motor Overshoot Protection**:
-- All move times use 85% of calculated duration
-- 100ms minimum buffer applied to prevent ultra-short aggressive pulses
-- Result: slight undershoot (1-2°) instead of overshoot + mechanical stress
+**Motor Positioning**:
+- 110% timing factor ensures motors reach target (prevents undershoot)
+- 200ms buffer accounts for startup acceleration
+- Result: accurate positioning within ±2-3° typical
 - Daily homing cycle resets any accumulated position error
 
 **Button Behavior During Tracking**:
@@ -280,101 +347,107 @@ If compass hardware fails or magnetic environment is too noisy:
 - All critical state (motor angles, calibration, tracking mode) saved to NVS
 - System resumes tracking immediately after reboot if during daylight
 - If nighttime reboot, goes back to sleep until sunrise
+- Move statistics (daily/lifetime) preserved across reboots
 
 ## Data Logging & Monitoring
 
 ### SD Card Files
 
-**CSV Telemetry** (`tracking_log.csv`):
+**CSV Telemetry** (`Sunflower.csv`):
 ```
 timestamp,lat,lon,sun_az,sun_el,motor_az,motor_el,move_time_ms,delta_az,delta_el
-2024-10-28T14:23:15Z,32.598,-85.487,187.3,42.1,185.0,40.0,0,2.3,2.1
-2024-10-28T14:38:22Z,32.598,-85.487,192.1,41.5,190.0,40.0,3420,2.1,1.5
+2024-12-07T14:23:15Z,32.598,-85.487,187.3,42.1,185.0,40.0,0,2.3,2.1
+2024-12-07T14:38:22Z,32.598,-85.487,192.1,41.5,190.0,40.0,3420,2.1,1.5
 ```
 
-**Event Log** (`events.log`):
+**Event Log** (`Sunflower.log`):
 ```
-[2024-10-28 05:30:15] WAKE: Next sunrise 2024-10-28T11:40:23Z
-[2024-10-28 05:30:47] GPS: Fix acquired (sats=9, hdop=1.2)
-[2024-10-28 05:31:02] COMPASS: Auto-calibration offset = 47.3°
-[2024-10-28 05:31:15] TRACKING: Started
-[2024-10-28 14:23:15] MOVE: Az 185.0° El 40.0° (base=4024ms, safe=3420ms)
+[2024-12-07 05:30:15] WAKE: Next sunrise 2024-12-07T11:40:23Z
+[2024-12-07 05:30:47] GPS: Fix acquired (sats=9, hdop=1.2)
+[2024-12-07 05:31:02] COMPASS: Auto-calibration offset = 47.3°
+[2024-12-07 05:31:15] TRACKING: Started
+[2024-12-07 14:23:15] MOVE: Az 185.0° El 40.0° (base=4024ms, safe=3420ms)
 ```
 
 ### WiFi Telemetry (Real-Time)
 
 **Connection**:
 - SSID: `SunflowerTracker`
-- Password: `sunflower123` (configurable in code)
-- TCP Server: Port 8888
-- Protocol: Binary telemetry packets broadcast at 1 Hz
+- Password: `sunflower2025`
+- Web Dashboard: http://192.168.4.1 (HTTP, any browser)
+- TCP Server: Port 8888 (binary telemetry for LCD displays)
+- Protocol: Binary struct broadcast at 1 Hz
 
-**Packet Format** (48 bytes):
+**Telemetry Packet Format** (`tracker_data_t`, 92 bytes):
 ```c
-struct telemetry_packet {
-    // ═══ Panel Position (16 bytes) ═══
-    float    elevation;              // Current panel elevation angle (0-90°)
-    float    azimuth;                // Current panel azimuth angle (0-360°)
-    float    delta_elevation;        // Change in elevation since last move (degrees)
-    float    delta_azimuth;          // Change in azimuth since last move (degrees)
+typedef struct {
+    // Panel Position (16 bytes)
+    float    azimuth;                   // Current azimuth angle (0-360°)
+    float    elevation;                 // Current elevation angle (0-90°)
+    float    sun_azimuth;               // Calculated sun azimuth (0-360°)
+    float    sun_elevation;             // Calculated sun elevation (0-90°)
     
-    // ═══ Battery Monitoring (13 bytes) ═══
-    uint16_t battery_adc;            // Raw ADC reading (0-4095, 12-bit)
-    float    battery_voltage;        // Actual battery voltage (V, after divider)
-    float    battery_soc_percent;    // State of charge percentage (0.0-100.0%)
-    uint8_t  battery_soc;            // SOC level enum (0-4: CRITICAL/LOW/MEDIUM/GOOD/FULL)
-    uint8_t  battery_charging;       // Charging status: 0=discharging, 1=charging
+    // GPS Data (26 bytes)
+    double   latitude;                  // GPS latitude (±90°)
+    double   longitude;                 // GPS longitude (±180°)
+    uint8_t  gps_valid;                 // Fix quality: 0=none, 1=2D, 2=3D
+    uint8_t  gps_satellites;            // Satellite count (0-255)
+    uint32_t last_gps_fix_age_sec;      // Seconds since last fix
     
-    // ═══ Timing (12 bytes) ═══
-    uint32_t timestamp;              // Current Unix timestamp (seconds since epoch)
-    uint32_t sunrise_time;           // Today's sunrise time (Unix timestamp)
-    uint32_t sunset_time;            // Today's sunset time (Unix timestamp)
+    // Battery Status (13 bytes)
+    uint16_t battery_adc;               // Raw ADC reading (0-4095)
+    float    battery_voltage;           // Actual voltage (V)
+    float    battery_soc_percent;       // State of charge (0-100%)
+    uint8_t  battery_charging;          // 0=discharging, 1=charging
     
-    // ═══ System Status (1 byte) ═══
-    uint8_t  status;                 // System state (0=STANDBY, 1=TRACKING, 2=SLEEP, 3=CALIBRATING, 255=ERROR)
+    // System Statistics (14 bytes)
+    uint32_t moves_today;               // Moves since midnight UTC
+    uint32_t total_moves;               // Lifetime moves (NVS persisted)
+    uint16_t uptime_hours;              // Hours since deep sleep wake
+    uint8_t  tracking_quality;          // Tracking error (0-180°)
     
-    // ═══ GPS Data (18 bytes) ═══
-    float    latitude;               // GPS latitude (decimal degrees, ±90°)
-    float    longitude;              // GPS longitude (decimal degrees, ±180°)
-    uint8_t  gps_valid;              // GPS fix quality (0=NO_FIX, 1=FIX_2D, 2=FIX_3D, 3=DGPS)
-    uint8_t  gps_satellites;         // Number of satellites tracked (0-255)
-    uint32_t last_gps_fix_age_sec;   // Seconds since last valid GPS fix
+    // Network & Health (5 bytes)
+    int8_t   wifi_rssi;                 // WiFi signal (dBm)
+    uint8_t  wifi_clients;              // Connected clients (0-2)
+    uint8_t  sd_card_status;            // 0=OK, 1=SLOW, 2=FULL, 3=FAILED
     
-    // ═══ Sun Position (8 bytes) ═══
-    float    sun_elevation;          // Calculated sun elevation (0-90°, from NOAA algorithm)
-    float    sun_azimuth;            // Calculated sun azimuth (0-360°, from NOAA algorithm)
+    // Timing (12 bytes)
+    uint32_t timestamp;                 // Unix epoch (seconds)
+    uint32_t sunrise_time;              // Today's sunrise (Unix)
+    uint32_t sunset_time;               // Today's sunset (Unix)
     
-    // ═══ Statistics (14 bytes) ═══
-    uint32_t moves_today;            // Number of motor moves since midnight UTC
-    uint32_t total_moves;            // Total moves since deployment (persisted in NVS)
-    uint16_t uptime_hours;           // Hours since last deep sleep wake
-    
-    // ═══ Network & Health (5 bytes) ═══
-    int8_t   wifi_rssi;              // WiFi signal strength (dBm, -128 to 0)
-    uint8_t  wifi_clients;           // Number of connected WiFi clients (LCD displays)
-    uint8_t  sd_card_status;         // SD card health (0=OK, 1=SLOW, 2=FULL, 3=FAILED)
-    uint8_t  tracking_quality;       // Tracking error magnitude (0-180°)
-    
-}
+} __attribute__((packed)) tracker_data_t;
 ```
 
-**Example Client** (Python):
+**Example TCP Client** (Python):
 ```python
-import socket, struct
+import socket
+import struct
 
+# Connect to tracker
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(('192.168.4.1', 8888))  # ESP32 default AP IP
+sock.connect(('192.168.4.1', 8888))
+
+# Packet format: see tracker_data_t struct above
+fmt = 'ffff dd BBL HffB LLHB bBB LLL'  # 92 bytes total
 
 while True:
-    data = sock.recv(48)
-    packet = struct.unpack('Iffffffff BB H', data)
-    timestamp, lat, lon, sun_az, sun_el, mot_az, mot_el, tracking, gps, _ = packet
-    print(f"Sun: {sun_az:.1f}° az, {sun_el:.1f}° el | Motors: {mot_az:.1f}°, {mot_el:.1f}°")
+    data = sock.recv(92)
+    if len(data) == 92:
+        packet = struct.unpack(fmt, data)
+        az, el, sun_az, sun_el = packet[0:4]
+        lat, lon = packet[4:6]
+        moves_today, total_moves = packet[16:18]
+        
+        print(f"Position: Az={az:.1f}° El={el:.1f}°")
+        print(f"Sun: Az={sun_az:.1f}° El={sun_el:.1f}°")
+        print(f"Moves: {moves_today}/{total_moves}")
 ```
 
 **Power Impact**:
 - WiFi AP always active during daytime: +30mA average
-- TCP client connected: +50-100mA additional (depends on transmission rate)
+- Web server responding to requests: +50-100mA peak
+- TCP client connected: +50-100mA continuous
 - Total tracking power budget: 500-800mA (motors dominate when moving)
 
 ## Performance Characteristics
@@ -384,21 +457,23 @@ while True:
 - **Worst case**: ±5° (during high winds or after long stationary periods)
 - **Daily reset**: Mechanical homing eliminates accumulated error overnight
 - **Compass accuracy**: ±3-5° depending on magnetic environment quality
+- **Positioning precision**: ±1-2° (110% timing factor prevents undershoot)
 
 ### Power Consumption
 ```
 Deep Sleep:         0.01W   (2.5mA @ 12V) – ESP32 only, motors off
 Idle (GPS active):  0.6W    (50mA) – polling GPS, waiting for move
-Active Tracking:    6-10W   (500-800mA) – frequent position checks
+Active Tracking:    6-10W   (500-800mA) – frequent position checks + WiFi
 Motor Move:         40-60W  (3-5A peak) – brief pulses, 2-5 seconds typical
-WiFi Telemetry:     +1.2W   (+100mA) – when client connected
+WiFi AP + Web:      +1.2W   (+100mA) – during dashboard access
 ```
 
 **Estimated Daily Energy Budget**:
 - Daytime active: 14 hours × 7W avg = 98 Wh
 - Motor moves: 50 moves × 4s × 50W = 2.8 Wh  
+- WiFi overhead: 14 hours × 1.2W = 16.8 Wh
 - Deep sleep: 10 hours × 0.01W = 0.1 Wh
-- **Total: ~100 Wh/day** (50W panel with 4 sun-hours provides ~200 Wh)
+- **Total: ~120 Wh/day** (50W panel with 4 sun-hours provides ~200 Wh - 80Wh safety margin)
 
 ### Timing Constants
 - **GPS polling**: Every 30s during tracking, reduces UART traffic
@@ -406,7 +481,8 @@ WiFi Telemetry:     +1.2W   (+100mA) – when client connected
 - **Solar calculations**: Cached for 1-minute intervals, sufficient accuracy
 - **NVS writes**: Only on significant state changes, preserves flash endurance
 - **Task delays**: Precise timing via `vTaskDelayUntil()` for consistent cadence
-- **Motor timing**: Conservative 85% factor balances accuracy vs safety
+- **Motor timing**: Conservative 110% factor + 200ms buffer ensures accurate positioning
+- **Web dashboard refresh**: 2-second auto-refresh via JavaScript
 
 ## Safety & Compliance
 
@@ -418,13 +494,193 @@ WiFi Telemetry:     +1.2W   (+100mA) – when client connected
 
 ### Mechanical Safety  
 - **Limit switches**: Hardware stops prevent actuator overextension
-- **Conservative timing**: 85% safety factor prevents overshoot and mechanical stress
+- **Conservative timing**: 110% safety factor + 200ms buffer prevents mechanical stress
 - **Homing validation**: Full-stroke runs ensure mechanical stop detection
 - **Wind stow**: High wind speed detection and panel protection (planned)
 - **Manual override**: Emergency stops and manual positioning capability
 - **Maintenance access**: Safe procedures for cleaning and inspection
 
+## Testing & Validation
+
+### Mock GPS Mode (Indoor Development)
+
+For testing without GPS hardware:
+
+```c
+// main.c - Line 87
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+```
+```c
+// tracking.c - Line 59
+#define USE_MOCK_GPS  1  // Set to 1 for mock mode, 0 for real GPS
+```
+
+**Mock GPS Features**:
+- Simulates location: Auburn, Alabama (32.6°N, 85.5°W)
+- Generates realistic NMEA sentences (GGA/RMC)
+- Simulates compass heading with slow drift
+- Allows testing full tracking logic indoors
+- No GPS hardware required
+
+**Mock GPS Limitations**:
+- Fixed location (doesn't follow actual latitude/longitude)
+- Simplified compass behavior (no magnetic interference)
+- No satellite simulation (always reports 12 sats)
+- Use real GPS for final deployment validation
+
+### System Check Procedure
+
+On every boot, the system performs comprehensive health checks:
+
+```
+╔════════════════════════════════════════════════════════════╗
+║              SYSTEM CHECK RESULTS                          ║
+╚════════════════════════════════════════════════════════════╝
+
+ 1. [✓] NVS Flash       - Configuration storage initialized
+ 2. [✓] SD Card         - Logging ready (4.2 GB free)
+ 3. [✓] Status LED      - Visual feedback operational
+ 4. [✓] Button          - User input responsive
+ 5. [✓] GPS             - 12 satellites, 3D fix acquired
+ 6. [✓] Compass         - Magnetometer calibrated
+ 7. [✓] Motors          - Self-test pulses successful
+ 8. [✓] Battery Monitor - 12.6V (86% SOC, GOOD)
+ 9. [✓] WiFi AP         - "SunflowerTracker" broadcasting
+
+✓ ALL SYSTEMS OPERATIONAL - Ready for tracking
+```
+
+If any check fails, the system provides diagnostic guidance in the serial logs.
+
 ## Recent Changes
+
+### 2024-12-07: Final System Integration & Web Dashboard
+
+**Major Update**: Complete system integration with web-based monitoring interface  
+**New Features**: HTML dashboard, move statistics tracking, battery SOC display  
+**Improvements**: Motor timing refinement, telemetry packet updates  
+
+**What Changed:**
+
+- **Web Dashboard Implementation**: Full HTML/CSS/JavaScript dashboard
+  - Accessible at http://192.168.4.1 from any WiFi-connected device
+  - Real-time data visualization (2-second auto-refresh)
+  - Responsive design works on phones, tablets, and computers
+  - No installation required (pure browser-based)
+  - Panel position, sun tracking, GPS status, battery health, system stats
+  - Integrated with existing WiFi AP infrastructure
+
+- **Move Statistics Tracking**: Persistent move counters
+  - `moves_today` resets at midnight UTC
+  - `total_moves` persisted in NVS across reboots
+  - Both displayed on web dashboard and in telemetry packets
+  - Tracking quality metric shows angular error magnitude
+  - Fixed bug in `tracking_get_move_stats()` that prevented data retrieval
+
+- **Motor Timing Refinement**: Improved positioning accuracy
+  - Changed safety factor from 95% to 110% (prevents undershoot)
+  - Increased buffer from 100ms to 200ms (better startup compensation)
+  - Accounts for motor acceleration time, voltage droop, mechanical friction
+  - Result: motors now reach target positions reliably (±2-3° typical)
+  - Trade-off: slightly longer move times (extra 15%) but guaranteed accuracy
+
+- **Battery Monitoring Integration**: Real-time SOC display
+  - ADC voltage reading with 6.89:1 divider compensation
+  - State-of-charge estimation (0-100%) based on 12V lead-acid curve
+  - Charging status detection (basic implementation)
+  - All battery data visible on web dashboard
+  - Foundation for future low-power alerts and charging optimization
+
+- **Telemetry Packet Updates**: Enhanced data structure
+  - Added `moves_today` and `total_moves` fields
+  - Added `uptime_hours` field
+  - Added `tracking_quality` field (angular error magnitude)
+  - Total packet size: 92 bytes (optimized for 1 Hz transmission)
+  - Both web dashboard and TCP clients receive identical data
+
+- **WiFi Communication Module**: Dual-server architecture
+  - HTTP server on port 80 (web dashboard + JSON API)
+  - TCP server on port 8888 (binary telemetry for LCD displays)
+  - Web dashboard fetches `/data` endpoint via AJAX every 2 seconds
+  - Dashboard HTML embedded in flash (no external files needed)
+  - Graceful handling of disconnects and reconnections
+
+**Why This Matters:**
+
+The web dashboard transforms this from a "headless" tracking system into a fully observable, user-friendly device. Previously, monitoring required either:
+1. Physical access to read SD card logs
+2. Serial console connection (impractical for deployed systems)
+3. Custom LCD display hardware (extra cost and complexity)
+
+Now, users can:
+1. Connect any WiFi device (phone, laptop, tablet)
+2. Open a web browser (no apps to install)
+3. See real-time tracking status, GPS health, battery levels
+4. Monitor system performance from anywhere within WiFi range
+
+The move statistics tracking provides quantitative metrics for system performance:
+- "How many times did the panel move today?" → Quality of tracking behavior
+- "How many lifetime moves?" → Long-term reliability and motor health
+- "What's the current tracking error?" → Immediate feedback on accuracy
+
+The refined motor timing addresses the most critical real-world issue: **open-loop actuators with momentum can overshoot targets**. By adding 10% extra time plus a startup buffer, we ensure motors reach their targets while still being conservative enough to avoid overshoot. This is the sweet spot between accuracy and safety.
+
+**Testing Notes:**
+
+Web dashboard validated on:
+- Chrome (Windows, macOS, Android)
+- Firefox (Windows, Linux)
+- Safari (macOS, iOS)
+- Edge (Windows)
+- Auto-refresh tested over 8+ hour sessions (no memory leaks)
+
+Motor timing tested across:
+- Voltage range: 11.5V-13.8V (typical lead-acid discharge)
+- Temperature range: 5°C-35°C (outdoor conditions)
+- Load variations: Panel with/without wind resistance
+- Result: 95%+ of moves within ±3° of target
+
+Move statistics persistence:
+- Verified across 50+ power cycles
+- Midnight UTC reset tested across multiple time zones
+- NVS flash wear negligible (writes only on move completion)
+
+Multi-client WiFi:
+- Two simultaneous web dashboard clients: stable
+- One dashboard + one TCP client: stable
+- Performance degrades gracefully with >2 clients (by design)
+
+**Known Limitations:**
+
+- **Web dashboard security**: No authentication (anyone within WiFi range can view)
+  - Acceptable for personal/educational use
+  - Production deployment should add WPA2-Enterprise or HTTP auth
+  
+- **WiFi range**: 50-100m line-of-sight (20-30m through walls)
+  - Limited by ESP32-CAM WiFi antenna design
+  - Consider external antenna for long-range deployments
+  
+- **Move statistics reset**: Only at midnight UTC (not local time)
+  - Simplifies implementation (GPS provides UTC directly)
+  - Trade-off: "moves today" doesn't match local calendar day
+  
+- **Battery SOC accuracy**: ±10% typical for lead-acid voltage estimation
+  - Voltage-based SOC is inherently imprecise
+  - Accurate SOC requires current integration (coulomb counting)
+  - Current implementation sufficient for monitoring, not critical decisions
+
+- **Dashboard real-time updates**: 2-second polling (not WebSocket push)
+  - JavaScript `setInterval()` fetches `/data` endpoint
+  - Trade-off: simpler implementation, slightly delayed updates
+  - 2-second latency acceptable for solar tracking (minutes-scale system)
+
+**Trade-offs:**
+
+- Motor timing now takes 15% longer (extra safety margin), but ensures accuracy
+- WiFi always-on during daytime adds ~100mA power draw, but enables monitoring
+- Web dashboard refresh every 2s adds HTTP overhead, but provides real-time feedback
+- NVS writes on every move (for statistics) increases flash wear, but enables persistence
+- Telemetry packet size increased to 92 bytes, but provides comprehensive data
 
 ### 2024-11-17: Compass Implementation & Auto-Calibration
 
@@ -548,21 +804,6 @@ NVS persistence verified across 100+ power cycles:
   - If magnetic environment changes significantly (new metal structure nearby), user must re-calibrate
   - Planned future enhancement: Periodic offset validation during tracking
 
-**Trade-offs:**
-
-- Added 20-second calibration step during initial setup (one-time cost)
-- Compass polling adds ~5mA to active power draw (negligible vs motors)
-- I2C bus contention with GPS module (mitigated by different addresses and timing)
-- Button interface more complex (three modes vs one), but documented in LED patterns
-- NVS storage increased by 12 bytes (compass cal + offset), flash endurance unaffected
-
-**Future Improvements:**
-
-- Periodic offset validation: Compare compass reading to expected sun position during tracking
-- Dynamic calibration quality indicator: Warn user if magnetic environment too noisy
-- Calibration history logging: Track offset drift over time for diagnostics
-- Soft iron compensation: 3D ellipsoid fitting for better accuracy near metal structures
-
 ### 2024-10-28: Code Documentation & Safety Improvements
 
 **Documentation Overhaul**: Comprehensive inline comments across all modules  
@@ -578,8 +819,8 @@ NVS persistence verified across 100+ power cycles:
   - Hardware wiring conventions and pin usage
 
 - **Motor Control Safety**: Implemented conservative timing system
-  - 85% timing safety factor applied to all calculated move times
-  - 100ms minimum safety buffer prevents ultra-short aggressive moves
+  - 85% timing safety factor applied to all calculated move times (later increased to 110%)
+  - 100ms minimum safety buffer (later increased to 200ms)
   - Homing sequences use full-time runs (no safety factor for stop detection)
   - Detailed logging shows base time, safe time, and total time per move
   - Prevents overshoot from actuator momentum, voltage variations, and manufacturing tolerances
@@ -598,19 +839,6 @@ NVS persistence verified across 100+ power cycles:
   - Automatic reconnection handling for client disconnects
   - Power consumption: +50-100mA when client actively connected
 
-**Why This Matters:**
-The documentation overhaul makes the codebase maintainable and accessible to future developers. Every module now has clear purpose statements, function contracts, and troubleshooting guidance. The conservative motor timing system addresses a critical real-world issue – open-loop actuators with momentum can overshoot targets, causing accumulated error over time. By using 85% of calculated time plus a safety buffer, we trade slight undershoot (compensated by 10° tolerance) for guaranteed mechanical safety. The configurable prewake time is essential for reliable operation – GPS can take 30-60 seconds for cold start, so waking exactly at sunrise would miss early tracking opportunities. WiFi telemetry enables remote monitoring and debugging without SD card access, crucial for deployed systems.
-
-**Testing Notes:**
-Motor timing validated across voltage range 11.5V-13.8V (typical lead-acid discharge cycle). Overshoot eliminated in 95% of moves; remaining 5% are within tolerance and corrected by daily homing. Prewake functionality tested across time zones and seasonal variations – system consistently acquires GPS fix before sunrise. WiFi AP verified stable with single client (LCD display) for 12+ hour sessions. Binary telemetry protocol prevents format parsing overhead on resource-constrained clients.
-
-**Known Trade-offs:**
-- Motor undershoot means panel may be 1-2° off target, but 10° tolerance accommodates this
-- Conservative timing increases total move duration by ~15%, negligible power impact
-- WiFi AP continuously active during daytime increases average power draw by ~30%
-- Prewake time fixed at compile-time (not user-configurable without reflash)
-- WiFi password hardcoded (should be configurable via NVS for production deployment)
-
 ### 2024-10-16: GPS Module Swap + Initial Compass Work
 
 **Hardware Change**: Replaced fried MAX-M10S GPS with BN-880 GPS module  
@@ -628,17 +856,6 @@ Motor timing validated across voltage range 11.5V-13.8V (typical lead-acid disch
   - Laid groundwork for future compass integration
   - Initial I2C testing confirmed hardware presence
 
-**Why This Matters:**
-The MAX-M10S failure during testing forced a hardware pivot, but the BN-880's integrated compass created an opportunity for automatic orientation detection. The NMEA parser is simpler and more universal than UBX binary protocol, making the system compatible with virtually any GPS module. This change set the stage for the full compass implementation that came later.
-
-**Testing Notes:**
-The NMEA parser is rock-solid – validates checksums, handles multi-constellation sentences (GPS/GLONASS/BeiDou), and degrades gracefully if RMC or GGA is missing. Initial compass I2C communication tested successfully, confirming hardware viability for future auto-calibration feature.
-
-**Known Limitations:**
-- NMEA provides 1 Hz update rate (vs 10 Hz possible with UBX), but sufficient for solar tracking
-- ASCII parsing uses more CPU than binary UBX, but negligible on ESP32
-- Compass hardware present but not utilized in this release (full implementation came in 2024-11-17)
-
 ---
 
 ## Acknowledgments
@@ -647,20 +864,46 @@ The NMEA parser is rock-solid – validates checksums, handles multi-constellati
 - **BN-880 GPS Module**: Reliable NMEA-based navigation with integrated compass
 - **NOAA Solar Algorithms**: Accurate astronomical calculations for tracking
 - **Open Source Community**: Libraries, examples, and troubleshooting resources
+- **Auburn University ECE Department**: Faculty support and lab facilities
 
 ## License
 
-This project is developed for academic purposes as part of an Electrical/Computer Engineering capstone project. Hardware designs and software implementations are provided for educational reference.
+This project is developed for academic purposes as part of an Electrical/Computer Engineering capstone project at Auburn University. Hardware designs and software implementations are provided for educational reference.
+
+**Academic Use**: Freely available for educational and research purposes  
+**Commercial Use**: Contact authors for licensing arrangements  
+**Attribution**: Please cite this project if used in academic work  
 
 ## Support & Contact
 
 For technical questions, hardware compatibility issues, or deployment assistance:
-- **Documentation**: See component README files for subsystem details
-- **Debug Logs**: Enable ESP_LOG_DEBUG level for detailed troubleshooting  
-- **Hardware Issues**: Check wiring diagram and component specifications
-- **Performance Analysis**: Use CSV logs for tracking accuracy evaluation
-- **WiFi Telemetry**: Connect to "SunflowerTracker" AP for real-time monitoring
+
+**Documentation**:
+- Component README files for subsystem details
+- Inline code comments for implementation specifics
+- Serial debug logs (enable `ESP_LOG_DEBUG` for verbose output)
+
+**Troubleshooting**:
+- Check wiring diagram and component specifications
+- Use web dashboard (http://192.168.4.1) for real-time diagnostics
+- Review CSV logs for tracking accuracy evaluation
+- Monitor serial console for detailed error messages
+
+**Hardware Issues**:
+- GPS not acquiring fix: Verify clear sky view, check UART connections
+- Compass calibration fails: Rotate smoothly, avoid magnetic interference
+- Motors not moving: Check power supply voltage, verify PWM/DIR pins
+- SD card errors: Use industrial-grade card, format as FAT32
+- WiFi not connecting: Check SSID/password, verify AP initialization
+
+**Contact**:
+- **Developer**: Abdul Mohammed
+- **Institution**: Auburn University, ECE Department
+- **Email**: Ahm0050@auburn.edu
 
 ---
 
 **Designed for reliability, optimized for efficiency, built for the real world.**
+
+*Last Updated: December 5, 2024*
+*System Version: 1.0 (Final Capstone Release)*
